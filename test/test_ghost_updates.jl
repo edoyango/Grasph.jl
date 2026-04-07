@@ -30,7 +30,7 @@ end
     ps.v[2] = SVector(0.0, 0.0)
     ps.rho[2] = rho0
 
-    ghost = GhostParticleSystem(ps)
+    ghost = GhostParticleSystem(ps, GhostCopier(:rho))
 
     normal = SVector(1.0, 0.0) # Vertical wall at x=0, normal points right
     point  = SVector(0.0, 0.0)
@@ -40,12 +40,13 @@ end
     @test ghost.n == 1
     @test ghost.x[1] ≈ SVector(-0.01, 0.01)
 
-    # 2. Update kinematics
+    # 2. Update kinematics and copy physics
     update_ghost_kinematics!(ghost, normal)
+    update_ghost!(ghost, 1)
 
     # Velocity should be reflected: vx -> -vx, vy -> vy
     @test ghost.v[1] ≈ SVector(-1.0, 2.0)
-    # Density should be copied (now via live view)
+    # Density copied from source
     @test ghost.rho[1] == ps.rho[1]
 end
 
@@ -64,14 +65,14 @@ end
     ps.x[1] = SVector(0.02, 0.05)
     ps.stress[1] = SVector(-100.0, -100.0, 0.0) # Pressure -100
 
-    ghost = GhostParticleSystem(ps)
+    ghost = GhostParticleSystem(ps, GhostCopier(:rho, :stress))
 
     normal = SVector(1.0, 0.0)
     point  = SVector(0.0, 0.0)
 
     generate_ghosts!(ghost, normal, point, 0.1)
     update_ghost_kinematics!(ghost, normal)
-    update_ghost!(ghost)
+    update_ghost!(ghost, 1)
 
     # Interaction: should use Cauchy interaction because :stress is present
     kernel = CubicSplineKernel(h; ndims=2)
@@ -101,14 +102,14 @@ end
 
     ps.x[1] = SVector(0.02, 0.05)
 
-    ghost = GhostParticleSystem(ps)
+    ghost = GhostParticleSystem(ps, GhostCopier(:rho, :p))
 
     normal = SVector(1.0, 0.0)
     point  = SVector(0.0, 0.0)
 
     generate_ghosts!(ghost, normal, point, 0.1)
     update_ghost_kinematics!(ghost, normal)
-    update_ghost!(ghost)
+    update_ghost!(ghost, 1)
 
     # Interaction: should use Pressure interaction because :p is present (no :stress)
     kernel = CubicSplineKernel(h; ndims=2)
@@ -136,7 +137,7 @@ end
     ps.drhodt .= 0.0
     ps.x[1] = SVector(0.02, 0.05)
 
-    ghost = GhostParticleSystem(ps)
+    ghost = GhostParticleSystem(ps, GhostCopier(:rho))
     entry = GhostEntry(ghost, SVector(1.0, 0.0), SVector(0.0, 0.0), 0.1)
 
     # Custom Pfn to check ghost state during sweep

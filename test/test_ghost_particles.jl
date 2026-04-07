@@ -50,7 +50,7 @@ end
 # update_ghost! — live views
 # ---------------------------------------------------------------------------
 
- @testset "ghost.stress is a live view of source (no update_ghost! needed)" begin
+ @testset "ghost.stress is updated by update_ghost!" begin
     ps    = _make_granular(n=4)
     ps.x[1] = SVector(0.1, 0.05)   # within cutoff → ghost
     ps.x[2] = SVector(0.2, 0.05)   # within cutoff → ghost
@@ -60,12 +60,9 @@ end
     ps.stress[2] = SVector(4.0, 5.0, 6.0)
     ps.rho .= 1850.0
 
-    ghost = GhostParticleSystem(ps)
-
-    # Generate ghosts from particles 1,2 (within cutoff)
+    ghost = GhostParticleSystem(ps, GhostCopier(:rho, :stress))
     generate_ghosts!(ghost, SVector(0.0, 1.0), SVector(0.0, 0.0), 0.15)
-    # update_ghost! is now a no-op, stress should already be visible via view
-    update_ghost!(ghost)
+    update_ghost!(ghost, 1)
 
     @test ghost.n == 2
     for k in 1:ghost.n
@@ -73,31 +70,33 @@ end
         @test ghost.stress[k] == ps.stress[orig]
     end
 
-    # Mutate source — ghost sees the update immediately (live view)
+    # Mutate source — ghost does NOT see it until update_ghost! is called
     ps.stress[1] = SVector(9.0, 9.0, 9.0)
+    update_ghost!(ghost, 1)
     for k in 1:ghost.n
         orig = ghost.idx_original[k]
         @test ghost.stress[k] == ps.stress[orig]
     end
 end
 
- @testset "ghost.p is a live view of source (no update_ghost! needed)" begin
+ @testset "ghost.p is updated by update_ghost!" begin
     ps = _make_fluid(n=4)
     ps.x .= [SVector(0.1*i, 0.05) for i in 1:4]
     ps.p .= [100.0, 200.0, 300.0, 400.0]
     ps.rho .= 1000.0
 
-    ghost = GhostParticleSystem(ps)
+    ghost = GhostParticleSystem(ps, GhostCopier(:rho, :p))
     generate_ghosts!(ghost, SVector(0.0, 1.0), SVector(0.0, 0.0), 0.15)
-    update_ghost!(ghost)
+    update_ghost!(ghost, 1)
 
     for k in 1:ghost.n
         orig = ghost.idx_original[k]
         @test ghost.p[k] == ps.p[orig]
     end
 
-    # Mutate source — ghost sees it immediately
+    # Mutate source — ghost does NOT see it until update_ghost! is called
     ps.p .= [999.0, 888.0, 777.0, 666.0]
+    update_ghost!(ghost, 1)
     for k in 1:ghost.n
         orig = ghost.idx_original[k]
         @test ghost.p[k] == ps.p[orig]
@@ -120,9 +119,10 @@ end
     ps.v[1] = SVector(1.0, -0.5)
     ps.rho .= 1850.0
 
-    ghost = GhostParticleSystem(ps)
+    ghost = GhostParticleSystem(ps, GhostCopier(:rho))
     generate_ghosts!(ghost, normal, point, cutoff)
     update_ghost_kinematics!(ghost, normal)
+    update_ghost!(ghost, 1)
 
     @test ghost.n                == 1
     @test length(ghost.x)        == 1
@@ -204,9 +204,10 @@ end
     ps.v[2] = SVector(0.0, 0.0)
     ps.rho .= rho0
 
-    ghost = GhostParticleSystem(ps)
+    ghost = GhostParticleSystem(ps, GhostCopier(:rho))
     generate_ghosts!(ghost, SVector(0.0, 1.0), SVector(0.0, 0.0), 0.15)
     update_ghost_kinematics!(ghost, SVector(0.0, 1.0))
+    update_ghost!(ghost, 1)
     @test ghost.n == 2
 
     k   = CubicSplineKernel(h; ndims=2)
@@ -248,8 +249,8 @@ end
     ps.stress[1] = SVector(1.0, 2.0, 3.0)
     ps.stress[2] = SVector(4.0, 5.0, 6.0)
 
-    # Set up ghost
-    ghost = GhostParticleSystem(ps)
+    # Set up ghost — stage 1 copier keeps rho and stress current before each sweep
+    ghost = GhostParticleSystem(ps, GhostCopier(:rho, :stress))
     entry = GhostEntry(ghost, SVector(0.0, 1.0), SVector(0.0, 0.0), 0.15)
 
     k = CubicSplineKernel(h; ndims=2)

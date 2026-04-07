@@ -235,7 +235,7 @@ function time_integrate!(
             end
 
             for (i, ge) in enumerate(integrator.ghosts)
-                @timeit to ghost_labels[i].stage update_ghost!(ge)
+                @timeit to ghost_labels[i].stage update_ghost!(ge, stage)
             end
 
             for (i, inter) in enumerate(ints)
