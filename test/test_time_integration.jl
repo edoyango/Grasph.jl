@@ -372,3 +372,94 @@ end
     @test to isa TimerOutput
     @test length(to.inner_timers) > 0
 end
+
+# ---------------------------------------------------------------------------
+# run_driver! — CLI overrides
+# ---------------------------------------------------------------------------
+
+@testset "run_driver! CLI overrides" begin
+    
+    @testset "Non-interactive and steps override (-n, -s)" begin
+        lf, ps, _ = _make_lf()
+        fill!(ps.x, zero(SVector{2,Float64}))
+        fill!(ps.v, SVector(1.0, 0.0))
+        
+        orig_args = copy(ARGS)
+        empty!(ARGS)
+        append!(ARGS, ["-n", "-s", "3"])
+        
+        try
+            # Call with num_timesteps = 10, but CLI should override to 3
+            dt = 0.5 * 0.1 / 10.0
+            run_driver!(lf, 10, 100, 100, 0.5, nothing)
+            
+            # Verify only 3 steps were taken
+            @test ps.x[1][1] ≈ 3 * dt atol=1e-10
+            @test ps.x[1][2] ≈ 0.0    atol=1e-10
+        finally
+            empty!(ARGS)
+            append!(ARGS, orig_args)
+        end
+    end
+
+    @testset "Save frequency override (-f / --save-freq)" begin
+        lf, ps, _ = _make_lf()
+        mktempdir() do tmpdir
+            prefix = joinpath(tmpdir, "out")
+            
+            orig_args = copy(ARGS)
+            empty!(ARGS)
+            append!(ARGS, ["--non-interactive", "--steps", "4", "--save-freq", "2"])
+            
+            try
+                # Call with save_interval_step = 100, but CLI should override to 2
+                run_driver!(lf, 10, 100, 100, 0.5, prefix)
+                
+                @test  isfile("$(prefix)_2.h5")
+                @test  isfile("$(prefix)_4.h5")
+                @test !isfile("$(prefix)_1.h5")
+                @test !isfile("$(prefix)_3.h5")
+            finally
+                empty!(ARGS)
+                append!(ARGS, orig_args)
+            end
+        end
+    end
+
+    @testset "CFL override (-c / --cfl)" begin
+        lf, ps, _ = _make_lf()
+        fill!(ps.x, zero(SVector{2,Float64}))
+        fill!(ps.v, SVector(1.0, 0.0))
+        
+        orig_args = copy(ARGS)
+        empty!(ARGS)
+        append!(ARGS, ["-n", "-s", "1", "-c", "0.25"])
+        
+        try
+            # Call with CFL = 0.5, CLI should override to 0.25
+            dt = 0.25 * 0.1 / 10.0
+            run_driver!(lf, 10, 100, 100, 0.5, nothing)
+            
+            @test ps.x[1][1] ≈ dt atol=1e-10
+        finally
+            empty!(ARGS)
+            append!(ARGS, orig_args)
+        end
+    end
+
+    @testset "Print frequency override (-p / --print-freq)" begin
+        lf, ps, _ = _make_lf()
+        orig_args = copy(ARGS)
+        empty!(ARGS)
+        append!(ARGS, ["-n", "-s", "2", "-p", "1"])
+        
+        try
+            # Run 2 steps, print every 1 step (to ensure no crash)
+            run_driver!(lf, 10, 100, 100, 0.5, nothing)
+            @test true
+        finally
+            empty!(ARGS)
+            append!(ARGS, orig_args)
+        end
+    end
+end

@@ -364,6 +364,37 @@ function run_driver!(
     cur_save    = save_interval_step
     cur_CFL     = Float64(CFL)
     cur_prefix  = output_prefix
+    cur_interactive = interactive
+
+    # Parse CLI flags from ARGS if any
+    i = 1
+    while i <= length(ARGS)
+        arg = ARGS[i]
+        if arg == "--steps" || arg == "-s"
+            if i + 1 <= length(ARGS)
+                cur_n = parse(Int, ARGS[i+1])
+                i += 1
+            end
+        elseif arg == "--print-freq" || arg == "-p"
+            if i + 1 <= length(ARGS)
+                cur_print = parse(Int, ARGS[i+1])
+                i += 1
+            end
+        elseif arg == "--save-freq" || arg == "-f"
+            if i + 1 <= length(ARGS)
+                cur_save = parse(Int, ARGS[i+1])
+                i += 1
+            end
+        elseif arg == "--cfl" || arg == "-c"
+            if i + 1 <= length(ARGS)
+                cur_CFL = parse(Float64, ARGS[i+1])
+                i += 1
+            end
+        elseif arg == "--non-interactive" || arg == "-n"
+            cur_interactive = false
+        end
+        i += 1
+    end
 
     while true
         time_integrate!(
@@ -378,7 +409,7 @@ function run_driver!(
         show(to; allocations=true, compact=false)
         println()
 
-        interactive || break
+        cur_interactive || break
 
         print("\nSteps to continue [0 to stop]: ")
         line   = strip(readline())
