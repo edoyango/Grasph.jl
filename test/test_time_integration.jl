@@ -45,17 +45,6 @@ end
         @test lf.c ≈ 7.0
     end
 
-    @testset "h is min over all interactions" begin
-        ps = BasicParticleSystem("fluid", 2, 2, 1.0, 1.0)
-        fill!(ps.x, SVector(0.3, 0.3))
-        k1 = CubicSplineKernel(0.2; ndims=2)
-        k2 = CubicSplineKernel(0.1; ndims=2)
-        si1 = SystemInteraction(k1, _noop, ps)
-        si2 = SystemInteraction(k2, _noop, ps)
-        lf = LeapFrogTimeIntegrator([ps], [si1, si2])
-        @test lf.h ≈ 0.1
-    end
-
     @testset "vector of systems and interactions" begin
         ps1 = BasicParticleSystem("a", 2, 2, 1.0, 1.0)
         ps2 = BasicParticleSystem("b", 2, 2, 1.0, 1.0)

@@ -15,11 +15,10 @@ cell list (spatial hash grid).
   sweep of all `system_b` particles within each `system_a` particle's
   neighbourhood.
 
-The cell list uses a linked-list structure: `_cell_head[cell]` is the index
-of the first particle in that cell (0 if empty); `_cell_next[i]` is the index
-of the next particle in the same cell as `i` (0 if last).
-
-`_cell_head` and `_cell_next` are `nothing` until `create_grid!` is called.
+The cell list uses a CSR (Compressed Sparse Row) layout: `_cell_start[c]` is the
+index of the first particle in cell `c` (0 if empty); `_cell_count[c]` is the
+number of particles in cell `c`.  This requires that particles are sorted by cell
+before `create_grid!` is called (handled by `sort_particles!` in the time loop).
 """
 struct SystemInteraction{T<:AbstractFloat, ND, KT<:AbstractKernel{T,ND}, SA<:AbstractParticleSystem{T,ND}, SB<:Union{Nothing,AbstractParticleSystem{T,ND}}, PFNS<:Tuple}
     kernel::KT
@@ -27,13 +26,13 @@ struct SystemInteraction{T<:AbstractFloat, ND, KT<:AbstractKernel{T,ND}, SA<:Abs
     system_a::SA
     system_b::SB
     _mingridx::MVector{ND,T}            # grid origin in each dimension (ndims,)
-    _ngridx::MVector{ND,Int}          # number of cells in each dimension (ndims,)
-    _cell_head::Vector{Int}    # first system_b particle per cell (ncells,)
-    _cell_next::Vector{Int}    # next system_b particle in same cell (n_b,)
-    _cell_head_a::Vector{Int}  # first system_a particle per cell (ncells,); nothing for self-interaction
-    _cell_next_a::Vector{Int}  # next system_a particle in same cell (n_a,);  nothing for self-interaction
-    _mingridx_a::MVector{ND,T}   # min position of system_a particles per dim (ndims,)
-    _maxgridx_a::MVector{ND,T}   # max position of system_a particles per dim (ndims,)
+    _ngridx::MVector{ND,Int}            # number of cells in each dimension (ndims,)
+    _cell_start::Vector{Int}            # first system_b particle in cell c (ncells,); 0 if empty
+    _cell_count::Vector{Int}            # number of system_b particles in cell c (ncells,)
+    _cell_start_a::Vector{Int}          # first system_a particle in cell c (ncells,); 0 if empty (coupled only)
+    _cell_count_a::Vector{Int}          # number of system_a particles in cell c (ncells,) (coupled only)
+    _mingridx_a::MVector{ND,T}          # min position of system_a particles per dim (ndims,)
+    _maxgridx_a::MVector{ND,T}          # max position of system_a particles per dim (ndims,)
     _cell_size::T
     function SystemInteraction{T, ND, KT, SA, SB, PFNS}(args...) where {T, ND, KT, SA, SB, PFNS}
         ND isa Int || throw(ArgumentError("ND must be an Int, got $(typeof(ND))"))
@@ -111,16 +110,16 @@ is_coupled(si::SystemInteraction) = si.system_b !== nothing
 """
     create_grid!(si::SystemInteraction)
 
-Build the cell list used by `sweep!`.
+Build the CSR cell list used by `sweep!`.
 
-Updates `si._mingridx`, `si._ngridx`, `si._cell_head`,
-and `si._cell_next`.
+**Requires pre-sorted particles**: `sort_particles!` must be called on both
+`system_a` and `system_b` (if present) before this function, so that each
+cell's particles occupy a contiguous index range.
+
+Updates `si._mingridx`, `si._ngridx`, `si._cell_start`, and `si._cell_count`.
 
 The grid origin is extended by 2h beyond all particle positions so that
 neighbour-cell accesses in the sweep never go out of bounds.
-
-`_cell_head` is indexed by flat cell index (length ncells).
-`_cell_next` is indexed by particle index (length n_a or n_b).
 """
 function create_grid!(si::SystemInteraction{T}) where {T}
     cutoff = T(si.kernel.interaction_length)
@@ -141,7 +140,7 @@ function _create_grid_impl!(si::SystemInteraction{T}, ::Nothing, cutoff::T) wher
     # simulation — a prerequisite for consistent particle sorting by cell index.
     mingridx = map(v -> floor(v / cutoff) * cutoff, mn .- 2*cutoff)
     maxgridx = mx .+ 2*cutoff
-    _setup_cell_arrays!(si, mingridx, maxgridx, cutoff, length(xa))
+    _setup_cell_arrays!(si, mingridx, maxgridx, cutoff)
     _populate_cells_self!(si, cutoff)
 end
 
@@ -158,7 +157,7 @@ function _create_grid_impl!(si::SystemInteraction{T}, system_b, cutoff::T) where
     end
     mingridx = map(v -> floor(v / cutoff) * cutoff, mn .- 2*cutoff)
     maxgridx = mx .+ 2*cutoff
-    _setup_cell_arrays!(si, mingridx, maxgridx, cutoff, length(xb), length(xa))
+    _setup_cell_arrays!(si, mingridx, maxgridx, cutoff; coupled=true)
     si._mingridx_a .= mn_a
     si._maxgridx_a .= mx_a
     _populate_cells_a!(si, cutoff)
@@ -167,21 +166,15 @@ end
 
 # --- shared setup ---
 
-function _setup_cell_arrays!(si::SystemInteraction{T, ND}, mingridx::SVector{ND, T}, maxgridx::SVector{ND, T}, cutoff::T, n_b::Int, n_a::Union{Nothing,Int}=nothing) where {T, ND}
+function _setup_cell_arrays!(si::SystemInteraction{T, ND}, mingridx::SVector{ND, T}, maxgridx::SVector{ND, T}, cutoff::T; coupled::Bool=false) where {T, ND}
     si._mingridx .= mingridx
     @. si._ngridx = Int(floor((maxgridx - mingridx) / cutoff)) + Int(1)
     ncells = Int(prod(si._ngridx))
-    # si._cell_head = zeros(Int32, ncells)
-    # si._cell_next = zeros(Int32, n_b)
-    resize!(si._cell_head, ncells)
-    si._cell_head .= 0
-    resize!(si._cell_next, n_b)
-    si._cell_next .= 0
-    if n_a !== nothing
-        resize!(si._cell_head_a, ncells)
-        si._cell_head_a .= 0
-        resize!(si._cell_next_a, n_a)
-        si._cell_next_a .= 0
+    resize!(si._cell_start, ncells); fill!(si._cell_start, 0)
+    resize!(si._cell_count, ncells); fill!(si._cell_count, 0)
+    if coupled
+        resize!(si._cell_start_a, ncells); fill!(si._cell_start_a, 0)
+        resize!(si._cell_count_a, ncells); fill!(si._cell_count_a, 0)
     end
 end
 
@@ -198,47 +191,34 @@ end
     return flat + 1          # convert to 1-indexed
 end
 
-function _populate_cells_self!(si::SystemInteraction{T,ND,KT,SA,SB}, cutoff::T) where {T,ND,KT,SA,SB}
-    ngridx   = si._ngridx
-    mingridx = si._mingridx
-    vnd      = Val{ND}()
-    cell_head = si._cell_head
-    cell_next = si._cell_next
-    xa = si.system_a.x
-    @batch for i in 1:length(xa)
-        cell = _cell_1idx(xa[i], mingridx, cutoff, ngridx, vnd)
-        # Atomically swap the new head (i) with the old head using Atomix
-        old_head = Atomix.swap!(Atomix.IndexableRef(cell_head, (cell,)), Int(i))
-        cell_next[i] = old_head
+# Sequential scan over pre-sorted particles to build the CSR cell arrays.
+# Assumes x is sorted so that all particles in the same cell are contiguous.
+function _populate_cells_sorted!(cell_start::Vector{Int}, cell_count::Vector{Int},
+                                  x, mingridx, cutoff, ngridx, vnd)
+    prev_cell = 0
+    @inbounds for i in eachindex(x)
+        cell = _cell_1idx(x[i], mingridx, cutoff, ngridx, vnd)
+        if cell != prev_cell
+            cell_start[cell] = i
+            prev_cell = cell
+        end
+        cell_count[cell] += 1
     end
 end
 
-function _populate_cells_a!(si::SystemInteraction{T,ND,KT,SA,SB}, cutoff::T) where {T,ND,KT,SA,SB}
-    ngridx    = si._ngridx
-    mingridx  = si._mingridx
-    vnd       = Val{ND}()
-    cell_head = si._cell_head_a
-    cell_next = si._cell_next_a
-    xa = si.system_a.x
-    @batch for i in 1:length(xa)
-        cell = _cell_1idx(xa[i], mingridx, cutoff, ngridx, vnd)
-        old_head = Atomix.swap!(Atomix.IndexableRef(cell_head, (cell,)), Int(i))
-        cell_next[i] = old_head
-    end
+function _populate_cells_self!(si::SystemInteraction{T,ND}, cutoff::T) where {T,ND}
+    _populate_cells_sorted!(si._cell_start, si._cell_count,
+                            si.system_a.x, si._mingridx, cutoff, si._ngridx, Val{ND}())
 end
 
-function _populate_cells_b!(si::SystemInteraction{T,ND,KT,SA,SB}, cutoff::T) where {T,ND,KT,SA,SB}
-    ngridx   = si._ngridx
-    mingridx = si._mingridx
-    vnd      = Val{ND}()
-    cell_head = si._cell_head
-    cell_next = si._cell_next
-    xb = si.system_b.x
-    @batch for i in 1:length(xb)
-        cell = _cell_1idx(xb[i], mingridx, cutoff, ngridx, vnd)
-        old_head = Atomix.swap!(Atomix.IndexableRef(cell_head, (cell,)), Int(i))
-        cell_next[i] = old_head
-    end
+function _populate_cells_a!(si::SystemInteraction{T,ND}, cutoff::T) where {T,ND}
+    _populate_cells_sorted!(si._cell_start_a, si._cell_count_a,
+                            si.system_a.x, si._mingridx, cutoff, si._ngridx, Val{ND}())
+end
+
+function _populate_cells_b!(si::SystemInteraction{T,ND}, cutoff::T) where {T,ND}
+    _populate_cells_sorted!(si._cell_start, si._cell_count,
+                            si.system_b.x, si._mingridx, cutoff, si._ngridx, Val{ND}())
 end
 
 # ---------------------------------------------------------------------------
@@ -314,8 +294,8 @@ _sweep_dispatch!(si, system_b, pfn) = _sweep_coupled!(si, system_b, pfn)
 #
 # Forward offsets (Δci, Δcj):  (+1,0), (-1,+1), (0,+1), (+1,+1)
 #
-# Same-cell pairs are handled with ii/jj ordered traversal (jj starts at
-# cell_next[ii], not cell_head) so each (ii,jj) pair is visited once.
+# Same-cell pairs are handled with nested for loops (jj > ii) so each
+# (ii,jj) pair is visited once.
 #
 # COLOURING FOR CONFLICT-FREE PARALLEL EXECUTION
 # ===============================================
@@ -360,16 +340,15 @@ end
 
 # 2D Specialisation: 6-colour sweep
 function _sweep_self!(si::SystemInteraction{T,2}, pfn::PFN) where {T,PFN}
-    ps_a      = si.system_a
-    kernel    = si.kernel
-    h         = T(kernel.h)
-    cutoff_sq = si._cell_size * si._cell_size
-    cell_head = si._cell_head::Vector{Int}
-    cell_next = si._cell_next::Vector{Int}
-    nc_y      = Int(si._ngridx[2])
-    nc_x      = Int(si._ngridx[1])
-    xa        = ps_a.x
-    vnd       = Val{2}()
+    ps_a       = si.system_a
+    kernel     = si.kernel
+    h          = T(kernel.h)
+    cutoff_sq  = si._cell_size * si._cell_size
+    cell_start = si._cell_start::Vector{Int}
+    cell_count = si._cell_count::Vector{Int}
+    nc_y       = Int(si._ngridx[2])
+    nc_x       = Int(si._ngridx[1])
+    vnd        = Val{2}()
 
     # Forward neighbour offsets (2D): (+1,0), (-1,+1), (0,+1), (+1,+1)
     forward_dflat = (nc_y, -nc_y+1, 1, nc_y+1)
@@ -384,29 +363,28 @@ function _sweep_self!(si::SystemInteraction{T,2}, pfn::PFN) where {T,PFN}
             ci   = ci_start + i_ci * 3
             cj   = cj_start + i_cj * 2
             flat = (ci - 1) * nc_y + cj
+            s    = cell_start[flat]
+            cnt  = cell_count[flat]
 
-            # Same-cell half-shell
-            ii = Int(cell_head[flat])
-            while ii != 0
-                jj = Int(cell_next[ii])
-                while jj != 0
+            # Same-cell half-shell (ii < jj, so each pair visited once)
+            for ii in s:s+cnt-2
+                for jj in ii+1:s+cnt-1
                     _pair_self!(pfn, ps_a, ii, jj, kernel, h, cutoff_sq, vnd)
-                    jj = Int(cell_next[jj])
                 end
-                ii = Int(cell_next[ii])
             end
 
-            # Cross-cell forward neighbours
-            for k in 1:4
-                nflat = flat + forward_dflat[k]
-                ii = Int(cell_head[flat])
-                while ii != 0
-                    jj = Int(cell_head[nflat])
-                    while jj != 0
-                        _pair_self!(pfn, ps_a, ii, jj, kernel, h, cutoff_sq, vnd)
-                        jj = Int(cell_next[jj])
+            # Cross-cell forward neighbours — skip empty cells to avoid
+            # computing out-of-bounds nflat indices for boundary cells.
+            if cnt > 0
+                for k in 1:4
+                    nflat = flat + forward_dflat[k]
+                    ns   = cell_start[nflat]
+                    ncnt = cell_count[nflat]
+                    for ii in s:s+cnt-1
+                        for jj in ns:ns+ncnt-1
+                            _pair_self!(pfn, ps_a, ii, jj, kernel, h, cutoff_sq, vnd)
+                        end
                     end
-                    ii = Int(cell_next[ii])
                 end
             end
         end
@@ -429,18 +407,17 @@ end
 # 2 × 3 × 3 = 18 colours total.
 #   colour = (ci-1)%2 * 9 + (cj-1)%3 * 3 + (ck-1)%3
 function _sweep_self!(si::SystemInteraction{T,3}, pfn::PFN) where {T,PFN}
-    ps_a      = si.system_a
-    kernel    = si.kernel
-    h         = T(kernel.h)
-    cutoff_sq = si._cell_size * si._cell_size
-    cell_head = si._cell_head::Vector{Int}
-    cell_next = si._cell_next::Vector{Int}
-    nc_z      = Int(si._ngridx[3])
-    nc_y      = Int(si._ngridx[2])
-    nc_x      = Int(si._ngridx[1])
-    ncyz      = nc_y * nc_z
-    xa        = ps_a.x
-    vnd       = Val{3}()
+    ps_a       = si.system_a
+    kernel     = si.kernel
+    h          = T(kernel.h)
+    cutoff_sq  = si._cell_size * si._cell_size
+    cell_start = si._cell_start::Vector{Int}
+    cell_count = si._cell_count::Vector{Int}
+    nc_z       = Int(si._ngridx[3])
+    nc_y       = Int(si._ngridx[2])
+    nc_x       = Int(si._ngridx[1])
+    ncyz       = nc_y * nc_z
+    vnd        = Val{3}()
 
     # Forward neighbour offsets (3D, 13 neighbors)
     forward_dflat = (
@@ -466,29 +443,27 @@ function _sweep_self!(si::SystemInteraction{T,3}, pfn::PFN) where {T,PFN}
             cj   = cj_start + i_cj * 3
             ck   = ck_start + i_ck * 3
             flat = (ci - 1) * ncyz + (cj - 1) * nc_z + ck
+            s    = cell_start[flat]
+            cnt  = cell_count[flat]
 
-            # Same-cell
-            ii = Int(cell_head[flat])
-            while ii != 0
-                jj = Int(cell_next[ii])
-                while jj != 0
+            # Same-cell half-shell (ii < jj)
+            for ii in s:s+cnt-2
+                for jj in ii+1:s+cnt-1
                     _pair_self!(pfn, ps_a, ii, jj, kernel, h, cutoff_sq, vnd)
-                    jj = Int(cell_next[jj])
                 end
-                ii = Int(cell_next[ii])
             end
 
-            # Forward neighbors
-            for k in 1:13
-                nflat = flat + forward_dflat[k]
-                ii = Int(cell_head[flat])
-                while ii != 0
-                    jj = Int(cell_head[nflat])
-                    while jj != 0
-                        _pair_self!(pfn, ps_a, ii, jj, kernel, h, cutoff_sq, vnd)
-                        jj = Int(cell_next[jj])
+            # Forward neighbors — skip empty cells to avoid out-of-bounds nflat.
+            if cnt > 0
+                for k in 1:13
+                    nflat = flat + forward_dflat[k]
+                    ns   = cell_start[nflat]
+                    ncnt = cell_count[nflat]
+                    for ii in s:s+cnt-1
+                        for jj in ns:ns+ncnt-1
+                            _pair_self!(pfn, ps_a, ii, jj, kernel, h, cutoff_sq, vnd)
+                        end
                     end
-                    ii = Int(cell_next[ii])
                 end
             end
         end
@@ -528,29 +503,27 @@ end
 #
 #   colour = (ci-1)%3 * 3 + (cj-1)%3,   colours 0..8
 #
-# The loop iterates over cells of system_a using the _cell_head_a/_cell_next_a
-# linked list built by create_grid!.
+# The loop iterates over cells of system_a using the _cell_start_a/_cell_count_a
+# CSR arrays built by create_grid!.
 
 function _sweep_coupled!(si::SystemInteraction, system_b, ::Nothing)
 end
 
 # 2D Specialisation: 9-colour sweep
 function _sweep_coupled!(si::SystemInteraction{T,2}, system_b, pfn::PFN) where {T,PFN}
-    ps_a        = si.system_a
-    kernel      = si.kernel
-    h           = T(kernel.h)
-    cutoff_sq   = si._cell_size * si._cell_size
-    cell_head   = si._cell_head::Vector{Int}
-    cell_next   = si._cell_next::Vector{Int}
-    cell_head_a = si._cell_head_a::Vector{Int}
-    cell_next_a = si._cell_next_a::Vector{Int}
-    nc_y        = Int(si._ngridx[2])
-    nc_x        = Int(si._ngridx[1])
-    xa          = ps_a.x
-    xb          = system_b.x
-    vnd         = Val{2}()
-    cutoff      = si._cell_size
-    mingridx    = si._mingridx
+    ps_a          = si.system_a
+    kernel        = si.kernel
+    h             = T(kernel.h)
+    cutoff_sq     = si._cell_size * si._cell_size
+    cell_start    = si._cell_start::Vector{Int}
+    cell_count    = si._cell_count::Vector{Int}
+    cell_start_a  = si._cell_start_a::Vector{Int}
+    cell_count_a  = si._cell_count_a::Vector{Int}
+    nc_y          = Int(si._ngridx[2])
+    nc_x          = Int(si._ngridx[1])
+    vnd           = Val{2}()
+    cutoff        = si._cell_size
+    mingridx      = si._mingridx
     ci_lo = floor(Int, (si._mingridx_a[1] - mingridx[1]) / cutoff) + 1
     ci_hi = floor(Int, (si._maxgridx_a[1] - mingridx[1]) / cutoff) + 1
     cj_lo = floor(Int, (si._mingridx_a[2] - mingridx[2]) / cutoff) + 1
@@ -566,19 +539,19 @@ function _sweep_coupled!(si::SystemInteraction{T,2}, system_b, pfn::PFN) where {
             ci   = ci_start + i_ci * 3
             cj   = cj_start + i_cj * 3
             flat = (ci - 1) * nc_y + cj
-            ii = Int(cell_head_a[flat])
-            while ii != 0
+            sa   = cell_start_a[flat]
+            cna  = cell_count_a[flat]
+            for ii in sa:sa+cna-1
                 for dxcell in -1:1
                     for dycell in -1:1
                         nidx = flat + dxcell * nc_y + dycell
-                        jj   = Int(cell_head[nidx])
-                        while jj != 0
+                        sb   = cell_start[nidx]
+                        cnb  = cell_count[nidx]
+                        for jj in sb:sb+cnb-1
                             _pair_coupled!(pfn, ps_a, system_b, ii, jj, kernel, h, cutoff_sq, vnd)
-                            jj = Int(cell_next[jj])
                         end
                     end
                 end
-                ii = Int(cell_next_a[ii])
             end
         end
     end
@@ -586,23 +559,21 @@ end
 
 # 3D Specialisation: 27-colour sweep
 function _sweep_coupled!(si::SystemInteraction{T,3}, system_b, pfn::PFN) where {T,PFN}
-    ps_a        = si.system_a
-    kernel      = si.kernel
-    h           = T(kernel.h)
-    cutoff_sq   = si._cell_size * si._cell_size
-    cell_head   = si._cell_head::Vector{Int}
-    cell_next   = si._cell_next::Vector{Int}
-    cell_head_a = si._cell_head_a::Vector{Int}
-    cell_next_a = si._cell_next_a::Vector{Int}
-    nc_z        = Int(si._ngridx[3])
-    nc_y        = Int(si._ngridx[2])
-    nc_x        = Int(si._ngridx[1])
-    ncyz        = nc_y * nc_z
-    xa          = ps_a.x
-    xb          = system_b.x
-    vnd         = Val{3}()
-    cutoff      = si._cell_size
-    mingridx    = si._mingridx
+    ps_a          = si.system_a
+    kernel        = si.kernel
+    h             = T(kernel.h)
+    cutoff_sq     = si._cell_size * si._cell_size
+    cell_start    = si._cell_start::Vector{Int}
+    cell_count    = si._cell_count::Vector{Int}
+    cell_start_a  = si._cell_start_a::Vector{Int}
+    cell_count_a  = si._cell_count_a::Vector{Int}
+    nc_z          = Int(si._ngridx[3])
+    nc_y          = Int(si._ngridx[2])
+    nc_x          = Int(si._ngridx[1])
+    ncyz          = nc_y * nc_z
+    vnd           = Val{3}()
+    cutoff        = si._cell_size
+    mingridx      = si._mingridx
     ci_lo = floor(Int, (si._mingridx_a[1] - mingridx[1]) / cutoff) + 1
     ci_hi = floor(Int, (si._maxgridx_a[1] - mingridx[1]) / cutoff) + 1
     cj_lo = floor(Int, (si._mingridx_a[2] - mingridx[2]) / cutoff) + 1
@@ -625,21 +596,21 @@ function _sweep_coupled!(si::SystemInteraction{T,3}, system_b, pfn::PFN) where {
             cj   = cj_start + i_cj * 3
             ck   = ck_start + i_ck * 3
             flat = (ci - 1) * ncyz + (cj - 1) * nc_z + ck
-            ii = Int(cell_head_a[flat])
-            while ii != 0
+            sa   = cell_start_a[flat]
+            cna  = cell_count_a[flat]
+            for ii in sa:sa+cna-1
                 for dxcell in -1:1
                     for dycell in -1:1
                         for dzcell in -1:1
                             nidx = flat + dxcell * ncyz + dycell * nc_z + dzcell
-                            jj   = Int(cell_head[nidx])
-                            while jj != 0
+                            sb   = cell_start[nidx]
+                            cnb  = cell_count[nidx]
+                            for jj in sb:sb+cnb-1
                                 _pair_coupled!(pfn, ps_a, system_b, ii, jj, kernel, h, cutoff_sq, vnd)
-                                jj = Int(cell_next[jj])
                             end
                         end
                     end
                 end
-                ii = Int(cell_next_a[ii])
             end
         end
     end

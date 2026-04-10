@@ -56,8 +56,8 @@ _dummy_pairwise(args...) = nothing
     @testset "grid arrays are empty before create_grid!" begin
         ps = _make_ps()
         si = SystemInteraction(_make_kernel(), _dummy_pairwise, ps)
-        @test isempty(si._cell_head)
-        @test isempty(si._cell_next)
+        @test isempty(si._cell_start)
+        @test isempty(si._cell_count)
     end
 
     # ------------------------------------------------------------------

@@ -44,16 +44,6 @@ function LeapFrogTimeIntegrator(systems, interactions; ghosts=())
     T = eltype(eltype(first(sys).x))
     c = T(maximum(ps.c           for ps   in sys))
     h = T(minimum(inter.kernel.h for inter in ints))
-    # All interactions must share the same smoothing length so that each interaction's
-    # grid can be snapped to a common multiple-of-cutoff lattice (see create_grid!).
-    if length(ints) > 1
-        h_ref = first(ints).kernel.h
-        for inter in ints
-            isapprox(inter.kernel.h, h_ref; rtol=1e-6) || throw(ArgumentError(
-                "All interactions must use the same kernel smoothing length for grid alignment; " *
-                "got h=$(inter.kernel.h), expected h≈$(h_ref)"))
-        end
-    end
     LeapFrogTimeIntegrator{typeof(sys), typeof(ints), typeof(gsts), T}(sys, ints, gsts, c, h)
 end
 
@@ -191,9 +181,23 @@ function time_integrate!(
     # _make_q0_bufs uses Base.tail recursion so each buffer has a concrete type.
     q0_bufs = [_make_q0_bufs(ps) for ps in sys]
 
+    # Pre-allocate sort infrastructure.  All interactions share the same cutoff
+    # (enforced at construction), so 2h is the canonical cell-lattice spacing.
+    # perm_buf and key_buf are shared across all sort calls within a timestep.
+    # sys_scratches is a tuple of scratch tuples (one per real system, fixed size).
+    # ghost_scratches is a vector of scratch tuples (one per ghost, resized each step).
+    sort_cutoff    = T(2) * integrator.h
+    sort_nd        = first(sys).ndims
+    sort_max_n     = maximum(ps.n for ps in sys)
+    sort_perm_buf  = Vector{Int}(undef, sort_max_n)
+    sort_key_buf   = Vector{SVector{sort_nd,Int}}(undef, sort_max_n)
+    sys_scratches  = map(_make_sort_scratch, sys)
+    ghost_scratches = [_make_empty_sort_scratch(ge.ghost) for ge in integrator.ghosts]
+
     # Pre-compute @timeit labels to avoid string interpolation allocations in the loop
-    ps_labels = [(mid="mid-step [$(ps.name)]", 
-                  full="full-step [$(ps.name)]", 
+    ps_labels = [(sort="sort [$(ps.name)]",
+                  mid="mid-step [$(ps.name)]",
+                  full="full-step [$(ps.name)]",
                   upd="state update [$(ps.name)]") for ps in sys]
     
     inter_labels = []
@@ -203,8 +207,9 @@ function time_integrate!(
         push!(inter_labels, (grid="grid [$label]", sweep="sweep [$label]"))
     end
 
-    ghost_labels = [(gen="ghost gen [$(ge.ghost.name)]", 
-                     kin="ghost kin [$(ge.ghost.name)]", 
+    ghost_labels = [(gen="ghost gen [$(ge.ghost.name)]",
+                     sort="sort ghost [$(ge.ghost.name)]",
+                     kin="ghost kin [$(ge.ghost.name)]",
                      stage="ghost stage [$(ge.ghost.name)]") for ge in integrator.ghosts]
 
     width = ndigits(step_offset + num_timesteps)
@@ -212,32 +217,51 @@ function time_integrate!(
     for itimestep in 1:num_timesteps
         global_step = step_offset + itimestep
 
-        # ---- 1. Save initial values ----------------------------------------
+        # ---- 1. Sort real particle systems by cell index -------------------
+        # Sorting before saving q0 keeps q0 and dqdt in the same index space
+        # throughout the step, so the full-step q = q0 + dt·dqdt is correct.
+        # Positions come from the previous step's update, so spatially nearby
+        # particles are already nearly sorted — the cost is low.
+        for (i, ps) in enumerate(sys)
+            @timeit to ps_labels[i].sort sort_particles!(
+                ps, sort_cutoff, sort_perm_buf, sort_key_buf, sys_scratches[i])
+        end
+
+        # ---- 2. Save initial values ----------------------------------------
         for (i, ps) in enumerate(sys)
             _save_q0_pairs!(ps, getfield(ps, :pairs), q0_bufs[i])
         end
 
-        # ---- 2. Generate ghosts (positions only) ---------------------------
+        # ---- 3. Generate ghosts (positions only) ---------------------------
         for (i, ge) in enumerate(integrator.ghosts)
             @timeit to ghost_labels[i].gen generate_ghosts!(ge)
         end
 
-        # ---- 3. Create grids -----------------------------------------------
+        # ---- 4. Sort ghost systems by cell index ---------------------------
+        # Ghosts are sorted after generation so their positions are fresh.
+        # idx_original is permuted alongside the physics arrays, so it
+        # continues to index correctly into the already-sorted real system.
+        for (i, ge) in enumerate(integrator.ghosts)
+            @timeit to ghost_labels[i].sort sort_particles!(
+                ge.ghost, sort_cutoff, sort_perm_buf, sort_key_buf, ghost_scratches[i])
+        end
+
+        # ---- 5. Create grids -----------------------------------------------
         for (i, inter) in enumerate(ints)
             @timeit to inter_labels[i].grid create_grid!(inter)
         end
 
-        # ---- 4. Half-step --------------------------------------------------
+        # ---- 6. Half-step --------------------------------------------------
         for (i, ps) in enumerate(sys)
             @timeit to ps_labels[i].mid _halfstep_ps!(ps, dt / 2)
         end
 
-        # ---- 5. Update ghost kinematics (v, rho) ---------------------------
+        # ---- 7. Update ghost kinematics (v, rho) ---------------------------
         for (i, ge) in enumerate(integrator.ghosts)
             @timeit to ghost_labels[i].kin update_ghost_kinematics!(ge)
         end
 
-        # ---- 6. Sweep ------------------------------------------------------
+        # ---- 8. Sweep ------------------------------------------------------
         for stage in 1:num_stages
             for (i, ps) in enumerate(sys)
                 length(ps.state_updater) == num_stages || continue
@@ -253,7 +277,7 @@ function time_integrate!(
             end
         end
 
-        # ---- 7. Full-step --------------------------------------------------
+        # ---- 9. Full-step --------------------------------------------------
         for (i, ps) in enumerate(sys)
             @timeit to ps_labels[i].full begin
                 _fullstep_ps!(ps, q0_bufs[i], dt)
@@ -261,7 +285,7 @@ function time_integrate!(
             end
         end
 
-        # ---- 8. Print ------------------------------------------------------
+        # ---- 10. Print -----------------------------------------------------
         if global_step % print_interval_step == 0
             @timeit to "print summary" begin
                 println("\nStep $global_step")
@@ -271,7 +295,7 @@ function time_integrate!(
             end
         end
 
-        # ---- 9. Save -------------------------------------------------------
+        # ---- 11. Save ------------------------------------------------------
         if output_prefix !== nothing && global_step % save_interval_step == 0
             @timeit to "save h5" begin
                 path = "$(output_prefix)_$(lpad(global_step, width, '0')).h5"

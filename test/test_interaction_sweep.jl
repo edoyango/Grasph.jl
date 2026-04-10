@@ -42,13 +42,11 @@ function _inject_self_grid!(si, n; ngrid=(4, 4))
     ncells = prod(ngrid)
     nc_y   = ngrid[2]
     cell   = (2 - 1) * nc_y + 2   # ci=2, cj=2 → flat index
-    si._ngridx .= Int32[ngrid[1], ngrid[2]]
-    resize!(si._cell_head, ncells); si._cell_head .= 0
-    resize!(si._cell_next, n);      si._cell_next .= 0
-    for i in 1:n
-        si._cell_next[i]   = si._cell_head[cell]
-        si._cell_head[cell] = Int32(i)
-    end
+    si._ngridx .= [ngrid[1], ngrid[2]]
+    resize!(si._cell_start, ncells); fill!(si._cell_start, 0)
+    resize!(si._cell_count, ncells); fill!(si._cell_count, 0)
+    si._cell_start[cell] = 1
+    si._cell_count[cell] = n
 end
 
 # Place all n_a system_a particles and all n_b system_b particles in the
@@ -60,23 +58,19 @@ function _inject_coupled_grid!(si, n_a, n_b; ngrid=(5, 5))
     ncells = prod(ngrid)
     nc_y   = ngrid[2]
     center = (3 - 1) * nc_y + 3               # ci=3, cj=3
-    si._ngridx .= Int32[ngrid[1], ngrid[2]]
-    resize!(si._cell_head,   ncells); si._cell_head   .= 0
-    resize!(si._cell_next,   n_b);    si._cell_next   .= 0
-    resize!(si._cell_head_a, ncells); si._cell_head_a .= 0
-    resize!(si._cell_next_a, n_a);    si._cell_next_a .= 0
+    si._ngridx .= [ngrid[1], ngrid[2]]
+    resize!(si._cell_start,   ncells); fill!(si._cell_start,   0)
+    resize!(si._cell_count,   ncells); fill!(si._cell_count,   0)
+    resize!(si._cell_start_a, ncells); fill!(si._cell_start_a, 0)
+    resize!(si._cell_count_a, ncells); fill!(si._cell_count_a, 0)
     cutoff = si._cell_size
     si._mingridx   .= 0.0
     si._mingridx_a .= 2 * cutoff   # lower bound of cell ci=cj=3: (3-1)*cutoff
     si._maxgridx_a .= 2 * cutoff
-    for i in 1:n_b
-        si._cell_next[i]       = si._cell_head[center]
-        si._cell_head[center]  = Int32(i)
-    end
-    for i in 1:n_a
-        si._cell_next_a[i]       = si._cell_head_a[center]
-        si._cell_head_a[center]  = Int32(i)
-    end
+    si._cell_start[center]   = 1
+    si._cell_count[center]   = n_b
+    si._cell_start_a[center] = 1
+    si._cell_count_a[center] = n_a
 end
 
 _make_ps(; n=2, ndims=2)   = BasicParticleSystem("test", n, ndims, 1.0, 1.0)

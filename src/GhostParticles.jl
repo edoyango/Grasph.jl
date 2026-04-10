@@ -24,13 +24,13 @@ Pass one or more `GhostCopier`s to `GhostParticleSystem` to declare which
 fields should be owned and how they should be refreshed per stage:
 
     ghost = GhostParticleSystem(ps,
-                GhostCopier(:rho, :stress),   # stage 1: copy rho + stress
-                GhostCopier(:rho))            # stage 2: copy rho only
+                GhostCopier(:p, :stress),   # stage 1: copy p + stress
+                GhostCopier(:p))            # stage 2: copy p only
 
 Calling `update_ghost!(ghost, stage)` invokes the stage-th copier.
 
-To add a field for a future particle system type (e.g. temperature), simply
-include it in the copier — no changes to the ghost machinery are needed.
+Density (:rho) is core kinematics and is updated every step automatically;
+you generally do not need to include it in a copier.
 """
 struct GhostCopier{fields} <: AbstractGhostUpdater end
 
@@ -86,24 +86,19 @@ behaviour are fully specified by the `GhostCopier`s supplied at construction.
     # No field copying:
     ghost = GhostParticleSystem(ps)
 
-    # Copy rho+stress at stage 1, rho only at stage 2:
-    ghost = GhostParticleSystem(ps,
-                GhostCopier(:rho, :stress),
-                GhostCopier(:rho))
-
 `extras` is a `NamedTuple` containing one `Vector` per field in the union of
-all copier field lists; it is the single source of truth for which fields are
-owned.  Scalar source fields (`mass`, `c`, …) are forwarded directly and are
-not stored in `extras`.
+all copier field lists. `x`, `v`, and `rho` are first-class fields updated
+every step. Scalar source fields (`mass`, `c`, …) are forwarded directly.
 """
 struct GhostParticleSystem{T<:AbstractFloat, ND, PS<:AbstractParticleSystem{T,ND}, ET<:NamedTuple, UPD<:Tuple} <: AbstractGhostParticleSystem{T, ND}
     name::String
     x::Vector{SVector{ND,T}}    # reflected positions — owned
     v::Vector{SVector{ND,T}}    # reflected velocities — owned
+    rho::Vector{T}              # mirrored density — owned
     idx_original::Vector{Int}   # ghost k → source particle index
     source::PS
-    extras::ET                  # owned copies: (rho=…, stress=…, …)
-    updaters::UPD               # per-stage GhostCopier instances
+    extras::ET                  # owned copies: (p=…, stress=…, …)
+    updaters::UPD               # per-stage GhostCopier or nothing instances
     function GhostParticleSystem{T, ND, PS, ET, UPD}(args...) where {T, ND, PS, ET, UPD}
         ND isa Int || throw(ArgumentError("ND must be an Int, got $(typeof(ND))"))
         new{T, ND, PS, ET, UPD}(args...)
@@ -115,11 +110,8 @@ end
 
 Allocate a ghost system backed by `ps`.
 
-Each positional argument after `ps` is a `GhostCopier` defining which fields
-to copy at each corresponding sweep stage.  The union of all listed fields is
-used to pre-allocate contiguous owned arrays in `extras`.  If no copiers are
-given, `extras` still owns a `rho` array (always included) and no other
-field copying occurs.
+Each positional argument after `ps` is a `GhostCopier` (or `nothing`) defining
+which fields to copy at each corresponding sweep stage.
 """
 function GhostParticleSystem(
     ps::AbstractParticleSystem{T,ND},
@@ -129,13 +121,12 @@ function GhostParticleSystem(
     n      = ps.n
     gname  = name === nothing ? "ghost[$(ps.name)]" : String(name)
     fields = _all_extras_fields(updaters)
-    # rho is always owned — update_ghost_kinematics! copies it unconditionally
-    fields = :rho in fields ? fields : (:rho, fields...)
     extras = _build_extras(ps, fields)
     GhostParticleSystem{T, ND, typeof(ps), typeof(extras), typeof(updaters)}(
         gname,
         Vector{SVector{ND,T}}(undef, n),
         Vector{SVector{ND,T}}(undef, n),
+        Vector{T}(undef, n),
         Vector{Int}(undef, n),
         ps,
         extras,
@@ -150,9 +141,9 @@ end
 @inline function Base.getproperty(g::GhostParticleSystem{T,ND,PS,ET,UPD}, s::Symbol) where {T,ND,PS,ET,UPD}
     s === :ndims && return ND
     s === :n     && return length(getfield(g, :x))
-    s in (:name, :x, :v, :idx_original, :source, :extras, :updaters) && return getfield(g, s)
+    s in (:name, :x, :v, :rho, :idx_original, :source, :extras, :updaters) && return getfield(g, s)
 
-    # Owned copies (rho, p, stress, …) — contiguous, cache-friendly
+    # Owned copies (p, stress, …) — contiguous, cache-friendly
     s in fieldnames(ET) && return getproperty(getfield(g, :extras), s)
 
     # Scalars (mass, c, …) forwarded directly from source
@@ -169,9 +160,8 @@ end
 Populate `ghost` from `ghost.source` by reflecting qualifying real particles
 across the plane defined by `normal` (unit vector) and `point`.
 
-Resizes and fills `x`, `idx_original`, and all `extras` arrays to the
-qualifying count.  Does **not** populate `extras` — call `update_ghost!(ghost,
-stage)` explicitly (or rely on the integrator) to copy physics fields.
+Resizes all owned arrays to the qualifying count. Call `update_ghost_kinematics!`
+and `update_ghost!` to populate physics values.
 """
 function generate_ghosts!(
     ghost::GhostParticleSystem{T,ND},
@@ -193,6 +183,7 @@ function generate_ghosts!(
     # Resize all owned arrays to exact count
     resize!(getfield(ghost, :x),            k)
     resize!(getfield(ghost, :v),            k)
+    resize!(getfield(ghost, :rho),          k)
     resize!(getfield(ghost, :idx_original), k)
     for arr in getfield(ghost, :extras)
         resize!(arr, k)
@@ -245,7 +236,7 @@ update_ghost!(ghost::GhostParticleSystem, stage::Int) =
     update_ghost_kinematics!(ghost::GhostParticleSystem, normal)
 
 Update ghost velocities by reflecting source velocities across the boundary
-normal, and copy source densities (rho is always owned by every ghost).
+normal, and mirror source densities.
 """
 function update_ghost_kinematics!(
     ghost::GhostParticleSystem{T,ND},
@@ -256,7 +247,7 @@ function update_ghost_kinematics!(
     idx       = getfield(ghost, :idx_original)
     v_ghost   = getfield(ghost, :v)
     v_real    = ps.v
-    rho_ghost = getproperty(getfield(ghost, :extras), :rho)
+    rho_ghost = getfield(ghost, :rho)
     rho_real  = ps.rho
 
     @inbounds for k in 1:n
@@ -275,7 +266,6 @@ end
 
 Bundles a ghost particle system with the boundary plane geometry
 (`normal`, `point`, `cutoff`) needed to regenerate it each timestep.
-The ghost system itself holds the per-stage `GhostCopier`s.
 """
 struct GhostEntry{GPS<:AbstractGhostParticleSystem, ND, T<:AbstractFloat}
     ghost::GPS
@@ -331,9 +321,17 @@ function write_h5(ghost::GhostParticleSystem{T,ND,PS,ET,UPD}, group::Union{HDF5.
     if n > 0
         group["x"]            = reinterpret(reshape, T, ghost.x)
         group["v"]            = reinterpret(reshape, T, ghost.v)
+        group["rho"]          = ghost.rho
         group["idx_original"] = getfield(ghost, :idx_original)
-        :rho    in fieldnames(ET) && (group["rho"]    = ghost.rho)
-        :p      in fieldnames(ET) && (group["p"]      = ghost.p)
-        :stress in fieldnames(ET) && (group["stress"] = reinterpret(reshape, T, ghost.stress))
+        
+        # Genericly save all extra fields
+        for fname in fieldnames(ET)
+            arr = getproperty(ghost.extras, fname)
+            if eltype(arr) <: SVector
+                group[string(fname)] = reinterpret(reshape, T, arr)
+            else
+                group[string(fname)] = arr
+            end
+        end
     end
 end

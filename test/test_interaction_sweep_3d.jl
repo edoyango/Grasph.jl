@@ -34,12 +34,10 @@ function _inject_self_grid_3d!(si, n; ngrid=(4, 4, 4))
     # Place in cell (2,2,2)
     cell = (2 - 1) * (nc_y * nc_z) + (2 - 1) * nc_z + 2
     si._ngridx .= Int[ngrid[1], ngrid[2], ngrid[3]]
-    resize!(si._cell_head, ncells); si._cell_head .= 0
-    resize!(si._cell_next, n);      si._cell_next .= 0
-    for i in 1:n
-        si._cell_next[i]   = si._cell_head[cell]
-        si._cell_head[cell] = Int(i)
-    end
+    resize!(si._cell_start, ncells); fill!(si._cell_start, 0)
+    resize!(si._cell_count, ncells); fill!(si._cell_count, 0)
+    si._cell_start[cell] = 1
+    si._cell_count[cell] = n
 end
 
 function _inject_coupled_grid_3d!(si, n_a, n_b; ngrid=(5, 5, 5))
@@ -48,22 +46,18 @@ function _inject_coupled_grid_3d!(si, n_a, n_b; ngrid=(5, 5, 5))
     # Place in center cell (3,3,3)
     center = (3 - 1) * (nc_y * nc_z) + (3 - 1) * nc_z + 3
     si._ngridx .= Int[ngrid[1], ngrid[2], ngrid[3]]
-    resize!(si._cell_head,   ncells); si._cell_head   .= 0
-    resize!(si._cell_next,   n_b);    si._cell_next   .= 0
-    resize!(si._cell_head_a, ncells); si._cell_head_a .= 0
-    resize!(si._cell_next_a, n_a);    si._cell_next_a .= 0
+    resize!(si._cell_start,   ncells); fill!(si._cell_start,   0)
+    resize!(si._cell_count,   ncells); fill!(si._cell_count,   0)
+    resize!(si._cell_start_a, ncells); fill!(si._cell_start_a, 0)
+    resize!(si._cell_count_a, ncells); fill!(si._cell_count_a, 0)
     cutoff = si._cell_size
     si._mingridx   .= 0.0
     si._mingridx_a .= 2 * cutoff
     si._maxgridx_a .= 2 * cutoff
-    for i in 1:n_b
-        si._cell_next[i]       = si._cell_head[center]
-        si._cell_head[center]  = Int(i)
-    end
-    for i in 1:n_a
-        si._cell_next_a[i]       = si._cell_head_a[center]
-        si._cell_head_a[center]  = Int(i)
-    end
+    si._cell_start[center]   = 1
+    si._cell_count[center]   = n_b
+    si._cell_start_a[center] = 1
+    si._cell_count_a[center] = n_a
 end
 
 _make_ps_3d(; n=2)   = BasicParticleSystem("test", n, 3, 1.0, 1.0)

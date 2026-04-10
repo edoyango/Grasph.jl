@@ -6,47 +6,39 @@ _make_ps(; n=10, ndims=2) = BasicParticleSystem("test", n, ndims, 1.0, 1.0)
 _make_k(; h=0.1, ndims=2)  = CubicSplineKernel(h; ndims=ndims)
 _noop(args...)              = nothing
 
-# Count particles in a single cell by traversing its linked list.
+# Count particles in a single cell.
 function _cell_count(si, cell)
-    n = 0
-    j = Int(si._cell_head[cell])
-    while j != 0
-        n += 1
-        j = Int(si._cell_next[j])
-    end
-    n
+    si._cell_count[cell]
 end
 
-# Count all particles reachable from any cell head.
+# Count all particles across all cells.
 function _total_count(si)
-    total = 0
-    for c in eachindex(si._cell_head)
-        total += _cell_count(si, c)
-    end
-    total
+    sum(si._cell_count)
 end
 
-# Build a particle-index → cell-index mapping from the system_b (or self) linked list.
+# Build a particle-index → cell-index mapping from the system_b (or self) CSR arrays.
 function _particle_to_cell(si)
     result = Dict{Int,Int}()
-    for c in eachindex(si._cell_head)
-        j = Int(si._cell_head[c])
-        while j != 0
+    for c in eachindex(si._cell_start)
+        cnt = si._cell_count[c]
+        cnt == 0 && continue
+        s = si._cell_start[c]
+        for j in s:s+cnt-1
             result[j] = c
-            j = Int(si._cell_next[j])
         end
     end
     result
 end
 
-# Build a particle-index → cell-index mapping from the system_a linked list.
+# Build a particle-index → cell-index mapping from the system_a CSR arrays.
 function _particle_to_cell_a(si)
     result = Dict{Int,Int}()
-    for c in eachindex(si._cell_head_a)
-        j = Int(si._cell_head_a[c])
-        while j != 0
+    for c in eachindex(si._cell_start_a)
+        cnt = si._cell_count_a[c]
+        cnt == 0 && continue
+        s = si._cell_start_a[c]
+        for j in s:s+cnt-1
             result[j] = c
-            j = Int(si._cell_next_a[j])
         end
     end
     result
@@ -114,8 +106,8 @@ end
         si = SystemInteraction(_make_k(), _noop, ps)
         fill!(ps.x, zero(SVector{2,Float64}))
         create_grid!(si)
-        @test !isempty(si._cell_head)
-        @test !isempty(si._cell_next)
+        @test !isempty(si._cell_start)
+        @test !isempty(si._cell_count)
     end
 
     @testset "repeated create_grid! gives consistent results" begin
@@ -212,7 +204,7 @@ end
         # system_a's cell has no system_b particles (they are far apart)
         @test _cell_count(si, cells_a[1]) == 0
         # exactly one cell contains all system_b particles
-        occupied = findall(c -> _cell_count(si, c) > 0, eachindex(si._cell_head))
+        occupied = findall(c -> _cell_count(si, c) > 0, eachindex(si._cell_start))
         @test length(occupied) == 1
         @test _cell_count(si, occupied[1]) == n_b
         @test occupied[1] != cells_a[1]
