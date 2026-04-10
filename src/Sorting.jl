@@ -178,7 +178,7 @@ function sort_particles!(ps::AbstractParticleSystem{T,ND}, cutoff::T,
     # Compute the sorting permutation in-place (no allocation).
     perm_view = view(perm_buf, 1:n)
     key_view  = view(key_buf,  1:n)
-    sortperm!(perm_view, key_view; lt=_lt_key, alg=QuickSort)
+    sortperm!(perm_view, key_view; lt=_lt_key, alg=InsertionSort)
 
     # Apply permutation to every per-particle array.
     _apply_perms!(arrs, scratch_arrays, perm_view, n)
