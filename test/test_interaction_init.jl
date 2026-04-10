@@ -57,7 +57,6 @@ _dummy_pairwise(args...) = nothing
         ps = _make_ps()
         si = SystemInteraction(_make_kernel(), _dummy_pairwise, ps)
         @test isempty(si._cell_start)
-        @test isempty(si._cell_count)
     end
 
     # ------------------------------------------------------------------

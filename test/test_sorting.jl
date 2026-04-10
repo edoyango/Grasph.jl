@@ -311,11 +311,11 @@ end
     create_grid!(si)
 
     # All particles in each cell's CSR range must actually map to that cell.
-    for c in eachindex(si._cell_start)
-        cnt = si._cell_count[c]
-        cnt == 0 && continue
+    for c in 1:length(si._cell_start)-1
         s = si._cell_start[c]
-        for j in s:s+cnt-1
+        e = si._cell_start[c + 1]
+        s == e && continue
+        for j in s:e-1
             @test Grasph._cell_1idx(ps.x[j], si._mingridx, si._cell_size, si._ngridx, Val{2}()) == c
         end
     end

@@ -6,24 +6,24 @@ _make_ps(; n=10, ndims=2) = BasicParticleSystem("test", n, ndims, 1.0, 1.0)
 _make_k(; h=0.1, ndims=2)  = CubicSplineKernel(h; ndims=ndims)
 _noop(args...)              = nothing
 
-# Count particles in a single cell.
+# Count particles in a single cell using the prefix-sum format.
 function _cell_count(si, cell)
-    si._cell_count[cell]
+    si._cell_start[cell + 1] - si._cell_start[cell]
 end
 
-# Count all particles across all cells.
+# Count all particles across all cells (sentinel - 1 gives n).
 function _total_count(si)
-    sum(si._cell_count)
+    isempty(si._cell_start) && return 0
+    si._cell_start[end] - 1
 end
 
 # Build a particle-index → cell-index mapping from the system_b (or self) CSR arrays.
 function _particle_to_cell(si)
     result = Dict{Int,Int}()
-    for c in eachindex(si._cell_start)
-        cnt = si._cell_count[c]
-        cnt == 0 && continue
+    for c in 1:length(si._cell_start)-1
         s = si._cell_start[c]
-        for j in s:s+cnt-1
+        e = si._cell_start[c + 1]
+        for j in s:e-1
             result[j] = c
         end
     end
@@ -33,11 +33,10 @@ end
 # Build a particle-index → cell-index mapping from the system_a CSR arrays.
 function _particle_to_cell_a(si)
     result = Dict{Int,Int}()
-    for c in eachindex(si._cell_start_a)
-        cnt = si._cell_count_a[c]
-        cnt == 0 && continue
+    for c in 1:length(si._cell_start_a)-1
         s = si._cell_start_a[c]
-        for j in s:s+cnt-1
+        e = si._cell_start_a[c + 1]
+        for j in s:e-1
             result[j] = c
         end
     end
@@ -107,7 +106,6 @@ end
         fill!(ps.x, zero(SVector{2,Float64}))
         create_grid!(si)
         @test !isempty(si._cell_start)
-        @test !isempty(si._cell_count)
     end
 
     @testset "repeated create_grid! gives consistent results" begin
@@ -204,7 +202,7 @@ end
         # system_a's cell has no system_b particles (they are far apart)
         @test _cell_count(si, cells_a[1]) == 0
         # exactly one cell contains all system_b particles
-        occupied = findall(c -> _cell_count(si, c) > 0, eachindex(si._cell_start))
+        occupied = findall(c -> _cell_count(si, c) > 0, 1:length(si._cell_start)-1)
         @test length(occupied) == 1
         @test _cell_count(si, occupied[1]) == n_b
         @test occupied[1] != cells_a[1]

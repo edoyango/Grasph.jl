@@ -27,10 +27,8 @@ struct SystemInteraction{T<:AbstractFloat, ND, KT<:AbstractKernel{T,ND}, SA<:Abs
     system_b::SB
     _mingridx::MVector{ND,T}            # grid origin in each dimension (ndims,)
     _ngridx::MVector{ND,Int}            # number of cells in each dimension (ndims,)
-    _cell_start::Vector{Int}            # first system_b particle in cell c (ncells,); 0 if empty
-    _cell_count::Vector{Int}            # number of system_b particles in cell c (ncells,)
-    _cell_start_a::Vector{Int}          # first system_a particle in cell c (ncells,); 0 if empty (coupled only)
-    _cell_count_a::Vector{Int}          # number of system_a particles in cell c (ncells,) (coupled only)
+    _cell_start::Vector{Int}            # CSR prefix-sum: cell_start[c]..cell_start[c+1]-1 is the range of system_b particles in cell c; length = ncells+1
+    _cell_start_a::Vector{Int}          # same for system_a (coupled only); length = ncells+1
     _mingridx_a::MVector{ND,T}          # min position of system_a particles per dim (ndims,)
     _maxgridx_a::MVector{ND,T}          # max position of system_a particles per dim (ndims,)
     _cell_size::T
@@ -82,8 +80,6 @@ function SystemInteraction(
         system_b,
         MVector{nd,T}(undef),
         MVector{nd,Int}(undef),
-        Vector{Int}(),
-        Vector{Int}(),
         Vector{Int}(),
         Vector{Int}(),
         MVector{nd,T}(undef),
@@ -179,11 +175,10 @@ function _setup_cell_arrays!(si::SystemInteraction{T, ND}, mingridx::SVector{ND,
     si._mingridx .= mingridx
     @. si._ngridx = Int(floor((maxgridx - mingridx) / cutoff)) + Int(1)
     ncells = Int(prod(si._ngridx))
-    resize!(si._cell_start, ncells); fill!(si._cell_start, 0)
-    resize!(si._cell_count, ncells); fill!(si._cell_count, 0)
+    # Length ncells+1: cell_start[c]..cell_start[c+1]-1 is the particle range for cell c.
+    resize!(si._cell_start, ncells + 1); fill!(si._cell_start, 0)
     if coupled
-        resize!(si._cell_start_a, ncells); fill!(si._cell_start_a, 0)
-        resize!(si._cell_count_a, ncells); fill!(si._cell_count_a, 0)
+        resize!(si._cell_start_a, ncells + 1); fill!(si._cell_start_a, 0)
     end
 end
 
@@ -207,10 +202,17 @@ end
     return flat + 1          # convert to 1-indexed
 end
 
-# Sequential scan over pre-sorted particles to build the CSR cell arrays.
+# Sequential scan over pre-sorted particles to build the CSR prefix-sum array.
 # Assumes x is sorted so that all particles in the same cell are contiguous.
-function _populate_cells_sorted!(cell_start::Vector{Int}, cell_count::Vector{Int},
+# cell_start must have length ncells+1 and be zero-initialised before the call.
+# After the call:
+#   cell_start[c] .. cell_start[c+1]-1  is the (inclusive) range of particles in cell c.
+#   Empty cells satisfy cell_start[c] == cell_start[c+1].
+function _populate_cells_sorted!(cell_start::Vector{Int},
                                   x, mingridx, cutoff, ngridx, vnd)
+    ncells = length(cell_start) - 1
+    n      = length(x)
+    # Forward pass: record the first particle index for each non-empty cell.
     prev_cell = 0
     @inbounds for i in eachindex(x)
         cell = _cell_1idx(x[i], mingridx, cutoff, ngridx, vnd)
@@ -218,22 +220,30 @@ function _populate_cells_sorted!(cell_start::Vector{Int}, cell_count::Vector{Int
             cell_start[cell] = i
             prev_cell = cell
         end
-        cell_count[cell] += 1
+    end
+    # Sentinel: one past the last particle index.
+    cell_start[ncells + 1] = n + 1
+    # Backward pass: propagate non-zero starts rightward so that empty cells
+    # satisfy cell_start[c] == cell_start[c+1] (empty range).
+    @inbounds for c in ncells:-1:1
+        if cell_start[c] == 0
+            cell_start[c] = cell_start[c + 1]
+        end
     end
 end
 
 function _populate_cells_self!(si::SystemInteraction{T,ND}, cutoff::T) where {T,ND}
-    _populate_cells_sorted!(si._cell_start, si._cell_count,
+    _populate_cells_sorted!(si._cell_start,
                             si.system_a.x, si._mingridx, cutoff, si._ngridx, Val{ND}())
 end
 
 function _populate_cells_a!(si::SystemInteraction{T,ND}, cutoff::T) where {T,ND}
-    _populate_cells_sorted!(si._cell_start_a, si._cell_count_a,
+    _populate_cells_sorted!(si._cell_start_a,
                             si.system_a.x, si._mingridx, cutoff, si._ngridx, Val{ND}())
 end
 
 function _populate_cells_b!(si::SystemInteraction{T,ND}, cutoff::T) where {T,ND}
-    _populate_cells_sorted!(si._cell_start, si._cell_count,
+    _populate_cells_sorted!(si._cell_start,
                             si.system_b.x, si._mingridx, cutoff, si._ngridx, Val{ND}())
 end
 
@@ -355,52 +365,73 @@ function _sweep_self!(si::SystemInteraction, ::Nothing)
 end
 
 # 2D Specialisation: 6-colour sweep
+#
+# SORTED-PARTICLE RANGE TRICK
+# ===========================
+# Particles are sorted by flat cell index (cell_x slowest, cell_y fastest).
+# Therefore particles in cells with consecutive flat indices occupy contiguous
+# slices of the particle array.  A single CSR range cell_start[c]..cell_start[c+k]-1
+# spans k consecutive flat cells with no gaps, so we can cover multiple
+# neighbouring cells with one range instead of k separate inner loops.
+#
+# This is exploited in two places per active cell (cell_x, cell_y):
+#
+#   1. Same-cell + (0,+1) neighbour — one range:
+#      cell_start[cell_idx]   .. cell_start[cell_idx+2]-1
+#      covers (cell_x, cell_y) and (cell_x, cell_y+1).
+#      Starting particle_j at particle_i+1 gives the same-cell half-shell
+#      (each unordered pair visited once); indices beyond pend_same
+#      automatically reach (cell_x, cell_y+1) particles.
+#
+#   2. (+1,*) strip — one range:
+#      cell_start[cell_idx + n_cells_y - 1] .. cell_start[cell_idx + n_cells_y + 2]-1
+#      The base offset (n_cells_y - 1) lands on flat cell (cell_x+1, cell_y-1);
+#      reading +3 entries from cell_start spans the full strip
+#      (cell_x+1, cell_y-1), (cell_x+1, cell_y), (cell_x+1, cell_y+1).
+#      This handles the three forward neighbours (+1,-1), (+1,0), (+1,+1)
+#      in a single particle loop.
 function _sweep_self!(si::SystemInteraction{T,2}, pfn::PFN) where {T,PFN}
     ps_a       = si.system_a
     kernel     = si.kernel
     h          = T(kernel.h)
     cutoff_sq  = si._cell_size * si._cell_size
     cell_start = si._cell_start::Vector{Int}
-    cell_count = si._cell_count::Vector{Int}
-    nc_y       = Int(si._ngridx[2])
-    nc_x       = Int(si._ngridx[1])
-    vnd        = Val{2}()
-
-    # Forward neighbour offsets (2D): (+1,0), (-1,+1), (0,+1), (+1,+1)
-    forward_dflat = (nc_y, -nc_y+1, 1, nc_y+1)
+    n_cells_y  = Int(si._ngridx[2])
+    n_cells_x  = Int(si._ngridx[1])
+    val_ndims  = Val{2}()
 
     for colour in 0:5
-        ci_start = colour ÷ 2 + 1
-        cj_start = colour % 2 + 1
-        nci = length(ci_start:3:nc_x)
-        ncj = length(cj_start:2:nc_y)
-        @inbounds @batch for idx in 1:nci*ncj
-            i_ci, i_cj = divrem(idx - 1, ncj)
-            ci   = ci_start + i_ci * 3
-            cj   = cj_start + i_cj * 2
-            flat = (ci - 1) * nc_y + cj
-            s    = cell_start[flat]
-            cnt  = cell_count[flat]
+        cell_x_begin = colour ÷ 2 + 2
+        cell_y_begin = colour % 2 + 2
+        n_active_x = length(cell_x_begin:3:n_cells_x-1)
+        n_active_y = length(cell_y_begin:2:n_cells_y-1)
+        @inbounds @batch for flat_idx in 1:n_active_x*n_active_y
+            step_x, step_y = divrem(flat_idx - 1, n_active_y)
+            cell_x   = cell_x_begin + step_x * 3
+            cell_y   = cell_y_begin + step_y * 2
+            cell_idx = (cell_x - 1) * n_cells_y + cell_y
 
-            # Same-cell half-shell (ii < jj, so each pair visited once)
-            for ii in s:s+cnt-2
-                for jj in ii+1:s+cnt-1
-                    _pair_self!(pfn, ps_a, ii, jj, kernel, h, cutoff_sq, vnd)
+            # Particles in (cell_x, cell_y) and (cell_x, cell_y+1) are contiguous;
+            # a single range covers both cells.
+            pstart    = cell_start[cell_idx]
+            pend_same = cell_start[cell_idx + 1]  # end of (cell_x, cell_y)
+            pend_next = cell_start[cell_idx + 2]  # end of (cell_x, cell_y+1)
+
+            # Flat cell (cell_x+1, cell_y-1) = cell_idx + n_cells_y - 1.
+            # Reading +3 entries spans the strip (cell_x+1, cell_y-1..cell_y+1).
+            neighbour_cell_idx = cell_idx + n_cells_y - 1
+            neighbour_pstart   = cell_start[neighbour_cell_idx]
+            neighbour_pend     = cell_start[neighbour_cell_idx + 3]
+
+            for particle_i in pstart:pend_same-1
+                # Same-cell half-shell (particle_i < particle_j avoids double-counting),
+                # then (0,+1) neighbour — both covered by the single range pstart..pend_next-1.
+                for particle_j in particle_i+1:pend_next-1
+                    _pair_self!(pfn, ps_a, particle_i, particle_j, kernel, h, cutoff_sq, val_ndims)
                 end
-            end
-
-            # Cross-cell forward neighbours — skip empty cells to avoid
-            # computing out-of-bounds nflat indices for boundary cells.
-            if cnt > 0
-                for k in 1:4
-                    nflat = flat + forward_dflat[k]
-                    ns   = cell_start[nflat]
-                    ncnt = cell_count[nflat]
-                    for ii in s:s+cnt-1
-                        for jj in ns:ns+ncnt-1
-                            _pair_self!(pfn, ps_a, ii, jj, kernel, h, cutoff_sq, vnd)
-                        end
-                    end
+                # Forward neighbours (+1,-1), (+1,0), (+1,+1) as one contiguous strip.
+                for particle_j in neighbour_pstart:neighbour_pend-1
+                    _pair_self!(pfn, ps_a, particle_i, particle_j, kernel, h, cutoff_sq, val_ndims)
                 end
             end
         end
@@ -422,63 +453,86 @@ end
 #
 # 2 × 3 × 3 = 18 colours total.
 #   colour = (ci-1)%2 * 9 + (cj-1)%3 * 3 + (ck-1)%3
+# 3D Specialisation: 18-colour sweep
+#
+# SORTED-PARTICLE RANGE TRICK (3D)
+# =================================
+# Particles are sorted with cell_z varying fastest (cell_x slowest).
+# Consecutive flat cell indices therefore differ only in cell_z, so cells
+# that are adjacent in z occupy contiguous particle-array slices.
+#
+# This is exploited in two places per active cell (cell_x, cell_y, cell_z):
+#
+#   1. Same-cell + (0,0,+1) neighbour — one range:
+#      pstart..pend_next-1  covers (cell_x,cell_y,cell_z) and (cell_x,cell_y,cell_z+1).
+#      Starting particle_j at particle_i+1 gives the same-cell half-shell;
+#      indices from pend onward reach (cell_x,cell_y,cell_z+1) automatically.
+#
+#   2. Each forward-offset group — one range per offset:
+#      Each entry in forward_offsets points to the flat index of the cell
+#      at z-1 relative to the neighbour row/plane.  Reading +3 entries from
+#      cell_start spans the three consecutive z-cells (z-1, z, z+1) in that
+#      row, covering three forward neighbours with a single particle loop.
+#      The 4 offsets × 3 z-cells = 12 pairs, plus (0,0,+1) = 13 total.
 function _sweep_self!(si::SystemInteraction{T,3}, pfn::PFN) where {T,PFN}
     ps_a       = si.system_a
     kernel     = si.kernel
     h          = T(kernel.h)
     cutoff_sq  = si._cell_size * si._cell_size
     cell_start = si._cell_start::Vector{Int}
-    cell_count = si._cell_count::Vector{Int}
-    nc_z       = Int(si._ngridx[3])
-    nc_y       = Int(si._ngridx[2])
-    nc_x       = Int(si._ngridx[1])
-    ncyz       = nc_y * nc_z
-    vnd        = Val{3}()
+    n_cells_z  = Int(si._ngridx[3])
+    n_cells_y  = Int(si._ngridx[2])
+    n_cells_x  = Int(si._ngridx[1])
+    n_cells_yz = n_cells_y * n_cells_z
+    val_ndims  = Val{3}()
 
-    # Forward neighbour offsets (3D, 13 neighbors)
-    forward_dflat = (
-        1,                                    # ( 0,  0, +1)
-        nc_z-1, nc_z, nc_z+1,                 # ( 0, +1, -1), ( 0, +1, 0), ( 0, +1, +1)
-        ncyz-nc_z-1, ncyz-nc_z, ncyz-nc_z+1,  # (+1, -1, -1), (+1, -1, 0), (+1, -1, +1)
-        ncyz-1,      ncyz,      ncyz+1,       # (+1,  0, -1), (+1,  0, 0), (+1,  0, +1)
-        ncyz+nc_z-1, ncyz+nc_z, ncyz+nc_z+1   # (+1, +1, -1), (+1, +1, 0), (+1, +1, +1)
+    # Each offset lands on the (dz = -1) cell of a 3-cell z-strip; reading
+    # +3 entries from cell_start covers dz ∈ {-1, 0, +1} in one range.
+    forward_offsets = (
+        n_cells_z-1,             # ( 0, +1, -1..+1)
+        n_cells_yz-n_cells_z-1, # (+1, -1, -1..+1)
+        n_cells_yz-1,            # (+1,  0, -1..+1)
+        n_cells_yz+n_cells_z-1, # (+1, +1, -1..+1)
     )
 
     for colour in 0:17
-        ci_start = (colour ÷ 9) + 1
-        cj_start = ((colour % 9) ÷ 3) + 1
-        ck_start = (colour % 3) + 1
-        nci  = length(ci_start:2:nc_x)
-        ncj  = length(cj_start:3:nc_y)
-        nck  = length(ck_start:3:nc_z)
-        ncjk = ncj * nck
-        @inbounds @batch for idx in 1:nci*ncjk
-            i_ci, rem_jk = divrem(idx - 1, ncjk)
-            i_cj, i_ck   = divrem(rem_jk, nck)
-            ci   = ci_start + i_ci * 2
-            cj   = cj_start + i_cj * 3
-            ck   = ck_start + i_ck * 3
-            flat = (ci - 1) * ncyz + (cj - 1) * nc_z + ck
-            s    = cell_start[flat]
-            cnt  = cell_count[flat]
+        cell_x_begin = (colour ÷ 9) + 2
+        cell_y_begin = ((colour % 9) ÷ 3) + 2
+        cell_z_begin = (colour % 3) + 2
+        n_active_x  = length(cell_x_begin:2:n_cells_x-1)
+        n_active_y  = length(cell_y_begin:3:n_cells_y-1)
+        n_active_z  = length(cell_z_begin:3:n_cells_z-1)
+        n_active_yz = n_active_y * n_active_z
+        @inbounds @batch for flat_idx in 1:n_active_x*n_active_yz
+            step_x, remaining_yz = divrem(flat_idx - 1, n_active_yz)
+            step_y, step_z       = divrem(remaining_yz, n_active_z)
+            cell_x   = cell_x_begin + step_x * 2
+            cell_y   = cell_y_begin + step_y * 3
+            cell_z   = cell_z_begin + step_z * 3
+            cell_idx  = (cell_x - 1) * n_cells_yz + (cell_y - 1) * n_cells_z + cell_z
 
-            # Same-cell half-shell (ii < jj)
-            for ii in s:s+cnt-2
-                for jj in ii+1:s+cnt-1
-                    _pair_self!(pfn, ps_a, ii, jj, kernel, h, cutoff_sq, vnd)
+            # Particles in (cell_x, cell_y, cell_z) and (cell_x, cell_y, cell_z+1)
+            # are contiguous; a single range covers both cells.
+            pstart    = cell_start[cell_idx]
+            pend      = cell_start[cell_idx + 1]  # end of (cell_x, cell_y, cell_z)
+            pend_next = cell_start[cell_idx + 2]  # end of (cell_x, cell_y, cell_z+1)
+
+            # Same-cell half-shell (particle_i < particle_j), then (0,0,+1) neighbour —
+            # both covered by one range because the two cells are contiguous.
+            for particle_i in pstart:pend-1
+                for particle_j in particle_i+1:pend_next-1
+                    _pair_self!(pfn, ps_a, particle_i, particle_j, kernel, h, cutoff_sq, val_ndims)
                 end
             end
 
-            # Forward neighbors — skip empty cells to avoid out-of-bounds nflat.
-            if cnt > 0
-                for k in 1:13
-                    nflat = flat + forward_dflat[k]
-                    ns   = cell_start[nflat]
-                    ncnt = cell_count[nflat]
-                    for ii in s:s+cnt-1
-                        for jj in ns:ns+ncnt-1
-                            _pair_self!(pfn, ps_a, ii, jj, kernel, h, cutoff_sq, vnd)
-                        end
+            # Remaining 12 forward neighbours in 4 z-strips of 3 cells each.
+            for dir_idx in 1:4
+                neighbour_cell_idx = cell_idx + forward_offsets[dir_idx]
+                neighbour_pstart   = cell_start[neighbour_cell_idx]
+                neighbour_pend     = cell_start[neighbour_cell_idx + 3]
+                for particle_i in pstart:pend-1
+                    for particle_j in neighbour_pstart:neighbour_pend-1
+                        _pair_self!(pfn, ps_a, particle_i, particle_j, kernel, h, cutoff_sq, val_ndims)
                     end
                 end
             end
@@ -526,46 +580,61 @@ function _sweep_coupled!(si::SystemInteraction, system_b, ::Nothing)
 end
 
 # 2D Specialisation: 9-colour sweep
+#
+# SORTED-PARTICLE RANGE TRICK (coupled, 2D)
+# =========================================
+# system_b particles are sorted by flat cell index (cell_y fastest).
+# For each system_a cell (cell_x, cell_y) we must search the full 3×3 block
+# of system_b cells: dx_cell ∈ {-1,0,+1}, dy ∈ {-1,0,+1}.
+#
+# Instead of 3 separate inner loops over dy, we use the contiguity of
+# consecutive y-cells: the base offset (dx_cell * n_cells_y - 1) lands on
+# flat cell (cell_x+dx_cell, cell_y-1), and reading +3 entries from
+# cell_start spans dy ∈ {-1, 0, +1} in one contiguous particle range.
+# This reduces 9 range lookups to 3 (one per dx_cell value).
+#
+# cell_x_min/max: cell index bounds of system_a in the system_b grid,
+# used to skip the (many) grid cells that contain no system_a particles.
 function _sweep_coupled!(si::SystemInteraction{T,2}, system_b, pfn::PFN) where {T,PFN}
     ps_a          = si.system_a
     kernel        = si.kernel
     h             = T(kernel.h)
     cutoff_sq     = si._cell_size * si._cell_size
     cell_start    = si._cell_start::Vector{Int}
-    cell_count    = si._cell_count::Vector{Int}
     cell_start_a  = si._cell_start_a::Vector{Int}
-    cell_count_a  = si._cell_count_a::Vector{Int}
-    nc_y          = Int(si._ngridx[2])
-    nc_x          = Int(si._ngridx[1])
-    vnd           = Val{2}()
+    n_cells_y     = Int(si._ngridx[2])
+    n_cells_x     = Int(si._ngridx[1])
+    val_ndims     = Val{2}()
     cutoff        = si._cell_size
     mingridx      = si._mingridx
-    ci_lo = floor(Int, (si._mingridx_a[1] - mingridx[1]) / cutoff) + 1
-    ci_hi = floor(Int, (si._maxgridx_a[1] - mingridx[1]) / cutoff) + 1
-    cj_lo = floor(Int, (si._mingridx_a[2] - mingridx[2]) / cutoff) + 1
-    cj_hi = floor(Int, (si._maxgridx_a[2] - mingridx[2]) / cutoff) + 1
+    # Cell index range (in the system_b grid) that system_a particles occupy.
+    cell_x_min = floor(Int, (si._mingridx_a[1] - mingridx[1]) / cutoff) + 1
+    cell_x_max = floor(Int, (si._maxgridx_a[1] - mingridx[1]) / cutoff) + 1
+    cell_y_min = floor(Int, (si._mingridx_a[2] - mingridx[2]) / cutoff) + 1
+    cell_y_max = floor(Int, (si._maxgridx_a[2] - mingridx[2]) / cutoff) + 1
 
     for colour in 0:8
-        ci_start = colour ÷ 3 + ci_lo
-        cj_start = colour % 3 + cj_lo
-        nci = length(ci_start:3:ci_hi)
-        ncj = length(cj_start:3:cj_hi)
-        @inbounds @batch for idx in 1:nci*ncj
-            i_ci, i_cj = divrem(idx - 1, ncj)
-            ci   = ci_start + i_ci * 3
-            cj   = cj_start + i_cj * 3
-            flat = (ci - 1) * nc_y + cj
-            sa   = cell_start_a[flat]
-            cna  = cell_count_a[flat]
-            for ii in sa:sa+cna-1
-                for dxcell in -1:1
-                    for dycell in -1:1
-                        nidx = flat + dxcell * nc_y + dycell
-                        sb   = cell_start[nidx]
-                        cnb  = cell_count[nidx]
-                        for jj in sb:sb+cnb-1
-                            _pair_coupled!(pfn, ps_a, system_b, ii, jj, kernel, h, cutoff_sq, vnd)
-                        end
+        cell_x_begin = colour ÷ 3 + cell_x_min
+        cell_y_begin = colour % 3 + cell_y_min
+        n_active_x = length(cell_x_begin:3:cell_x_max)
+        n_active_y = length(cell_y_begin:3:cell_y_max)
+        @inbounds @batch for flat_idx in 1:n_active_x*n_active_y
+            step_x, step_y = divrem(flat_idx - 1, n_active_y)
+            cell_x   = cell_x_begin + step_x * 3
+            cell_y   = cell_y_begin + step_y * 3
+            cell_idx = (cell_x - 1) * n_cells_y + cell_y
+            sys_a_pstart = cell_start_a[cell_idx]
+            sys_a_pend   = cell_start_a[cell_idx + 1]
+            for particle_i in sys_a_pstart:sys_a_pend-1
+                # For each x-offset, read a 3-cell y-strip of system_b particles
+                # in one contiguous range: base offset lands on (dx_cell, -1) in y,
+                # and +3 spans dy ∈ {-1, 0, +1}.
+                for dx_cell in -1:1
+                    neighbour_cell_idx = cell_idx + dx_cell * n_cells_y - 1
+                    sys_b_pstart = cell_start[neighbour_cell_idx]
+                    sys_b_pend   = cell_start[neighbour_cell_idx + 3]
+                    for particle_j in sys_b_pstart:sys_b_pend-1
+                        _pair_coupled!(pfn, ps_a, system_b, particle_i, particle_j, kernel, h, cutoff_sq, val_ndims)
                     end
                 end
             end
@@ -574,56 +643,67 @@ function _sweep_coupled!(si::SystemInteraction{T,2}, system_b, pfn::PFN) where {
 end
 
 # 3D Specialisation: 27-colour sweep
+#
+# SORTED-PARTICLE RANGE TRICK (coupled, 3D)
+# =========================================
+# system_b particles are sorted with cell_z varying fastest.
+# For each system_a cell we must search the full 3×3×3 block of system_b
+# cells: dx_cell ∈ {-1,0,+1}, dy_cell ∈ {-1,0,+1}, dz ∈ {-1,0,+1}.
+#
+# The z-dimension is handled implicitly: the base offset
+# (dx_cell * n_cells_yz + dy_cell * n_cells_z - 1) lands on
+# flat cell (cell_x+dx, cell_y+dy, cell_z-1), and reading +3 entries from
+# cell_start spans dz ∈ {-1, 0, +1} in one contiguous particle range.
+# This reduces 27 range lookups to 9 (one per (dx_cell, dy_cell) pair).
 function _sweep_coupled!(si::SystemInteraction{T,3}, system_b, pfn::PFN) where {T,PFN}
     ps_a          = si.system_a
     kernel        = si.kernel
     h             = T(kernel.h)
     cutoff_sq     = si._cell_size * si._cell_size
     cell_start    = si._cell_start::Vector{Int}
-    cell_count    = si._cell_count::Vector{Int}
     cell_start_a  = si._cell_start_a::Vector{Int}
-    cell_count_a  = si._cell_count_a::Vector{Int}
-    nc_z          = Int(si._ngridx[3])
-    nc_y          = Int(si._ngridx[2])
-    nc_x          = Int(si._ngridx[1])
-    ncyz          = nc_y * nc_z
-    vnd           = Val{3}()
+    n_cells_z     = Int(si._ngridx[3])
+    n_cells_y     = Int(si._ngridx[2])
+    n_cells_x     = Int(si._ngridx[1])
+    n_cells_yz    = n_cells_y * n_cells_z
+    val_ndims     = Val{3}()
     cutoff        = si._cell_size
     mingridx      = si._mingridx
-    ci_lo = floor(Int, (si._mingridx_a[1] - mingridx[1]) / cutoff) + 1
-    ci_hi = floor(Int, (si._maxgridx_a[1] - mingridx[1]) / cutoff) + 1
-    cj_lo = floor(Int, (si._mingridx_a[2] - mingridx[2]) / cutoff) + 1
-    cj_hi = floor(Int, (si._maxgridx_a[2] - mingridx[2]) / cutoff) + 1
-    ck_lo = floor(Int, (si._mingridx_a[3] - mingridx[3]) / cutoff) + 1
-    ck_hi = floor(Int, (si._maxgridx_a[3] - mingridx[3]) / cutoff) + 1
+    # Cell index range (in the system_b grid) that system_a particles occupy.
+    cell_x_min = floor(Int, (si._mingridx_a[1] - mingridx[1]) / cutoff) + 1
+    cell_x_max = floor(Int, (si._maxgridx_a[1] - mingridx[1]) / cutoff) + 1
+    cell_y_min = floor(Int, (si._mingridx_a[2] - mingridx[2]) / cutoff) + 1
+    cell_y_max = floor(Int, (si._maxgridx_a[2] - mingridx[2]) / cutoff) + 1
+    cell_z_min = floor(Int, (si._mingridx_a[3] - mingridx[3]) / cutoff) + 1
+    cell_z_max = floor(Int, (si._maxgridx_a[3] - mingridx[3]) / cutoff) + 1
 
     for colour in 0:26
-        ci_start = (colour ÷ 9) + ci_lo
-        cj_start = ((colour % 9) ÷ 3) + cj_lo
-        ck_start = (colour % 3) + ck_lo
-        nci  = length(ci_start:3:ci_hi)
-        ncj  = length(cj_start:3:cj_hi)
-        nck  = length(ck_start:3:ck_hi)
-        ncjk = ncj * nck
-        @inbounds @batch for idx in 1:nci*ncjk
-            i_ci, rem_jk = divrem(idx - 1, ncjk)
-            i_cj, i_ck   = divrem(rem_jk, nck)
-            ci   = ci_start + i_ci * 3
-            cj   = cj_start + i_cj * 3
-            ck   = ck_start + i_ck * 3
-            flat = (ci - 1) * ncyz + (cj - 1) * nc_z + ck
-            sa   = cell_start_a[flat]
-            cna  = cell_count_a[flat]
-            for ii in sa:sa+cna-1
-                for dxcell in -1:1
-                    for dycell in -1:1
-                        for dzcell in -1:1
-                            nidx = flat + dxcell * ncyz + dycell * nc_z + dzcell
-                            sb   = cell_start[nidx]
-                            cnb  = cell_count[nidx]
-                            for jj in sb:sb+cnb-1
-                                _pair_coupled!(pfn, ps_a, system_b, ii, jj, kernel, h, cutoff_sq, vnd)
-                            end
+        cell_x_begin = (colour ÷ 9) + cell_x_min
+        cell_y_begin = ((colour % 9) ÷ 3) + cell_y_min
+        cell_z_begin = (colour % 3) + cell_z_min
+        n_active_x  = length(cell_x_begin:3:cell_x_max)
+        n_active_y  = length(cell_y_begin:3:cell_y_max)
+        n_active_z  = length(cell_z_begin:3:cell_z_max)
+        n_active_yz = n_active_y * n_active_z
+        @inbounds @batch for flat_idx in 1:n_active_x*n_active_yz
+            step_x, remaining_yz = divrem(flat_idx - 1, n_active_yz)
+            step_y, step_z       = divrem(remaining_yz, n_active_z)
+            cell_x   = cell_x_begin + step_x * 3
+            cell_y   = cell_y_begin + step_y * 3
+            cell_z   = cell_z_begin + step_z * 3
+            cell_idx = (cell_x - 1) * n_cells_yz + (cell_y - 1) * n_cells_z + cell_z
+            sys_a_pstart = cell_start_a[cell_idx]
+            sys_a_pend   = cell_start_a[cell_idx + 1]
+            for particle_i in sys_a_pstart:sys_a_pend-1
+                # Iterate over the 3×3 (dx, dy) neighbourhood; for each pair the
+                # base offset lands on dz = -1, and +3 spans the full z-strip.
+                for dx_cell in -1:1
+                    for dy_cell in -1:1
+                        neighbour_cell_idx = cell_idx + dx_cell * n_cells_yz + dy_cell * n_cells_z - 1
+                        sys_b_pstart = cell_start[neighbour_cell_idx]
+                        sys_b_pend   = cell_start[neighbour_cell_idx + 3]
+                        for particle_j in sys_b_pstart:sys_b_pend-1
+                            _pair_coupled!(pfn, ps_a, system_b, particle_i, particle_j, kernel, h, cutoff_sq, val_ndims)
                         end
                     end
                 end
