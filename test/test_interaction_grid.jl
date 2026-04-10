@@ -68,7 +68,7 @@ end
         @test _total_count(si) == n
     end
 
-    @testset "mingridx is min particle position minus 2h" begin
+    @testset "mingridx is snapped to a multiple of cutoff at or below min - 2h" begin
         n, nd = 6, 2
         k  = _make_k(h=0.1)
         ps = _make_ps(n=n, ndims=nd)
@@ -79,8 +79,14 @@ end
 
         create_grid!(si)
 
-        expected = reduce((a,b)->min.(a,b), ps.x) .- 2*k.interaction_length
-        @test si._mingridx ≈ expected
+        cutoff = k.interaction_length
+        raw_min = reduce((a,b)->min.(a,b), ps.x) .- 2*cutoff
+        # Snapped origin must provide at least the same padding as the raw minimum.
+        @test all(si._mingridx .<= raw_min .+ 1e-10)
+        # Snapped origin must be a multiple of cutoff (alignment invariant).
+        @test all(v -> isapprox(mod(v, cutoff), 0; atol=1e-9) ||
+                       isapprox(mod(v, cutoff), cutoff; atol=1e-9),
+                  si._mingridx)
     end
 
     @testset "co-located particles share a cell, two clusters in different cells" begin
@@ -167,7 +173,7 @@ end
         @test all(1 .<= values(cells_a) .<= ncells)
     end
 
-    @testset "mingridx covers both systems" begin
+    @testset "mingridx covers both systems and is snapped to a multiple of cutoff" begin
         n_a, n_b, nd = 3, 3, 2
         k    = _make_k()
         ps_a = _make_ps(n=n_a, ndims=nd)
@@ -179,9 +185,13 @@ end
 
         create_grid!(si)
 
+        cutoff = k.interaction_length
         combined_min = min.(reduce((a,b)->min.(a,b), ps_a.x),
                             reduce((a,b)->min.(a,b), ps_b.x))
-        @test si._mingridx ≈ combined_min .- 2*k.interaction_length
+        @test all(si._mingridx .<= combined_min .- 2*cutoff .+ 1e-10)
+        @test all(v -> isapprox(mod(v, cutoff), 0; atol=1e-9) ||
+                       isapprox(mod(v, cutoff), cutoff; atol=1e-9),
+                  si._mingridx)
     end
 
     @testset "system_a particles in one cell, system_b particles in different cell" begin
@@ -237,9 +247,51 @@ end
 
         create_grid!(si)
 
+        cutoff = k.interaction_length
         combined_min = min.(reduce((a,b)->min.(a,b), ps_a.x),
                             reduce((a,b)->min.(a,b), ps_b.x))
-        @test si._mingridx ≈ combined_min .- 2*k.interaction_length
+        # system_b drives the minimum; snapped origin must be ≤ the padded minimum.
+        @test all(si._mingridx .<= combined_min .- 2*cutoff .+ 1e-10)
+        @test all(v -> isapprox(mod(v, cutoff), 0; atol=1e-9) ||
+                       isapprox(mod(v, cutoff), cutoff; atol=1e-9),
+                  si._mingridx)
+        # system_a's minimum must also lie inside the grid.
+        ps_a_min = reduce((a,b)->min.(a,b), ps_a.x)
+        @test all(si._mingridx .<= ps_a_min)
+    end
+
+end
+
+@testset "grid alignment across interactions" begin
+
+    @testset "two self-interactions share cell boundary lattice" begin
+        k    = _make_k(h=0.1)
+        ps_a = _make_ps(n=4, ndims=2)
+        ps_b = _make_ps(n=4, ndims=2)
+        si_a = SystemInteraction(k, _noop, ps_a)
+        si_b = SystemInteraction(k, _noop, ps_b)
+
+        # Place systems at different positions so they compute different raw origins.
+        ps_a.x .= [SVector(0.05, 0.05), SVector(0.07, 0.07),
+                   SVector(0.09, 0.05), SVector(0.06, 0.09)]
+        ps_b.x .= [SVector(0.53, 0.53), SVector(0.55, 0.57),
+                   SVector(0.57, 0.55), SVector(0.54, 0.56)]
+
+        create_grid!(si_a)
+        create_grid!(si_b)
+
+        cutoff = k.interaction_length
+        # Both mingridx vectors must be multiples of cutoff — same lattice.
+        for si in (si_a, si_b), v in si._mingridx
+            @test isapprox(mod(v, cutoff), 0; atol=1e-9) ||
+                  isapprox(mod(v, cutoff), cutoff; atol=1e-9)
+        end
+        # The difference of the two origins must also be an integer multiple of cutoff,
+        # confirming their cell boundary lattices coincide.
+        Δ = si_a._mingridx .- si_b._mingridx
+        @test all(v -> isapprox(mod(v, cutoff), 0; atol=1e-9) ||
+                       isapprox(mod(v, cutoff), cutoff; atol=1e-9),
+                  Δ)
     end
 
 end

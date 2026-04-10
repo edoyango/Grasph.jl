@@ -135,7 +135,11 @@ function _create_grid_impl!(si::SystemInteraction{T}, ::Nothing, cutoff::T) wher
     mn, mx = reduce(xa; init=(xa[1], xa[1])) do (mn, mx), x
         (min.(mn, x), max.(mx, x))
     end
-    mingridx = mn .- 2*cutoff
+    # Snap mingridx down to the nearest multiple of cutoff below the padded minimum.
+    # Since cutoff is identical for all interactions, every snapped origin is an integer
+    # multiple of cutoff from 0, so cell boundaries align across all grids in the
+    # simulation — a prerequisite for consistent particle sorting by cell index.
+    mingridx = map(v -> floor(v / cutoff) * cutoff, mn .- 2*cutoff)
     maxgridx = mx .+ 2*cutoff
     _setup_cell_arrays!(si, mingridx, maxgridx, cutoff, length(xa))
     _populate_cells_self!(si, cutoff)
@@ -152,7 +156,7 @@ function _create_grid_impl!(si::SystemInteraction{T}, system_b, cutoff::T) where
     mn, mx = reduce(xb; init=(mn_a, mx_a)) do (mn, mx), x
         (min.(mn, x), max.(mx, x))
     end
-    mingridx = mn .- 2*cutoff
+    mingridx = map(v -> floor(v / cutoff) * cutoff, mn .- 2*cutoff)
     maxgridx = mx .+ 2*cutoff
     _setup_cell_arrays!(si, mingridx, maxgridx, cutoff, length(xb), length(xa))
     si._mingridx_a .= mn_a

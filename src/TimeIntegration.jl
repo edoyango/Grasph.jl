@@ -44,6 +44,16 @@ function LeapFrogTimeIntegrator(systems, interactions; ghosts=())
     T = eltype(eltype(first(sys).x))
     c = T(maximum(ps.c           for ps   in sys))
     h = T(minimum(inter.kernel.h for inter in ints))
+    # All interactions must share the same smoothing length so that each interaction's
+    # grid can be snapped to a common multiple-of-cutoff lattice (see create_grid!).
+    if length(ints) > 1
+        h_ref = first(ints).kernel.h
+        for inter in ints
+            isapprox(inter.kernel.h, h_ref; rtol=1e-6) || throw(ArgumentError(
+                "All interactions must use the same kernel smoothing length for grid alignment; " *
+                "got h=$(inter.kernel.h), expected h≈$(h_ref)"))
+        end
+    end
     LeapFrogTimeIntegrator{typeof(sys), typeof(ints), typeof(gsts), T}(sys, ints, gsts, c, h)
 end
 
