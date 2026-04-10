@@ -131,14 +131,17 @@ end
 
 function _create_grid_impl!(si::SystemInteraction{T}, ::Nothing, cutoff::T) where {T}
     xa = si.system_a.x
-    mn, mx = reduce(xa; init=(xa[1], xa[1])) do (mn, mx), x
-        (min.(mn, x), max.(mx, x))
+    mn = xa[1]; mx = xa[1]
+    @inbounds for i in 2:length(xa)
+        xi = xa[i]
+        mn = min.(mn, xi)
+        mx = max.(mx, xi)
     end
     # Snap mingridx down to the nearest multiple of cutoff below the padded minimum.
     # Since cutoff is identical for all interactions, every snapped origin is an integer
     # multiple of cutoff from 0, so cell boundaries align across all grids in the
     # simulation — a prerequisite for consistent particle sorting by cell index.
-    mingridx = map(v -> floor(v / cutoff) * cutoff, mn .- 2*cutoff)
+    mingridx = _snap_to_grid(mn .- 2*cutoff, cutoff)
     maxgridx = mx .+ 2*cutoff
     _setup_cell_arrays!(si, mingridx, maxgridx, cutoff)
     _populate_cells_self!(si, cutoff)
@@ -149,13 +152,19 @@ end
 function _create_grid_impl!(si::SystemInteraction{T}, system_b, cutoff::T) where {T}
     xa = si.system_a.x
     xb = system_b.x
-    mn_a, mx_a = reduce(xa; init=(xa[1], xa[1])) do (mn, mx), x
-        (min.(mn, x), max.(mx, x))
+    mn_a = xa[1]; mx_a = xa[1]
+    @inbounds for i in 2:length(xa)
+        xi = xa[i]
+        mn_a = min.(mn_a, xi)
+        mx_a = max.(mx_a, xi)
     end
-    mn, mx = reduce(xb; init=(mn_a, mx_a)) do (mn, mx), x
-        (min.(mn, x), max.(mx, x))
+    mn = mn_a; mx = mx_a
+    @inbounds for i in eachindex(xb)
+        xi = xb[i]
+        mn = min.(mn, xi)
+        mx = max.(mx, xi)
     end
-    mingridx = map(v -> floor(v / cutoff) * cutoff, mn .- 2*cutoff)
+    mingridx = _snap_to_grid(mn .- 2*cutoff, cutoff)
     maxgridx = mx .+ 2*cutoff
     _setup_cell_arrays!(si, mingridx, maxgridx, cutoff; coupled=true)
     si._mingridx_a .= mn_a
@@ -176,6 +185,13 @@ function _setup_cell_arrays!(si::SystemInteraction{T, ND}, mingridx::SVector{ND,
         resize!(si._cell_start_a, ncells); fill!(si._cell_start_a, 0)
         resize!(si._cell_count_a, ncells); fill!(si._cell_count_a, 0)
     end
+end
+
+# Snap each element of `raw` down to the nearest grid-aligned multiple of cutoff.
+# Named @inline function avoids the heap-allocated closure that `map(v -> ..., raw)`
+# would create when `cutoff` is a captured local variable.
+@inline function _snap_to_grid(raw::SVector{ND,T}, cutoff::T) where {ND,T}
+    SVector(ntuple(d -> floor(raw[d] / cutoff) * cutoff, Val(ND)))
 end
 
 # Compute the 1-indexed flat cell for particle i in a Vector{SVector} x.

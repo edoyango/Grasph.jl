@@ -112,6 +112,13 @@ end
 # Public API
 # ---------------------------------------------------------------------------
 
+# Allocation-free position → integer cell-key conversion.
+# Using a named @inline function instead of a `map(v -> ..., xi)` closure
+# ensures the captured `cutoff` is never heap-boxed.
+@inline function _pos_to_key(xi::SVector{ND,T}, cutoff::T) where {ND,T}
+    SVector(ntuple(d -> floor(Int, xi[d] / cutoff), Val(ND)))
+end
+
 """
     sort_particles!(ps, cutoff, perm_buf, key_buf, scratch_arrays)
 
@@ -153,8 +160,20 @@ function sort_particles!(ps::AbstractParticleSystem{T,ND}, cutoff::T,
     arrs = _particle_arrays(ps)
     x    = first(arrs)       # x is always the first array
     @inbounds for i in 1:n
-        key_buf[i] = map(v -> floor(Int, v / cutoff), x[i])
+        key_buf[i] = _pos_to_key(x[i], cutoff)
     end
+
+    # Fast path: if keys are already non-decreasing, no reordering needed.
+    # Avoids both sortperm! and _apply_perms! on steps where particles haven't
+    # crossed cell boundaries — common after the first few timesteps.
+    already_sorted = true
+    @inbounds for i in 1:n-1
+        if _lt_key(key_buf[i+1], key_buf[i])
+            already_sorted = false
+            break
+        end
+    end
+    already_sorted && return
 
     # Compute the sorting permutation in-place (no allocation).
     perm_view = view(perm_buf, 1:n)

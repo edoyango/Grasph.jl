@@ -128,6 +128,40 @@ end
 end
 
 # ---------------------------------------------------------------------------
+# Tuple-recursive helpers for the time loop
+#
+# `for (i, ps) in enumerate(sys)` gives `ps::Union{A,B,...}` when sys is a
+# heterogeneous Tuple.  Any call inside the loop that dispatches on ps's
+# concrete type (e.g. _particle_arrays, _make_q0_bufs) then returns a Union
+# type, which Julia must box on the heap before passing to recursive helpers
+# like _apply_perms!.  The Base.tail pattern below ensures each call site
+# sees a fully concrete type with no Union boxing.
+# ---------------------------------------------------------------------------
+
+_sort_all_systems!(::Tuple{}, ::Tuple{}, cutoff, perm_buf, key_buf, to, labels, idx) = nothing
+@inline function _sort_all_systems!(sys::Tuple, scratches::Tuple, cutoff, perm_buf, key_buf, to, labels, idx)
+    @timeit to labels[idx].sort sort_particles!(first(sys), cutoff, perm_buf, key_buf, first(scratches))
+    _sort_all_systems!(Base.tail(sys), Base.tail(scratches), cutoff, perm_buf, key_buf, to, labels, idx + 1)
+end
+
+_save_q0_all!(::Tuple{}, ::Tuple{}) = nothing
+@inline function _save_q0_all!(sys::Tuple, q0s::Tuple)
+    ps = first(sys)
+    _save_q0_pairs!(ps, getfield(ps, :pairs), first(q0s))
+    _save_q0_all!(Base.tail(sys), Base.tail(q0s))
+end
+
+_fullstep_all!(::Tuple{}, ::Tuple{}, dt, to, labels, idx) = nothing
+@inline function _fullstep_all!(sys::Tuple, q0s::Tuple, dt, to, labels, idx)
+    ps = first(sys)
+    @timeit to labels[idx].full begin
+        _fullstep_ps!(ps, first(q0s), dt)
+        _update_positions!(ps, dt)
+    end
+    _fullstep_all!(Base.tail(sys), Base.tail(q0s), dt, to, labels, idx + 1)
+end
+
+# ---------------------------------------------------------------------------
 # Integration loop
 # ---------------------------------------------------------------------------
 
@@ -178,8 +212,9 @@ function time_integrate!(
     end
 
     # Pre-allocate q0 buffers: one typed tuple of arrays per system.
-    # _make_q0_bufs uses Base.tail recursion so each buffer has a concrete type.
-    q0_bufs = [_make_q0_bufs(ps) for ps in sys]
+    # map on a Tuple preserves element types (unlike a comprehension, which
+    # would produce Vector{Any} when systems have different concrete types).
+    q0_bufs = map(_make_q0_bufs, sys)
 
     # Pre-allocate sort infrastructure.  All interactions share the same cutoff
     # (enforced at construction), so 2h is the canonical cell-lattice spacing.
@@ -222,15 +257,10 @@ function time_integrate!(
         # throughout the step, so the full-step q = q0 + dt·dqdt is correct.
         # Positions come from the previous step's update, so spatially nearby
         # particles are already nearly sorted — the cost is low.
-        for (i, ps) in enumerate(sys)
-            @timeit to ps_labels[i].sort sort_particles!(
-                ps, sort_cutoff, sort_perm_buf, sort_key_buf, sys_scratches[i])
-        end
+        _sort_all_systems!(sys, sys_scratches, sort_cutoff, sort_perm_buf, sort_key_buf, to, ps_labels, 1)
 
         # ---- 2. Save initial values ----------------------------------------
-        for (i, ps) in enumerate(sys)
-            _save_q0_pairs!(ps, getfield(ps, :pairs), q0_bufs[i])
-        end
+        _save_q0_all!(sys, q0_bufs)
 
         # ---- 3. Generate ghosts (positions only) ---------------------------
         for (i, ge) in enumerate(integrator.ghosts)
@@ -278,12 +308,7 @@ function time_integrate!(
         end
 
         # ---- 9. Full-step --------------------------------------------------
-        for (i, ps) in enumerate(sys)
-            @timeit to ps_labels[i].full begin
-                _fullstep_ps!(ps, q0_bufs[i], dt)
-                _update_positions!(ps, dt)
-            end
-        end
+        _fullstep_all!(sys, q0_bufs, dt, to, ps_labels, 1)
 
         # ---- 10. Print -----------------------------------------------------
         if global_step % print_interval_step == 0

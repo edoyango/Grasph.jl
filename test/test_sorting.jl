@@ -129,6 +129,25 @@ end
         @test ps.x == expected_x
     end
 
+    @testset "already-sorted input takes the fast path (zero allocations)" begin
+        n, nd = 6, 2
+        ps = _make_ps(n=n, ndims=nd)
+        cutoff = 0.2
+        # Positions already in sorted cell order
+        ps.x[1] = SVector(0.05, 0.05)
+        ps.x[2] = SVector(0.05, 0.25)
+        ps.x[3] = SVector(0.25, 0.05)
+        ps.x[4] = SVector(0.25, 0.25)
+        ps.x[5] = SVector(0.45, 0.05)
+        ps.x[6] = SVector(0.45, 0.25)
+
+        perm_buf, key_buf, scratch = _make_sort_bufs(ps)
+        # Warm up to avoid first-call JIT overhead
+        sort_particles!(ps, cutoff, perm_buf, key_buf, scratch)
+        allocs = @allocated sort_particles!(ps, cutoff, perm_buf, key_buf, scratch)
+        @test allocs == 0
+    end
+
     @testset "sort is idempotent (second call leaves order unchanged)" begin
         n, nd = 6, 2
         ps = _make_ps(n=n, ndims=nd)
