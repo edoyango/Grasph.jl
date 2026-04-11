@@ -239,7 +239,7 @@ end
 
         normal = SVector(0.0, 1.0)
         point  = SVector(0.0, 0.0)
-        ge = GhostEntry(ghost, normal, point, k.interaction_length)
+        ge = GhostEntry(ghost, k.interaction_length, (normal, point))
         generate_ghosts!(ge)
 
         n_ghost = ghost.n
@@ -273,7 +273,7 @@ end
 
         normal = SVector(0.0, 1.0)
         point  = SVector(0.0, 0.0)
-        ge = GhostEntry(ghost, normal, point, k.interaction_length)
+        ge = GhostEntry(ghost, k.interaction_length, (normal, point))
         generate_ghosts!(ge)
 
         # Record which original index each ghost position comes from before sort
@@ -285,6 +285,51 @@ end
         # After sort: (x, idx_original) pairs must still match
         post_sort_pairs = Set([(ghost.x[i], ghost.idx_original[i]) for i in 1:ghost.n])
         @test Set(pre_sort_pairs) == post_sort_pairs
+    end
+
+    @testset "idx_boundary moves with ghost positions after sort" begin
+        # Regression test: idx_boundary must be permuted alongside x during
+        # sort_particles! so each ghost's reported boundary still matches its
+        # reflected position.
+        #
+        # Setup: two boundaries generate ghosts in spatially distinct regions.
+        # After generation the ghost array is [boundary-1 ghosts, boundary-2 ghosts].
+        # Sorting by cell index reverses that order.  Without the fix, idx_boundary
+        # stays in the pre-sort order while x is permuted — so boundary indices
+        # and positions no longer correspond.
+        #
+        # Boundary 1: right wall  normal=(-1,0) point=(1,0) — particle at (0.92, 0.5)
+        #   → ghost at (1.08, 0.5), cell ≈ (10, 5) with h=0.1
+        # Boundary 2: bottom wall normal=(0,1)  point=(0,0) — particle at (0.05, 0.06)
+        #   → ghost at (0.05,-0.06), cell ≈ (0,-1) with h=0.1
+        # Sorted order: (0,-1) < (10,5), so boundary-2 ghost ends up first.
+
+        h   = 0.1
+        ps  = _make_ps(n=2, ndims=2)
+        ps.x[1] = SVector(0.92, 0.5)   # near right wall
+        ps.x[2] = SVector(0.05, 0.06)  # near bottom wall
+        ps.rho .= 1000.0
+
+        ghost = GhostParticleSystem(ps)
+        ge = GhostEntry(ghost, h,
+            (SVector(-1.0, 0.0), SVector(1.0, 0.0)),   # boundary 1: right wall
+            (SVector( 0.0, 1.0), SVector(0.0, 0.0)),   # boundary 2: bottom wall
+        )
+        generate_ghosts!(ge)
+        @test ghost.n == 2   # one ghost per boundary
+
+        perm_buf, key_buf, scratch = _make_sort_bufs_empty(ghost)
+        sort_particles!(ghost, h, perm_buf, key_buf, scratch)
+
+        # For every ghost k: reflected position must equal the reflection of its
+        # source particle across its reported boundary.
+        for k in 1:ghost.n
+            b      = ge.boundaries[ghost.idx_boundary[k]]
+            src_x  = ps.x[ghost.idx_original[k]]
+            da     = dot(src_x - b.point, b.normal)
+            expected_x = src_x - 2 * da * b.normal
+            @test ghost.x[k] ≈ expected_x
+        end
     end
 end
 

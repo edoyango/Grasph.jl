@@ -32,6 +32,7 @@ function _particle_arrays(ps::GhostParticleSystem)
      getfield(ps, :v),
      getfield(ps, :rho),
      getfield(ps, :idx_original),
+     getfield(ps, :idx_boundary),
      values(getfield(ps, :extras))...)
 end
 

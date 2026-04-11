@@ -119,28 +119,16 @@ fill!(bottom_boundary.v, zero(SVector{3,Float64}))
 
 const Y_max = nfy * dx_spacing
 
-left_ghost  = GhostParticleSystem(fluid, nothing, GhostCopier(:stress); name="ghost_left")
-front_ghost = GhostParticleSystem(fluid, nothing, GhostCopier(:stress); name="ghost_front")
-back_ghost  = GhostParticleSystem(fluid, nothing, GhostCopier(:stress); name="ghost_back")
-north_west_ghost = GhostParticleSystem(fluid, nothing, GhostCopier(:stress); name="ghost_northwest")
-south_west_ghost = GhostParticleSystem(fluid, nothing, GhostCopier(:stress); name="ghost_southwest")
+boundary_ghost = GhostParticleSystem(fluid, nothing, GhostCopier(:stress); name="ghost[fluid]")
 
 # Normal points into the domain; point lies on the wall plane.
-left_ghost_entry  = GhostEntry(left_ghost,
-                               SVector(1.0, 0.0,  0.0),
-                               SVector(0.0, 0.0,  0.0), 3.0*h_sph)
-front_ghost_entry = GhostEntry(front_ghost,
-                               SVector(0.0, 1.0,  0.0),
-                               SVector(0.0, 0.0,  0.0), 3.0*h_sph)
-back_ghost_entry  = GhostEntry(back_ghost,
-                               SVector(0.0, -1.0, 0.0),
-                               SVector(0.0, Y_max, 0.0), 3.0*h_sph)
-north_west_ghost_entry = GhostEntry(north_west_ghost,
-                                    SVector(1.0, -1.0, 0.0)/sqrt(2),
-                                    SVector(0.0, Y_max, 0.0), 3.0*h_sph)
-south_west_ghost_entry = GhostEntry(south_west_ghost,
-                                    SVector(1.0, 1.0, 0.0)/sqrt(2), 
-                                    SVector(0.0, 0.0, 0.0), 3.0*h_sph)
+boundary_ghost_entry = GhostEntry(boundary_ghost, 3.0*h_sph,
+    (SVector(1.0,  0.0, 0.0),         SVector(0.0,   0.0, 0.0)),  # left wall
+    (SVector(0.0,  1.0, 0.0),         SVector(0.0,   0.0, 0.0)),  # front wall
+    (SVector(0.0, -1.0, 0.0),         SVector(0.0, Y_max, 0.0)),  # back wall
+    (SVector(1.0, -1.0, 0.0)/sqrt(2), SVector(0.0, Y_max, 0.0)),  # north-west corner
+    (SVector(1.0,  1.0, 0.0)/sqrt(2), SVector(0.0,   0.0, 0.0)),  # south-west corner
+)
 
 # ---------------------------------------------------------------------------
 # Interactions and integrator
@@ -163,22 +151,12 @@ fluid_interaction = SystemInteraction(kernel, pfns, fluid)
 
 fluid_bottom_interaction = SystemInteraction(kernel, pfns, fluid, dynamic_bottom)
 
-fluid_left_interaction  = SystemInteraction(kernel, pfns, fluid, left_ghost)
-fluid_front_interaction = SystemInteraction(kernel, pfns, fluid, front_ghost)
-fluid_back_interaction  = SystemInteraction(kernel, pfns, fluid, back_ghost)
-fluid_northwest_interaction = SystemInteraction(kernel, pfns, fluid, north_west_ghost)
-fluid_southwest_interaction  = SystemInteraction(kernel, pfns, fluid, south_west_ghost)
+fluid_boundary_interaction = SystemInteraction(kernel, pfns, fluid, boundary_ghost)
 
 integrator = LeapFrogTimeIntegrator(
     [fluid, bottom_boundary],
-    [fluid_interaction,
-     fluid_bottom_interaction,
-     fluid_left_interaction,
-     fluid_front_interaction,
-     fluid_back_interaction,
-     fluid_northwest_interaction,
-     fluid_southwest_interaction];
-    ghosts = (left_ghost_entry, front_ghost_entry, back_ghost_entry, north_west_ghost_entry, south_west_ghost_entry),
+    [fluid_interaction, fluid_bottom_interaction, fluid_boundary_interaction];
+    ghosts = (boundary_ghost_entry,),
 )
 
 # ---------------------------------------------------------------------------

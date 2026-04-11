@@ -61,7 +61,8 @@ end
     ps.rho .= 1850.0
 
     ghost = GhostParticleSystem(ps, GhostCopier(:rho, :stress))
-    generate_ghosts!(ghost, SVector(0.0, 1.0), SVector(0.0, 0.0), 0.15)
+    entry = GhostEntry(ghost, 0.15, (SVector(0.0, 1.0), SVector(0.0, 0.0)))
+    generate_ghosts!(entry)
     update_ghost!(ghost, 1)
 
     @test ghost.n == 2
@@ -86,7 +87,8 @@ end
     ps.rho .= 1000.0
 
     ghost = GhostParticleSystem(ps, GhostCopier(:rho, :p))
-    generate_ghosts!(ghost, SVector(0.0, 1.0), SVector(0.0, 0.0), 0.15)
+    entry = GhostEntry(ghost, 0.15, (SVector(0.0, 1.0), SVector(0.0, 0.0)))
+    generate_ghosts!(entry)
     update_ghost!(ghost, 1)
 
     for k in 1:ghost.n
@@ -120,8 +122,9 @@ end
     ps.rho .= 1850.0
 
     ghost = GhostParticleSystem(ps, GhostCopier(:rho))
-    generate_ghosts!(ghost, normal, point, cutoff)
-    update_ghost_kinematics!(ghost, normal)
+    entry = GhostEntry(ghost, cutoff, (normal, point))
+    generate_ghosts!(entry)
+    update_ghost_kinematics!(entry)
     update_ghost!(ghost, 1)
 
     @test ghost.n                == 1
@@ -138,7 +141,8 @@ end
     ps.x[2] = SVector(0.0, -0.2)
     ps.x[3] = SVector(0.0,  0.5)   # da=0.5 > cutoff=0.15
     ghost = GhostParticleSystem(ps)
-    generate_ghosts!(ghost, SVector(0.0, 1.0), SVector(0.0, 0.0), 0.15)
+    entry = GhostEntry(ghost, 0.15, (SVector(0.0, 1.0), SVector(0.0, 0.0)))
+    generate_ghosts!(entry)
     @test ghost.n == 0
     @test length(ghost.x)  == 0
 end
@@ -151,7 +155,8 @@ end
     end
     ps.rho .= 1850.0
     ghost = GhostParticleSystem(ps)
-    generate_ghosts!(ghost, SVector(0.0, 1.0), SVector(0.0, 0.0), 0.15)
+    entry = GhostEntry(ghost, 0.15, (SVector(0.0, 1.0), SVector(0.0, 0.0)))
+    generate_ghosts!(entry)
     @test ghost.n == n
     @test length(ghost.x)  == n
     for k in 1:n
@@ -164,24 +169,25 @@ end
     ghost = GhostParticleSystem(ps)
     normal = SVector(0.0, 1.0)
     point  = SVector(0.0, 0.0)
+    entry  = GhostEntry(ghost, 0.15, (normal, point))
 
     # First call: 2 particles inside
     ps.x[1] = SVector(0.0, 0.05); ps.x[2] = SVector(0.0, 0.08)
     ps.x[3] = SVector(0.0, -0.1); ps.x[4] = SVector(0.0, 0.5)
     ps.rho .= 1850.0
-    generate_ghosts!(ghost, normal, point, 0.15)
+    generate_ghosts!(entry)
     @test ghost.n == 2
 
     # Second call: fewer qualify — arrays must shrink
     ps.x[2] = SVector(0.0, 0.5)
-    generate_ghosts!(ghost, normal, point, 0.15)
+    generate_ghosts!(entry)
     @test ghost.n == 1
     @test length(ghost.x)  == 1
 
     # Third call: more qualify again — arrays must grow back
     ps.x[2] = SVector(0.0, 0.08)
     ps.x[3] = SVector(0.0, 0.06)
-    generate_ghosts!(ghost, normal, point, 0.15)
+    generate_ghosts!(entry)
     @test ghost.n == 3
     @test length(ghost.x)  == 3
 end
@@ -205,8 +211,9 @@ end
     ps.rho .= rho0
 
     ghost = GhostParticleSystem(ps, GhostCopier(:rho))
-    generate_ghosts!(ghost, SVector(0.0, 1.0), SVector(0.0, 0.0), 0.15)
-    update_ghost_kinematics!(ghost, SVector(0.0, 1.0))
+    entry = GhostEntry(ghost, 0.15, (SVector(0.0, 1.0), SVector(0.0, 0.0)))
+    generate_ghosts!(entry)
+    update_ghost_kinematics!(entry)
     update_ghost!(ghost, 1)
     @test ghost.n == 2
 
@@ -226,16 +233,57 @@ end
 # Integration: GhostEntry + LeapFrogTimeIntegrator mirrors stress each stage
 # ---------------------------------------------------------------------------
 
-@testset "GhostEntry construction" begin
+@testset "GhostEntry construction — single boundary" begin
     ps    = _make_granular(n=4)
     ps.x .= [SVector(0.1*i, 0.05) for i in 1:4]
     ps.rho .= 1850.0
     ghost = GhostParticleSystem(ps)
-    entry = GhostEntry(ghost, SVector(0.0, 1.0), SVector(0.0, 0.0), 0.15)
-    @test entry.normal  == SVector(0.0, 1.0)
-    @test entry.point   == SVector(0.0, 0.0)
+    entry = GhostEntry(ghost, 0.15, (SVector(0.0, 1.0), SVector(0.0, 0.0)))
+    @test length(entry.boundaries) == 1
+    @test entry.boundaries[1].normal == SVector(0.0, 1.0)
+    @test entry.boundaries[1].point  == SVector(0.0, 0.0)
     @test entry.cutoff  ≈ 0.15
     @test entry.ghost   === ghost
+end
+
+@testset "GhostEntry construction — multiple boundaries" begin
+    ps    = _make_granular(n=4)
+    ps.x .= [SVector(0.1*i, 0.05) for i in 1:4]
+    ps.rho .= 1850.0
+    ghost = GhostParticleSystem(ps)
+    entry = GhostEntry(ghost, 0.15,
+                       (SVector(1.0, 0.0), SVector(0.0, 0.0)),
+                       (SVector(0.0, 1.0), SVector(0.0, 0.0)))
+    @test length(entry.boundaries) == 2
+    @test entry.boundaries[1].normal == SVector(1.0, 0.0)
+    @test entry.boundaries[2].normal == SVector(0.0, 1.0)
+    @test entry.cutoff ≈ 0.15
+end
+
+@testset "GhostEntry generate_ghosts! sets idx_boundary correctly" begin
+    ps = _make_granular(n=4)
+    # Particles near y=0 (boundary 1) and near x=0 (boundary 2)
+    ps.x[1] = SVector(0.05, 0.5)   # near x=0 only
+    ps.x[2] = SVector(0.5,  0.05)  # near y=0 only
+    ps.x[3] = SVector(0.5,  0.5)   # neither
+    ps.x[4] = SVector(0.05, 0.05)  # near both
+    ps.rho .= 1850.0
+    ghost = GhostParticleSystem(ps)
+    entry = GhostEntry(ghost, 0.15,
+                       (SVector(1.0, 0.0), SVector(0.0, 0.0)),  # boundary 1: x=0 wall
+                       (SVector(0.0, 1.0), SVector(0.0, 0.0)))  # boundary 2: y=0 wall
+    generate_ghosts!(entry)
+    # All ghosts from boundary 1 have idx_boundary == 1, boundary 2 → 2
+    idx_bnd = ghost.idx_boundary
+    @test all(b -> b in (1, 2), idx_bnd)
+    # Ghosts generated from x-wall have reflected x-coordinate (negative x)
+    for k in 1:ghost.n
+        if idx_bnd[k] == 1
+            @test ghost.x[k][1] < 0
+        else
+            @test ghost.x[k][2] < 0
+        end
+    end
 end
 
 @testset "integrator calls generate_ghosts! and update_ghost! automatically" begin
@@ -251,7 +299,7 @@ end
 
     # Set up ghost — stage 1 copier keeps rho and stress current before each sweep
     ghost = GhostParticleSystem(ps, GhostCopier(:rho, :stress))
-    entry = GhostEntry(ghost, SVector(0.0, 1.0), SVector(0.0, 0.0), 0.15)
+    entry = GhostEntry(ghost, 0.15, (SVector(0.0, 1.0), SVector(0.0, 0.0)))
 
     k = CubicSplineKernel(h; ndims=2)
     si = SystemInteraction(k, StrainRatePfn(), ps, ghost)

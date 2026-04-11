@@ -123,23 +123,19 @@ fill!(fluid_Y.v, zero(SVector{2,Float64}))
 # Particle setup — ghost boundaries
 # ---------------------------------------------------------------------------
 
-left_ghost = GhostParticleSystem(fluid_X, GhostCopier(:p); name="ghost left[fluid_X]")
-right_ghost = GhostParticleSystem(fluid_X, GhostCopier(:p); name="ghost right[fluid_X]")
-bottom_ghost = GhostParticleSystem(fluid_X, GhostCopier(:p); name="ghost bottom[fluid_X]")
-top_ghost = GhostParticleSystem(fluid_X, GhostCopier(:p); name="ghost top[fluid_X]")
-bottom_left_ghost = GhostParticleSystem(fluid_X, GhostCopier(:p); name="ghost bottom left[fluid_X]")
-bottom_right_ghost = GhostParticleSystem(fluid_X, GhostCopier(:p); name="ghost bottom right[fluid_X]")
-top_left_ghost = GhostParticleSystem(fluid_X, GhostCopier(:p); name="ghost top left[fluid_X]")
-top_right_ghost = GhostParticleSystem(fluid_X, GhostCopier(:p); name="ghost top right[fluid_X]")
+# Single ghost system representing all 4 walls and 4 corner boundaries.
+boundary_ghost = GhostParticleSystem(fluid_X, GhostCopier(:p); name="ghost[fluid_X]")
 
-left_ghost_entry = GhostEntry(left_ghost, SVector(1.0, 0.0), SVector(x_min, 0.0), 3.0 * h_sph)
-right_ghost_entry = GhostEntry(right_ghost, SVector(-1.0, 0.0), SVector(x_max, 0.0), 3.0 * h_sph)
-bottom_ghost_entry = GhostEntry(bottom_ghost, SVector(0.0, 1.0), SVector(0.0, y_min), 3.0 * h_sph)
-top_ghost_entry = GhostEntry(top_ghost, SVector(0.0, -1.0), SVector(0.0, y_max), 3.0 * h_sph)
-bottom_left_ghost_entry = GhostEntry(bottom_left_ghost, SVector(1.0, 1.0)/sqrt(2.0), SVector(x_min, y_min), 3.0 * h_sph)
-bottom_right_ghost_entry = GhostEntry(bottom_right_ghost, SVector(-1.0, 1.0)/sqrt(2.0), SVector(x_max, y_min), 3.0 * h_sph)
-top_left_ghost_entry = GhostEntry(top_left_ghost, SVector(1.0, -1.0)/sqrt(2.0), SVector(x_min, y_max), 3.0 * h_sph)
-top_right_ghost_entry = GhostEntry(top_right_ghost, SVector(-1.0, -1.0)/sqrt(2.0), SVector(x_max, y_max), 3.0 * h_sph)
+boundary_ghost_entry = GhostEntry(boundary_ghost, 3.0 * h_sph,
+    (SVector( 1.0,  0.0),            SVector(x_min, 0.0  )),  # left wall
+    (SVector(-1.0,  0.0),            SVector(x_max, 0.0  )),  # right wall
+    (SVector( 0.0,  1.0),            SVector(0.0,   y_min)),  # bottom wall
+    (SVector( 0.0, -1.0),            SVector(0.0,   y_max)),  # top wall
+    (SVector( 1.0,  1.0)/sqrt(2.0),  SVector(x_min, y_min)),  # bottom-left corner
+    (SVector(-1.0,  1.0)/sqrt(2.0),  SVector(x_max, y_min)),  # bottom-right corner
+    (SVector( 1.0, -1.0)/sqrt(2.0),  SVector(x_min, y_max)),  # top-left corner
+    (SVector(-1.0, -1.0)/sqrt(2.0),  SVector(x_max, y_max)),  # top-right corner
+)
 
 # ---------------------------------------------------------------------------
 # Interactions and integrator
@@ -170,66 +166,24 @@ fluid_XY_interaction = SystemInteraction(
     fluid_X,
 )
 
-# heavy fluid particles interacting with boundary
-# should technically also add an interaction of fluid_Y with boundary, 
+# heavy fluid particles interacting with boundary.
+# should technically also add an interaction of fluid_Y with boundary,
 # but we're not running the simulation long enough for the bubble to touch
 # the top wall.
-fluid_left_interaction = SystemInteraction(
+fluid_boundary_interaction = SystemInteraction(
     kernel,
     FluidPfn(art_visc_alpha, art_visc_beta, h_sph),
     fluid_X,
-    left_ghost
-)
-fluid_right_interaction = SystemInteraction(
-    kernel,
-    FluidPfn(art_visc_alpha, art_visc_beta, h_sph),
-    fluid_X,
-    right_ghost
-)
-fluid_bottom_interaction = SystemInteraction(
-    kernel,
-    FluidPfn(art_visc_alpha, art_visc_beta, h_sph),
-    fluid_X,
-    bottom_ghost
-)
-fluid_top_interaction = SystemInteraction(
-    kernel,
-    FluidPfn(art_visc_alpha, art_visc_beta, h_sph),
-    fluid_X,
-    top_ghost
-)
-fluid_bottom_left_interaction = SystemInteraction(
-    kernel,
-    FluidPfn(art_visc_alpha, art_visc_beta, h_sph),
-    fluid_X,
-    bottom_left_ghost
-)
-fluid_bottom_right_interaction = SystemInteraction(
-    kernel,
-    FluidPfn(art_visc_alpha, art_visc_beta, h_sph),
-    fluid_X,
-    bottom_right_ghost
-)
-fluid_top_left_interaction = SystemInteraction(
-    kernel,
-    FluidPfn(art_visc_alpha, art_visc_beta, h_sph),
-    fluid_X,
-    top_left_ghost
-)
-fluid_top_right_interaction = SystemInteraction(
-    kernel,
-    FluidPfn(art_visc_alpha, art_visc_beta, h_sph),
-    fluid_X,
-    top_right_ghost
+    boundary_ghost
 )
 
 integrator = LeapFrogTimeIntegrator(
     # vector of particle systems involved in the simulation.
     # the boundary system could be omitted, as their positions and properties don't get
     # updated, but they're included here so their data is written and can be visualised.
-    [fluid_X, fluid_Y], 
-    [fluid_X_interaction, fluid_Y_interaction, fluid_XY_interaction, fluid_left_interaction, fluid_right_interaction, fluid_top_interaction, fluid_bottom_interaction, fluid_bottom_left_interaction, fluid_bottom_right_interaction, fluid_top_left_interaction, fluid_top_right_interaction];
-    ghosts = [left_ghost_entry, right_ghost_entry, top_ghost_entry, bottom_ghost_entry, bottom_left_ghost_entry, bottom_right_ghost_entry, top_left_ghost_entry, top_right_ghost_entry]
+    [fluid_X, fluid_Y],
+    [fluid_X_interaction, fluid_Y_interaction, fluid_XY_interaction, fluid_boundary_interaction];
+    ghosts = [boundary_ghost_entry]
 )
 
 # ---------------------------------------------------------------------------

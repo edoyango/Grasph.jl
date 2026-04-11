@@ -90,7 +90,7 @@ fill!(bottom_boundary.v, zero(SVector{2,Float64}))
 # Setup ghost particles for the left wall (mirroring across x=0)
 left_ghost  = GhostParticleSystem(fluid, nothing, GhostCopier(:stress))
 # normal pointing into the domain (right), point on the wall (x=0)
-left_ghost_entry = GhostEntry(left_ghost, SVector(1.0, 0.0), SVector(0.0, 0.0), 3.0 * h_sph)
+left_ghost_entry = GhostEntry(left_ghost, 3.0 * h_sph, (SVector(1.0, 0.0), SVector(0.0, 0.0)))
 
 # ---------------------------------------------------------------------------
 # Interactions and integrator

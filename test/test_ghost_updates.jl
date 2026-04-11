@@ -34,14 +34,15 @@ end
 
     normal = SVector(1.0, 0.0) # Vertical wall at x=0, normal points right
     point  = SVector(0.0, 0.0)
+    entry  = GhostEntry(ghost, 0.1, (normal, point))
 
     # 1. Generate ghosts (positions only)
-    generate_ghosts!(ghost, normal, point, 0.1)
+    generate_ghosts!(entry)
     @test ghost.n == 1
     @test ghost.x[1] ≈ SVector(-0.01, 0.01)
 
     # 2. Update kinematics and copy physics
-    update_ghost_kinematics!(ghost, normal)
+    update_ghost_kinematics!(entry)
     update_ghost!(ghost, 1)
 
     # Velocity should be reflected: vx -> -vx, vy -> vy
@@ -69,9 +70,10 @@ end
 
     normal = SVector(1.0, 0.0)
     point  = SVector(0.0, 0.0)
+    entry  = GhostEntry(ghost, 0.1, (normal, point))
 
-    generate_ghosts!(ghost, normal, point, 0.1)
-    update_ghost_kinematics!(ghost, normal)
+    generate_ghosts!(entry)
+    update_ghost_kinematics!(entry)
     update_ghost!(ghost, 1)
 
     # Interaction: should use Cauchy interaction because :stress is present
@@ -106,9 +108,10 @@ end
 
     normal = SVector(1.0, 0.0)
     point  = SVector(0.0, 0.0)
+    entry  = GhostEntry(ghost, 0.1, (normal, point))
 
-    generate_ghosts!(ghost, normal, point, 0.1)
-    update_ghost_kinematics!(ghost, normal)
+    generate_ghosts!(entry)
+    update_ghost_kinematics!(entry)
     update_ghost!(ghost, 1)
 
     # Interaction: should use Pressure interaction because :p is present (no :stress)
@@ -138,7 +141,7 @@ end
     ps.x[1] = SVector(0.02, 0.05)
 
     ghost = GhostParticleSystem(ps, GhostCopier(:rho))
-    entry = GhostEntry(ghost, SVector(1.0, 0.0), SVector(0.0, 0.0), 0.1)
+    entry = GhostEntry(ghost, 0.1, (SVector(1.0, 0.0), SVector(0.0, 0.0)))
 
     # Custom Pfn to check ghost state during sweep
     struct MockPfn end

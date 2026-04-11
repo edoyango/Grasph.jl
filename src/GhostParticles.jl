@@ -1,6 +1,7 @@
 export AbstractGhostParticleSystem,
        GhostParticleSystem, GhostCopier,
-       GhostEntry, generate_ghosts!, update_ghost!, update_ghost_kinematics!, write_h5
+       GhostBoundary, GhostEntry,
+       generate_ghosts!, update_ghost!, update_ghost_kinematics!, write_h5
 
 # ---------------------------------------------------------------------------
 # Abstract type
@@ -89,6 +90,10 @@ behaviour are fully specified by the `GhostCopier`s supplied at construction.
 `extras` is a `NamedTuple` containing one `Vector` per field in the union of
 all copier field lists. `x`, `v`, and `rho` are first-class fields updated
 every step. Scalar source fields (`mass`, `c`, …) are forwarded directly.
+
+`idx_original[k]` maps ghost particle k to its source particle index.
+`idx_boundary[k]` maps ghost particle k to the boundary that generated it,
+indexing into the `boundaries` tuple of the associated `GhostEntry`.
 """
 struct GhostParticleSystem{T<:AbstractFloat, ND, PS<:AbstractParticleSystem{T,ND}, ET<:NamedTuple, UPD<:Tuple} <: AbstractGhostParticleSystem{T, ND}
     name::String
@@ -96,6 +101,7 @@ struct GhostParticleSystem{T<:AbstractFloat, ND, PS<:AbstractParticleSystem{T,ND
     v::Vector{SVector{ND,T}}    # reflected velocities — owned
     rho::Vector{T}              # mirrored density — owned
     idx_original::Vector{Int}   # ghost k → source particle index
+    idx_boundary::Vector{Int}   # ghost k → boundary index in GhostEntry
     source::PS
     extras::ET                  # owned copies: (p=…, stress=…, …)
     updaters::UPD               # per-stage GhostCopier or nothing instances
@@ -127,7 +133,8 @@ function GhostParticleSystem(
         Vector{SVector{ND,T}}(undef, n),
         Vector{SVector{ND,T}}(undef, n),
         Vector{T}(undef, n),
-        Vector{Int}(undef, n),
+        Vector{Int}(undef, n),   # idx_original
+        Vector{Int}(undef, n),   # idx_boundary
         ps,
         extras,
         updaters,
@@ -141,7 +148,7 @@ end
 @inline function Base.getproperty(g::GhostParticleSystem{T,ND,PS,ET,UPD}, s::Symbol) where {T,ND,PS,ET,UPD}
     s === :ndims && return ND
     s === :n     && return length(getfield(g, :x))
-    s in (:name, :x, :v, :rho, :idx_original, :source, :extras, :updaters) && return getfield(g, s)
+    s in (:name, :x, :v, :rho, :idx_original, :idx_boundary, :source, :extras, :updaters) && return getfield(g, s)
 
     # Owned copies (p, stress, …) — contiguous, cache-friendly
     s in fieldnames(ET) && return getproperty(getfield(g, :extras), s)
@@ -151,58 +158,22 @@ end
 end
 
 # ---------------------------------------------------------------------------
-# generate_ghosts!
+# GhostBoundary
 # ---------------------------------------------------------------------------
 
 """
-    generate_ghosts!(ghost::GhostParticleSystem, normal, point, cutoff)
+    GhostBoundary{ND, T}
 
-Populate `ghost` from `ghost.source` by reflecting qualifying real particles
-across the plane defined by `normal` (unit vector) and `point`.
-
-Resizes all owned arrays to the qualifying count. Call `update_ghost_kinematics!`
-and `update_ghost!` to populate physics values.
+A plane boundary defined by an inward-pointing unit `normal` and a `point`
+on the plane.  Used as elements of the `boundaries` tuple in a `GhostEntry`.
 """
-function generate_ghosts!(
-    ghost::GhostParticleSystem{T,ND},
-    normal::SVector{ND,T},
-    point::SVector{ND,T},
-    cutoff::T,
-) where {T,ND}
-    ps = getfield(ghost, :source)
-
-    # First pass: count qualifying particles
-    k = 0
-    @inbounds for i in 1:ps.n
-        da = dot(ps.x[i] - point, normal)
-        if abs(da) <= cutoff && da > zero(T)
-            k += 1
-        end
+struct GhostBoundary{ND, T<:AbstractFloat}
+    normal::SVector{ND,T}
+    point::SVector{ND,T}
+    function GhostBoundary{ND,T}(normal, point) where {ND,T}
+        ND isa Int || throw(ArgumentError("ND must be an Int, got $(typeof(ND))"))
+        new{ND,T}(normal, point)
     end
-
-    # Resize all owned arrays to exact count
-    resize!(getfield(ghost, :x),            k)
-    resize!(getfield(ghost, :v),            k)
-    resize!(getfield(ghost, :rho),          k)
-    resize!(getfield(ghost, :idx_original), k)
-    for arr in getfield(ghost, :extras)
-        resize!(arr, k)
-    end
-
-    # Second pass: populate positions and index mapping
-    x   = getfield(ghost, :x)
-    idx = getfield(ghost, :idx_original)
-    cursor = 0
-    @inbounds for i in 1:ps.n
-        da = dot(ps.x[i] - point, normal)
-        if abs(da) <= cutoff && da > zero(T)
-            cursor += 1
-            x[cursor]   = ps.x[i] - (2 * da) * normal
-            idx[cursor] = i
-        end
-    end
-
-    return ghost
 end
 
 # ---------------------------------------------------------------------------
@@ -229,77 +200,145 @@ update_ghost!(ghost::GhostParticleSystem, stage::Int) =
     _run_ghost_stage!(ghost, getfield(ghost, :updaters), stage)
 
 # ---------------------------------------------------------------------------
-# update_ghost_kinematics!
-# ---------------------------------------------------------------------------
-
-"""
-    update_ghost_kinematics!(ghost::GhostParticleSystem, normal)
-
-Update ghost velocities by reflecting source velocities across the boundary
-normal, and mirror source densities.
-"""
-function update_ghost_kinematics!(
-    ghost::GhostParticleSystem{T,ND},
-    normal::SVector{ND,T},
-) where {T,ND}
-    ps        = getfield(ghost, :source)
-    n         = ghost.n
-    idx       = getfield(ghost, :idx_original)
-    v_ghost   = getfield(ghost, :v)
-    v_real    = ps.v
-    rho_ghost = getfield(ghost, :rho)
-    rho_real  = ps.rho
-
-    @inbounds for k in 1:n
-        v_r          = v_real[idx[k]]
-        v_ghost[k]   = v_r - 2 * dot(v_r, normal) * normal
-        rho_ghost[k] = rho_real[idx[k]]
-    end
-end
-
-# ---------------------------------------------------------------------------
 # GhostEntry
 # ---------------------------------------------------------------------------
 
 """
-    GhostEntry{GPS, ND, T}
+    GhostEntry{GPS, ND, T, NB}
 
-Bundles a ghost particle system with the boundary plane geometry
-(`normal`, `point`, `cutoff`) needed to regenerate it each timestep.
+Bundles a ghost particle system with `NB` boundary planes and a shared
+`cutoff` distance.  Each boundary is a `GhostBoundary{ND,T}` holding an
+inward-pointing unit `normal` and a `point` on the plane.
+
+Construct with:
+
+    entry = GhostEntry(ghost, cutoff,
+                       (normal1, point1),
+                       (normal2, point2), …)
+
+where each `(normal, point)` pair describes one boundary.
+`ghost.idx_boundary[k]` gives the index into `boundaries` for ghost particle k.
 """
-struct GhostEntry{GPS<:AbstractGhostParticleSystem, ND, T<:AbstractFloat}
+struct GhostEntry{GPS<:AbstractGhostParticleSystem, ND, T<:AbstractFloat, NB}
     ghost::GPS
-    normal::SVector{ND,T}
-    point::SVector{ND,T}
+    boundaries::NTuple{NB, GhostBoundary{ND,T}}
     cutoff::T
-    function GhostEntry{GPS, ND, T}(args...) where {GPS, ND, T}
+    function GhostEntry{GPS, ND, T, NB}(args...) where {GPS, ND, T, NB}
         ND isa Int || throw(ArgumentError("ND must be an Int, got $(typeof(ND))"))
-        new{GPS, ND, T}(args...)
+        NB isa Int || throw(ArgumentError("NB must be an Int, got $(typeof(NB))"))
+        new{GPS, ND, T, NB}(args...)
     end
 end
 
 """
-    GhostEntry(ghost, normal, point, cutoff) -> GhostEntry
+    GhostEntry(ghost, cutoff, (normal1, point1), (normal2, point2), …) -> GhostEntry
+
+Construct a `GhostEntry` with one or more boundary planes.  Each boundary is
+specified as a `(normal, point)` 2-tuple.
 """
 function GhostEntry(
     ghost::AbstractGhostParticleSystem{T,ND},
-    normal,
-    point,
-    cutoff,
+    cutoff::Real,
+    boundary_pairs...,
 ) where {T,ND}
-    GhostEntry{typeof(ghost), ND, T}(
-        ghost,
-        SVector{ND,T}(normal),
-        SVector{ND,T}(point),
-        T(cutoff),
-    )
+    isempty(boundary_pairs) && throw(ArgumentError("at least one boundary (normal, point) pair is required"))
+    boundaries = map(boundary_pairs) do pair
+        normal, point = pair
+        GhostBoundary{ND,T}(SVector{ND,T}(normal), SVector{ND,T}(point))
+    end
+    NB = length(boundaries)
+    GhostEntry{typeof(ghost), ND, T, NB}(ghost, boundaries, T(cutoff))
 end
 
-generate_ghosts!(ge::GhostEntry) =
-    generate_ghosts!(ge.ghost, ge.normal, ge.point, ge.cutoff)
+# ---------------------------------------------------------------------------
+# generate_ghosts! — GhostEntry form (multi-boundary)
+# ---------------------------------------------------------------------------
 
-update_ghost_kinematics!(ge::GhostEntry) =
-    update_ghost_kinematics!(ge.ghost, ge.normal)
+"""
+    generate_ghosts!(ge::GhostEntry)
+
+Populate `ge.ghost` from its source by reflecting qualifying real particles
+across every boundary plane in `ge`.  Each ghost's `idx_boundary` field
+records which boundary (1-based index into `ge.boundaries`) generated it.
+
+Resizes all owned ghost arrays to the total qualifying count.
+"""
+function generate_ghosts!(ge::GhostEntry{GPS,ND,T,NB}) where {GPS,ND,T,NB}
+    ghost      = ge.ghost
+    boundaries = ge.boundaries
+    cutoff     = ge.cutoff
+    ps         = getfield(ghost, :source)
+
+    # First pass: count qualifying particles across all boundaries
+    total = 0
+    for b in boundaries
+        @inbounds for i in 1:ps.n
+            da = dot(ps.x[i] - b.point, b.normal)
+            if abs(da) <= cutoff && da > zero(T)
+                total += 1
+            end
+        end
+    end
+
+    # Resize all owned arrays to the total count
+    resize!(getfield(ghost, :x),            total)
+    resize!(getfield(ghost, :v),            total)
+    resize!(getfield(ghost, :rho),          total)
+    resize!(getfield(ghost, :idx_original), total)
+    resize!(getfield(ghost, :idx_boundary), total)
+    for arr in getfield(ghost, :extras)
+        resize!(arr, total)
+    end
+
+    # Second pass: populate positions and index mappings
+    x        = getfield(ghost, :x)
+    idx_orig = getfield(ghost, :idx_original)
+    idx_bnd  = getfield(ghost, :idx_boundary)
+    cursor   = 0
+    for (b_idx, b) in enumerate(boundaries)
+        @inbounds for i in 1:ps.n
+            da = dot(ps.x[i] - b.point, b.normal)
+            if abs(da) <= cutoff && da > zero(T)
+                cursor          += 1
+                x[cursor]        = ps.x[i] - (2 * da) * b.normal
+                idx_orig[cursor] = i
+                idx_bnd[cursor]  = b_idx
+            end
+        end
+    end
+
+    return ghost
+end
+
+# ---------------------------------------------------------------------------
+# update_ghost_kinematics! — GhostEntry form (multi-boundary)
+# ---------------------------------------------------------------------------
+
+"""
+    update_ghost_kinematics!(ge::GhostEntry)
+
+Reflect source velocities and mirror source densities into `ge.ghost`,
+using each ghost's `idx_boundary` to select the correct boundary normal.
+"""
+function update_ghost_kinematics!(ge::GhostEntry{GPS,ND,T,NB}) where {GPS,ND,T,NB}
+    ghost      = ge.ghost
+    boundaries = ge.boundaries
+    ps         = getfield(ghost, :source)
+    n          = ghost.n
+    idx_orig   = getfield(ghost, :idx_original)
+    idx_bnd    = getfield(ghost, :idx_boundary)
+    v_ghost    = getfield(ghost, :v)
+    rho_ghost  = getfield(ghost, :rho)
+    v_real     = ps.v
+    rho_real   = ps.rho
+
+    @inbounds for k in 1:n
+        normal       = boundaries[idx_bnd[k]].normal
+        v_r          = v_real[idx_orig[k]]
+        v_ghost[k]   = v_r - 2 * dot(v_r, normal) * normal
+        rho_ghost[k] = rho_real[idx_orig[k]]
+    end
+end
 
 update_ghost!(ge::GhostEntry, stage::Int) = update_ghost!(ge.ghost, stage)
 
@@ -323,7 +362,8 @@ function write_h5(ghost::GhostParticleSystem{T,ND,PS,ET,UPD}, group::Union{HDF5.
         group["v"]            = reinterpret(reshape, T, ghost.v)
         group["rho"]          = ghost.rho
         group["idx_original"] = getfield(ghost, :idx_original)
-        
+        group["idx_boundary"] = getfield(ghost, :idx_boundary)
+
         # Genericly save all extra fields
         for fname in fieldnames(ET)
             arr = getproperty(ghost.extras, fname)
