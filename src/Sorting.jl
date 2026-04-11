@@ -119,6 +119,12 @@ end
     SVector(ntuple(d -> floor(Int, xi[d] / cutoff), Val(ND)))
 end
 
+@inline _sortperm_by_key!(::AbstractParticleSystem, perm_view, key_view) = 
+    sortperm!(perm_view, key_view; lt=_lt_key, alg=InsertionSort)
+
+@inline _sortperm_by_key!(::AbstractGhostParticleSystem, perm_view, key_view) =
+    sortperm!(perm_view, key_view; lt=_lt_key)
+
 """
     sort_particles!(ps, cutoff, perm_buf, key_buf, scratch_arrays)
 
@@ -178,7 +184,7 @@ function sort_particles!(ps::AbstractParticleSystem{T,ND}, cutoff::T,
     # Compute the sorting permutation in-place (no allocation).
     perm_view = view(perm_buf, 1:n)
     key_view  = view(key_buf,  1:n)
-    sortperm!(perm_view, key_view; lt=_lt_key, alg=InsertionSort)
+    _sortperm_by_key!(ps, perm_view, key_view) #sortperm!(perm_view, key_view; lt=_lt_key, alg=InsertionSort)
 
     # Apply permutation to every per-particle array.
     _apply_perms!(arrs, scratch_arrays, perm_view, n)
