@@ -313,7 +313,8 @@ function time_integrate!(
         # ---- 10. Print -----------------------------------------------------
         if global_step % print_interval_step == 0
             @timeit to "print summary" begin
-                println("\nStep $global_step")
+                sim_time = global_step * dt
+                println("\nStep $global_step (t = $(@sprintf("%.6g", sim_time)))")
                 for ps in sys
                     print_summary(ps)
                 end
