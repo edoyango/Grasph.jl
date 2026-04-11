@@ -47,21 +47,22 @@ abstract type EOSUpdater <: StateUpdater end
 
 Functor that applies the Tait equation of state to particle `i`:
 
-    p[i] = rho0 * c^2 / 7 * ((rho[i] / rho0)^7 - 1)
+    p[i] = p0 * ((rho[i] / rho0)^7 - 1) + p_b
 
-Construct with rho0, then pass to `state_updater` in `FluidParticleSystem` constructor:
+Construct with p0, rho0 and p_b, then pass to `state_updater` in `FluidParticleSystem` constructor:
 
-    u  = TaitEOSUpdater(rho0)
+    u  = TaitEOSUpdater(p0, rho0, p_b)
 """
 struct TaitEOSUpdater{T} <: EOSUpdater
     rho0::T
+    p_b::T
 end
-TaitEOSUpdater(rho0::T) where {T<:AbstractFloat} = TaitEOSUpdater{T}(rho0)
+TaitEOSUpdater(rho0::T, p_b::T = T(0.0)) where {T<:AbstractFloat} = TaitEOSUpdater{T}(rho0, p_b)
 
 @inline @Base.propagate_inbounds function (u::TaitEOSUpdater)(ps::AbstractParticleSystem{T}, i::Int) where {T}
     p = ps.p ; rho = ps.rho
-    rho0 = T(u.rho0) ; c = ps.c
-    p[i] = rho0 * c * c / T(7) * ((rho[i] / rho0)^7 - one(T))
+    rho0 = T(u.rho0) ; c = ps.c ; p_b = u.p_b
+    p[i] = rho0 * c * c / T(7) * ((rho[i] / rho0)^7 - one(T)) + p_b
 end
 
 """

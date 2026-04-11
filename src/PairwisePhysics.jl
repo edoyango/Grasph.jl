@@ -25,10 +25,11 @@ Monaghan (1994) artificial viscosity coefficient.
 `dx = xi - xj` and `dv = vi - vj` are SVectors.
 Returns the scalar `piv` to subtract from the pressure gradient coefficient.
 """
-@inline function artificial_viscosity(dx::SVector{ND,T}, dv::SVector{ND,T}, h::T, rho_i::T, rho_j::T, alpha::T, beta::T, c::T) where {ND,T<:AbstractFloat}
+@inline function artificial_viscosity(dx::SVector{ND,T}, dv::SVector{ND,T}, h::T, rho_i::T, rho_j::T, alpha::T, beta::T, c_i::T, c_j::T) where {ND,T<:AbstractFloat}
     vr  = min(dot(dx, dv), zero(T))
     muv = h * vr / (dot(dx, dx) + h * h * T(0.01))
-    return (beta * muv - alpha * c) * muv / (T(0.5) * rho_i * rho_j)
+    mc = 0.5*(c_i + c_j)
+    return (beta * muv - alpha * mc) * muv / (T(0.5) * rho_i * rho_j)
 end
 
 """

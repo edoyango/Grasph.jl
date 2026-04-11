@@ -147,7 +147,7 @@ end
     mass         = ps.mass
     dv           = vi - vj
 
-    piv    = artificial_viscosity(dx, dv, f.h, rho_i, rho_j, f.art_visc_alpha, f.art_visc_beta, ps.c)
+    piv    = artificial_viscosity(dx, dv, f.h, rho_i, rho_j, f.art_visc_alpha, f.art_visc_beta, ps.c, ps.c)
     dh     = pressure_force_coeff(p_i, p_j, rho_i, rho_j)
     dv_tmp = mass * (dh - piv) * gx
 
@@ -159,6 +159,25 @@ end
     ps.drhodt[j] += mass * dr
 end
 
+@inline @Base.propagate_inbounds function (f::FluidPfn{T})(ps_a::FluidParticleSystem{T,ND}, ps_b::FluidParticleSystem{T,ND}, i::Int, j::Int, dx::SVector{ND,T}, gx::SVector{ND,T}, w::T) where {ND,T<:AbstractFloat}
+    vi, vj       = ps_a.v[i], ps_b.v[j]
+    rho_i, rho_j = ps_a.rho[i], ps_b.rho[j]
+    p_i, p_j     = ps_a.p[i], ps_b.p[j]
+    mass_i, mass_j = ps_a.mass, ps_b.mass
+    dv           = vi - vj
+
+    piv    = artificial_viscosity(dx, dv, f.h, rho_i, rho_j, f.art_visc_alpha, f.art_visc_beta, ps_a.c, ps_b.c)
+    dh     = pressure_force_coeff(p_i, p_j, rho_i, rho_j)
+    dv_tmp = (dh - piv) * gx
+
+    ps_a.dvdt[i] += mass_j*dv_tmp
+    ps_b.dvdt[j] -= mass_i*dv_tmp
+
+    dr = continuity_rate(dv, gx)
+    ps_a.drhodt[i] += mass_j * dr
+    ps_b.drhodt[j] += mass_i * dr
+end
+
 # Coupled generic (one-sided, pressure-based) — covers ghosts
 @inline @Base.propagate_inbounds function (f::FluidPfn{T})(ps_a::AbstractParticleSystem{T,ND}, ps_b::AbstractParticleSystem{T,ND}, i::Int, j::Int, dx::SVector{ND,T}, gx::SVector{ND,T}, w::T) where {ND,T<:AbstractFloat}
     vi, vj       = ps_a.v[i], ps_b.v[j]
@@ -167,7 +186,7 @@ end
     mass_j       = ps_b.mass
     dv           = vi - vj
 
-    piv = artificial_viscosity(dx, dv, f.h, rho_i, rho_j, f.art_visc_alpha, f.art_visc_beta, ps_a.c)
+    piv = artificial_viscosity(dx, dv, f.h, rho_i, rho_j, f.art_visc_alpha, f.art_visc_beta, ps_a.c, ps_a.c)
     dh  = pressure_force_coeff(p_i, p_j, rho_i, rho_j)
     ps_a.dvdt[i] += mass_j * (dh - piv) * gx
 
@@ -182,7 +201,7 @@ end
     mass_j       = ps_b.mass
     dv           = vi - vj
 
-    piv = artificial_viscosity(dx, dv, f.h, rho_i, rho_j, f.art_visc_alpha, f.art_visc_beta, ps_a.c)
+    piv = artificial_viscosity(dx, dv, f.h, rho_i, rho_j, f.art_visc_alpha, f.art_visc_beta, ps_a.c, ps_a.c)
     rf  = lennard_jones(dx, ps_b.lj_cutoff, ps_a.c, 12, 6)
     ps_a.dvdt[i] += -mass_j * piv * gx + rf * dx
 end
@@ -201,7 +220,7 @@ end
     mass     = ps_a.mass
     dv       = vi - vj
 
-    piv = artificial_viscosity(dx, dv, f.h, rho_i, rho_j, f.art_visc_alpha, f.art_visc_beta, ps_a.c)
+    piv = artificial_viscosity(dx, dv, f.h, rho_i, rho_j, f.art_visc_alpha, f.art_visc_beta, ps_a.c, ps_a.c)
     dh  = pressure_force_coeff(p_i, p_j, rho_i, rho_j)
     ps_a.dvdt[i] += mass * (dh - piv) * gx
 
@@ -231,7 +250,7 @@ end
     mass               = ps.mass
     dv                 = vi - vj
 
-    piv    = artificial_viscosity(dx, dv, f.h, rho_i, rho_j, f.art_visc_alpha, f.art_visc_beta, ps.c)
+    piv    = artificial_viscosity(dx, dv, f.h, rho_i, rho_j, f.art_visc_alpha, f.art_visc_beta, ps.c, ps.c)
     h_vec  = cauchy_stress_force(stress_i, stress_j, rho_i, rho_j, gx)
     dv_tmp = mass * (h_vec - piv * gx)
 
@@ -252,7 +271,7 @@ end
     mass_j             = ps_b.mass
     dv                 = vi - vj
 
-    piv   = artificial_viscosity(dx, dv, f.h, rho_i, rho_j, f.art_visc_alpha, f.art_visc_beta, ps_a.c)
+    piv   = artificial_viscosity(dx, dv, f.h, rho_i, rho_j, f.art_visc_alpha, f.art_visc_beta, ps_a.c, ps_b.c)
     h_vec = cauchy_stress_force(stress_i, stress_j, rho_i, rho_j, gx)
     ps_a.dvdt[i] += mass_j * (h_vec - piv * gx)
 
@@ -268,7 +287,7 @@ end
     mass_j       = ps_b.mass
     dv           = vi - vj
 
-    piv = artificial_viscosity(dx, dv, f.h, rho_i, rho_j, f.art_visc_alpha, f.art_visc_beta, ps_a.c)
+    piv = artificial_viscosity(dx, dv, f.h, rho_i, rho_j, f.art_visc_alpha, f.art_visc_beta, ps_a.c, ps_a.c)
     rf  = lennard_jones(dx, ps_b.lj_cutoff, ps_a.c, 12, 6)
     ps_a.dvdt[i] += -mass_j * piv * gx + rf * dx
 end
@@ -287,7 +306,7 @@ end
     mass     = ps_a.mass
     dv       = vi - vj
 
-    piv    = artificial_viscosity(dx, dv, f.h, rho_i, rho_j, f.art_visc_alpha, f.art_visc_beta, ps_a.c)
+    piv    = artificial_viscosity(dx, dv, f.h, rho_i, rho_j, f.art_visc_alpha, f.art_visc_beta, ps_a.c, ps_a.c)
     h_vec  = cauchy_stress_force(stress_i, stress_j, rho_i, rho_j, gx)
     dv_tmp = mass * (h_vec - piv * gx)
     ps_a.dvdt[i] += dv_tmp
