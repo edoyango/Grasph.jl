@@ -1,5 +1,6 @@
 export artificial_viscosity, pressure_force_coeff, continuity_rate, lennard_jones,
-       strain_rate_tensor, vorticity_tensor, cauchy_stress_force, diffusion_density
+       strain_rate_tensor, vorticity_tensor, cauchy_stress_force, diffusion_density, 
+       pressure_force_interfacial_coeff
 
 using StaticArrays
 using LinearAlgebra
@@ -33,15 +34,38 @@ Returns the scalar `piv` to subtract from the pressure gradient coefficient.
 end
 
 """
-    pressure_force_coeff(p_i, p_j, rho_i, rho_j) -> dh
+    pressure_force_coeff(p_i, p_j, rho_i, rho_j, ::Val{S}) -> T
 
-Symmetric isotropic pressure gradient coefficient.
+Symmetric SPH pressure-gradient coefficient for a particle pair.
 
-Returns `-(p_i/ρ_i² + p_j/ρ_j²)`, the scalar that multiplies the kernel
-gradient vector to give the pressure acceleration contribution.
+Returns the scalar `h` such that the pressure acceleration contribution for
+particle `i` from neighbour `j` is `h * ∇W_ij`:
+
+    h = -(p_i / (ρ_i^S · ρ_j^(2-S))  +  p_j / (ρ_i^(2-S) · ρ_j^S))
+
+The exponent `S` controls how the density symmetrisation is split between
+the two particles:
+
+- `Val{1}` — preferred for multi phase (Colagrossi and Landrini, 2003): `-(p_i + p_j) / (ρ_i ρ_j)`.
+- `Val{2}` — otherwise preffered form (Monaghan, 1994): `-(p_i/ρ_i² + p_j/ρ_j²)`.
+
+Both specialisations satisfy Newton's third law (antisymmetry under `i ↔ j`),
+preserving discrete momentum conservation. The general `Val{S}` fallback
+handles non-standard exponents at the cost of `^` exponentiation.
+
+Usage: `dvdt[i] += mass_j * pressure_force_coeff(...) * gx`
 """
-@inline function pressure_force_coeff(p_i::T, p_j::T, rho_i::T, rho_j::T) where {T<:AbstractFloat}
-    return -(p_i / (rho_i * rho_i) + p_j / (rho_j * rho_j))
+@inline function pressure_force_coeff(p_i::T, p_j::T, rho_i::T, rho_j::T, ::Val{1}) where {T<:AbstractFloat}
+    return -(p_i+p_j)/(rho_i*rho_j)
+end
+
+@inline function pressure_force_coeff(p_i::T, p_j::T, rho_i::T, rho_j::T, ::Val{2}) where {T<:AbstractFloat}
+    return -(p_i/(rho_i*rho_i)+p_j/(rho_j*rho_j))
+end
+
+# General S: falls back to integer exponentiation; prefer Val{1} or Val{2} in production.
+@inline function pressure_force_coeff(p_i::T, p_j::T, rho_i::T, rho_j::T, ::Val{S}) where {S, T<:AbstractFloat}
+    return -(p_i/(rho_i^S*rho_j^(2-S)) + p_j/(rho_i^(2-S)*rho_j^S))
 end
 
 """
@@ -53,6 +77,32 @@ Returns `dot(dv, gx)` where `dv = vi - vj` and `gx` is the kernel gradient
 vector. Multiply by mass to get the contribution to `drhodt`.
 """
 @inline continuity_rate(dv::SVector{ND,T}, gx::SVector{ND,T}) where {ND,T<:AbstractFloat} = dot(dv, gx)
+
+"""
+    continuity_density_coeff(rho_i, rho_j, ::Val{S}) -> T
+
+Density-symmetrisation factor for the SPH continuity equation.
+
+Returns the scalar `c` such that `drhodt[i] += mass_j * continuity_rate(dv, gx) * c`:
+
+    c = (ρ_i / ρ_j)^(2-S)
+
+This is the factor paired with `pressure_force_coeff(..., Val{S})` so that both
+equations use a consistent density split.  For the j-particle contribution in a
+symmetric self-interaction, swap the arguments: `continuity_density_coeff(rho_j, rho_i, Val{S})`.
+
+- `Val{1}` — Colagrossi & Landrini (2003) multi-phase form: `ρ_i / ρ_j`.
+- `Val{2}` — Monaghan (1994) standard form: `1` (no density weighting).
+- General `Val{S}` — falls back to `^`; prefer the two specialisations above.
+"""
+# S=1: (ρ_i/ρ_j)^1
+@inline continuity_density_coeff(rho_i::T, rho_j::T, ::Val{1}) where {T<:AbstractFloat} = rho_i / rho_j
+
+# S=2: (ρ_i/ρ_j)^0 = 1
+@inline continuity_density_coeff(rho_i::T, rho_j::T, ::Val{2}) where {T<:AbstractFloat} = one(T)
+
+# General S: (ρ_i/ρ_j)^(2-S); avoids negative exponents by rewriting the original 1/(ρ_i^(S-2) ρ_j^(2-S)).
+@inline continuity_density_coeff(rho_i::T, rho_j::T, ::Val{S}) where {S,T<:AbstractFloat} = rho_i^(2-S) / rho_j^(2-S)
 
 """
     cauchy_stress_force(stress_i, stress_j, rho_i, rho_j, gx) -> SVector
