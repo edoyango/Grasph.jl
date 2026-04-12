@@ -1,4 +1,4 @@
-export FluidPfn, MultiPhaseFluidPfn, StrainRatePfn, StrainRateVorticityPfn, CauchyFluidPfn
+export FluidPfn, MultiPhaseFluidPfn, StrainRatePfn, StrainRateVorticityPfn, CauchyFluidPfn, XSPHPfn
 
 # ---------------------------------------------------------------------------
 # Premade pairwise interaction functors
@@ -314,4 +314,39 @@ end
     psi = diffusion_density(dx, rho_i, rho_j, ps_a.c, ps_a.c, f.h, f.h, gx)
     dr  = continuity_rate(dv, gx)
     ps_a.drhodt[i] += mass * (dr + psi / rho_j)
+end
+
+"""
+    XSPHPfn{T}
+"""
+struct XSPHPfn{T<:AbstractFloat}
+    epsilon::T
+end
+
+@inline @Base.propagate_inbounds function (f::XSPHPfn{T})(ps::AbstractParticleSystem, i::Int, j::Int, dx::SVector{ND,T}, gx::SVector{ND,T}, w::T) where {ND, T<:AbstractFloat}
+    vi, vj             = ps.v[i], ps.v[j]
+    rho_i, rho_j       = ps.rho[i], ps.rho[j]
+    mass               = ps.mass
+    dv                 = vi - vj
+    epsilon            = f.epsilon
+
+    du = xsph_veladjust(epsilon, dv, rho_i, rho_j, w)
+
+    ps.v_adjustment[i] += du*mass
+    ps.v_adjustment[j] -= du*mass
+
+end
+
+@inline @Base.propagate_inbounds function (f::XSPHPfn{T})(ps_a::AbstractParticleSystem, ps_b::AbstractParticleSystem, i::Int, j::Int, dx::SVector{ND,T}, gx::SVector{ND,T}, w::T) where {ND, T<:AbstractFloat}
+    vi, vj             = ps_a.v[i], ps_b.v[j]
+    rho_i, rho_j       = ps_a.rho[i], ps_b.rho[j]
+    mass_i, mass_j     = ps_a.mass, ps_b.mass
+    dv                 = vi - vj
+    epsilon            = f.epsilon
+
+    du = xsph_veladjust(epsilon, dv, rho_i, rho_j, w)
+
+    ps_a.v_adjustment[i] += du*mass_j
+    ps_b.v_adjustment[j] -= du*mass_i
+
 end

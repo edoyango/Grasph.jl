@@ -1,4 +1,4 @@
-export SystemInteraction, is_coupled, create_grid!, sweep!
+export SystemInteraction, is_coupled, create_grid!, sweep!, adjust_v!
 
 # ---------------------------------------------------------------------------
 # Struct
@@ -20,9 +20,10 @@ index of the first particle in cell `c` (0 if empty); `_cell_count[c]` is the
 number of particles in cell `c`.  This requires that particles are sorted by cell
 before `create_grid!` is called (handled by `sort_particles!` in the time loop).
 """
-struct SystemInteraction{T<:AbstractFloat, ND, KT<:AbstractKernel{T,ND}, SA<:AbstractParticleSystem{T,ND}, SB<:Union{Nothing,AbstractParticleSystem{T,ND}}, PFNS<:Tuple}
+struct SystemInteraction{T<:AbstractFloat, ND, KT<:AbstractKernel{T,ND}, SA<:AbstractParticleSystem{T,ND}, SB<:Union{Nothing,AbstractParticleSystem{T,ND}}, PFNS<:Tuple, VPFN}
     kernel::KT
     pfns::PFNS
+    vadjust_pfn::VPFN
     system_a::SA
     system_b::SB
     _mingridx::MVector{ND,T}            # grid origin in each dimension (ndims,)
@@ -32,9 +33,9 @@ struct SystemInteraction{T<:AbstractFloat, ND, KT<:AbstractKernel{T,ND}, SA<:Abs
     _mingridx_a::MVector{ND,T}          # min position of system_a particles per dim (ndims,)
     _maxgridx_a::MVector{ND,T}          # max position of system_a particles per dim (ndims,)
     _cell_size::T
-    function SystemInteraction{T, ND, KT, SA, SB, PFNS}(args...) where {T, ND, KT, SA, SB, PFNS}
+    function SystemInteraction{T, ND, KT, SA, SB, PFNS, VPFN}(args...) where {T, ND, KT, SA, SB, PFNS, VPFN}
         ND isa Int || throw(ArgumentError("ND must be an Int, got $(typeof(ND))"))
-        new{T, ND, KT, SA, SB, PFNS}(args...)
+        new{T, ND, KT, SA, SB, PFNS, VPFN}(args...)
     end
 end
 
@@ -61,7 +62,8 @@ function SystemInteraction(
     kernel::AbstractKernel,
     pairwise_fn,
     system_a::AbstractParticleSystem{T, ND},
-    system_b::Union{Nothing, AbstractParticleSystem} = nothing
+    system_b::Union{Nothing, AbstractParticleSystem} = nothing;
+    velocity_adjust_pairwise_fn = nothing
 ) where {T<:AbstractFloat, ND}
     nd = Int(ND)
     kernel.ndims == nd || throw(ArgumentError(
@@ -72,10 +74,11 @@ function SystemInteraction(
     _check_functors_eltype(pfns, T, "pairwise functor")
     SystemInteraction{
         T, nd, typeof(kernel),
-        typeof(system_a), typeof(system_b), typeof(pfns)
+        typeof(system_a), typeof(system_b), typeof(pfns), typeof(velocity_adjust_pairwise_fn)
     }(
         kernel,
         pfns,
+        velocity_adjust_pairwise_fn,
         system_a,
         system_b,
         MVector{nd,T}(undef),
@@ -303,6 +306,8 @@ end
 _sweep_dispatch!(si, ::Nothing, pfn) = _sweep_self!(si, pfn)
 _sweep_dispatch!(si, system_b, pfn) = _sweep_coupled!(si, system_b, pfn)
 
+adjust_v!(si::SystemInteraction) = _sweep_pfns!(si, si.system_b, (si.vadjust_pfn,), 1)
+
 # --- self-interaction half-shell, 6-colour sweep ---
 #
 # HALF-SHELL STENCIL
@@ -361,7 +366,9 @@ _sweep_dispatch!(si, system_b, pfn) = _sweep_coupled!(si, system_b, pfn)
 # in cj — safely beyond the conflict radius — so Threads.@threads over the
 # ci loop is race-free.
 
-function _sweep_self!(si::SystemInteraction, ::Nothing)
+function _sweep_self!(si::SystemInteraction{T,2}, ::Nothing) where {T}
+end
+function _sweep_self!(si::SystemInteraction{T,3}, ::Nothing) where {T}
 end
 
 # 2D Specialisation: 6-colour sweep
@@ -576,7 +583,9 @@ end
 # The loop iterates over cells of system_a using the _cell_start_a/_cell_count_a
 # CSR arrays built by create_grid!.
 
-function _sweep_coupled!(si::SystemInteraction, system_b, ::Nothing)
+function _sweep_coupled!(si::SystemInteraction{T,2}, system_b, ::Nothing) where {T}
+end
+function _sweep_coupled!(si::SystemInteraction{T,3}, system_b, ::Nothing) where {T}
 end
 
 # 2D Specialisation: 9-colour sweep

@@ -40,6 +40,7 @@ struct BasicParticleSystem{T<:AbstractFloat, ND, PAIRS<:Tuple, UPD<:Tuple} <: Ab
     n::Int
     x::Vector{SVector{ND,T}}
     v::Vector{SVector{ND,T}}
+    v_adjustment::Vector{SVector{ND,T}}
     rho::Vector{T}
     dvdt::Vector{SVector{ND,T}}
     drhodt::Vector{T}
@@ -77,6 +78,7 @@ function BasicParticleSystem(
 
     x      = Vector{SVector{ndims,T}}(undef, n)
     v      = Vector{SVector{ndims,T}}(undef, n)
+    v_adjustment = fill(zero(SVector{ndims,T}), n)
     rho    = Vector{T}(undef, n)
     dvdt   = fill(zero(SVector{ndims,T}), n)
     drhodt = zeros(T, n)
@@ -86,7 +88,7 @@ function BasicParticleSystem(
 
     BasicParticleSystem{T, ndims, typeof(_DEFAULT_PAIRS), typeof(state_updaters)}(
         String(name), n,
-        x, v, rho, dvdt, drhodt,
+        x, v, v_adjustment, rho, dvdt, drhodt,
         T(mass), T(c),
         SVector{ndims,T}(source_v),
         T(source_rho),
@@ -147,6 +149,7 @@ struct FluidParticleSystem{T<:AbstractFloat, ND, PAIRS<:Tuple, UPD<:Tuple} <: Ab
     n::Int
     x::Vector{SVector{ND,T}}
     v::Vector{SVector{ND,T}}
+    v_adjustment::Vector{SVector{ND,T}}
     rho::Vector{T}
     dvdt::Vector{SVector{ND,T}}
     drhodt::Vector{T}
@@ -185,6 +188,7 @@ function FluidParticleSystem(
 
     x      = Vector{SVector{ndims,T}}(undef, n)
     v      = Vector{SVector{ndims,T}}(undef, n)
+    v_adjustment = fill(zero(SVector{ndims,T}), n)
     rho    = Vector{T}(undef, n)
     dvdt   = fill(zero(SVector{ndims,T}), n)
     drhodt = zeros(T, n)
@@ -195,7 +199,7 @@ function FluidParticleSystem(
 
     FluidParticleSystem{T, ndims, typeof(_DEFAULT_PAIRS), typeof(state_updaters)}(
         String(name), n,
-        x, v, rho, dvdt, drhodt, p,
+        x, v, v_adjustment, rho, dvdt, drhodt, p,
         T(mass), T(c),
         SVector{ndims,T}(source_v),
         T(source_rho),

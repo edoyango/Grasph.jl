@@ -1,6 +1,6 @@
 export artificial_viscosity, pressure_force_coeff, continuity_rate, lennard_jones,
        strain_rate_tensor, vorticity_tensor, cauchy_stress_force, diffusion_density, 
-       pressure_force_interfacial_coeff
+       xsph_veladjust
 
 using StaticArrays
 using LinearAlgebra
@@ -256,4 +256,11 @@ is `f * dx`.
     r  = sqrt(rr)
     f  = (r < cutoff ? one(T) : zero(T)) * ((cutoff / r)^p1 - (cutoff / r)^p2) / rr
     return T(0.01) * c * c * f
+end
+
+"""
+    xsph_veladjust(epsilon, dv, rho_i, rho_j, w)
+"""
+@inline function xsph_veladjust(epsilon::T, dv::SVector{ND,T}, rho_i::T, rho_j::T, w::T) where {ND,T<:AbstractFloat}
+    return -epsilon*dv*w/(rho_i+rho_j)
 end

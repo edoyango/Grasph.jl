@@ -13,10 +13,10 @@ export sort_particles!
 # ---------------------------------------------------------------------------
 
 _particle_arrays(ps::BasicParticleSystem) =
-    (ps.x, ps.v, ps.rho, ps.dvdt, ps.drhodt)
+    (ps.x, ps.v, ps.v_adjustment, ps.rho, ps.dvdt, ps.drhodt)
 
 _particle_arrays(ps::FluidParticleSystem) =
-    (ps.x, ps.v, ps.rho, ps.dvdt, ps.drhodt, ps.p)
+    (ps.x, ps.v, ps.v_adjustment, ps.rho, ps.dvdt, ps.drhodt, ps.p)
 
 _particle_arrays(ps::StressParticleSystem) =
     (ps.x, ps.v, ps.rho, ps.dvdt, ps.drhodt, ps.p, ps.stress, ps.strain_rate)

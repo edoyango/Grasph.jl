@@ -15,7 +15,8 @@ Conjugate pairs `(q, dqdt)` are driven by `ps.pairs`. At each step:
 2. **Half-step**: `q += 0.5 dt * dqdt`, reset `dqdt ← source`, call
    `update_state!`.
 3. Rebuild the cell list and sweep all interactions.
-4. **Full-step**: `q = q₀ + dt * dqdt`, `x += dt * v`.
+4. **Full-step**: `q = q₀ + dt * dqdt`.
+5. **Update positions**: `x += dt * v`.
 """
 struct LeapFrogTimeIntegrator{SYS<:Tuple, INTS<:Tuple, GHOSTS<:Tuple, T<:AbstractFloat}
     systems::SYS
@@ -127,6 +128,25 @@ end
     end
 end
 
+@inline function _apply_v_adjustments!(ps::AbstractParticleSystem)
+    v = ps.v ; v_adjustment = ps.v_adjustment
+    @inbounds @fastmath @batch for i in eachindex(v)
+        v[i] += v_adjustment[i]
+    end
+end
+
+@inline function _subtract_v_adjustments!(ps::AbstractParticleSystem)
+    v = ps.v ; v_adjustment = ps.v_adjustment
+    @inbounds @fastmath @batch for i in eachindex(v)
+        v[i] -= v_adjustment[i]
+    end
+end
+
+@inline function _zero_field(ps::AbstractParticleSystem, field::Symbol)
+    f = _getf(ps, Val(field))
+    fill!(f, zero(eltype(f)))
+end
+
 # ---------------------------------------------------------------------------
 # Tuple-recursive helpers for the time loop
 #
@@ -151,14 +171,16 @@ _save_q0_all!(::Tuple{}, ::Tuple{}) = nothing
     _save_q0_all!(Base.tail(sys), Base.tail(q0s))
 end
 
-_fullstep_all!(::Tuple{}, ::Tuple{}, dt, to, labels, idx) = nothing
-@inline function _fullstep_all!(sys::Tuple, q0s::Tuple, dt, to, labels, idx)
-    ps = first(sys)
-    @timeit to labels[idx].full begin
-        _fullstep_ps!(ps, first(q0s), dt)
-        _update_positions!(ps, dt)
-    end
-    _fullstep_all!(Base.tail(sys), Base.tail(q0s), dt, to, labels, idx + 1)
+_fullstep_q_all!(::Tuple{}, ::Tuple{}, dt, to, labels, idx) = nothing
+@inline function _fullstep_q_all!(sys::Tuple, q0s::Tuple, dt, to, labels, idx)
+    @timeit to labels[idx].full _fullstep_ps!(first(sys), first(q0s), dt)
+    _fullstep_q_all!(Base.tail(sys), Base.tail(q0s), dt, to, labels, idx + 1)
+end
+
+_update_positions_all!(::Tuple{}, dt, to, labels, idx) = nothing
+@inline function _update_positions_all!(sys::Tuple, dt, to, labels, idx)
+    @timeit to labels[idx].pos _update_positions!(first(sys), dt)
+    _update_positions_all!(Base.tail(sys), dt, to, labels, idx + 1)
 end
 
 # ---------------------------------------------------------------------------
@@ -233,13 +255,15 @@ function time_integrate!(
     ps_labels = [(sort="sort [$(ps.name)]",
                   mid="mid-step [$(ps.name)]",
                   full="full-step [$(ps.name)]",
-                  upd="state update [$(ps.name)]") for ps in sys]
+                  pos="update pos [$(ps.name)]",
+                  upd="state update [$(ps.name)]",
+                  v_adjust="vel adjust [$(ps.name)]") for ps in sys]
     
     inter_labels = []
     for inter in ints
         ps_a  = inter.system_a
         label = is_coupled(inter) ? "$(ps_a.name)×$(inter.system_b.name)" : ps_a.name
-        push!(inter_labels, (grid="grid [$label]", sweep="sweep [$label]"))
+        push!(inter_labels, (grid="grid [$label]", sweep="sweep [$label]", v_adjust="v adjust [$label]"))
     end
 
     ghost_labels = [(gen="ghost gen [$(ge.ghost.name)]",
@@ -291,7 +315,18 @@ function time_integrate!(
             @timeit to ghost_labels[i].kin update_ghost_kinematics!(ge)
         end
 
-        # ---- 8. Sweep ------------------------------------------------------
+        # # ---- 8. Velocity adjustment Sweep ----------------------------------
+        # for (i, ps) in enumerate(sys)
+        #     @timeit to ps_labels[i].v_adjust _zero_field(ps, :v_adjustment)
+        # end
+        # for (i, inter) in enumerate(ints)
+        #     @timeit to inter_labels[i].v_adjust adjust_v!(inter)
+        # end
+        # for (i, ps) in enumerate(sys)
+        #     @timeit to ps_labels[i].v_adjust _apply_v_adjustments!(ps)
+        # end
+
+        # ---- 9. Sweep ------------------------------------------------------
         for stage in 1:num_stages
             for (i, ps) in enumerate(sys)
                 length(ps.state_updater) == num_stages || continue
@@ -307,10 +342,27 @@ function time_integrate!(
             end
         end
 
-        # ---- 9. Full-step --------------------------------------------------
-        _fullstep_all!(sys, q0_bufs, dt, to, ps_labels, 1)
+        # ---- 10. Full-step: update q = q0 + dt·dqdt -----------------------
+        _fullstep_q_all!(sys, q0_bufs, dt, to, ps_labels, 1)
 
-        # ---- 10. Print -----------------------------------------------------
+        # ---- 11. Velocity adjustment Sweep 2 --------------------------------
+        for (i, ps) in enumerate(sys)
+            @timeit to ps_labels[i].v_adjust _subtract_v_adjustments!(ps)
+        end
+        for (i, ps) in enumerate(sys)
+            @timeit to ps_labels[i].v_adjust _zero_field(ps, :v_adjustment)
+        end
+        for (i, inter) in enumerate(ints)
+            @timeit to inter_labels[i].v_adjust adjust_v!(inter)
+        end
+        for (i, ps) in enumerate(sys)
+            @timeit to ps_labels[i].v_adjust _apply_v_adjustments!(ps)
+        end
+
+        # ---- 12. Update positions: x += dt·v -------------------------------
+        _update_positions_all!(sys, dt, to, ps_labels, 1)
+
+        # ---- 13. Print -----------------------------------------------------
         if global_step % print_interval_step == 0
             @timeit to "print summary" begin
                 sim_time = global_step * dt
@@ -321,7 +373,7 @@ function time_integrate!(
             end
         end
 
-        # ---- 11. Save ------------------------------------------------------
+        # ---- 14. Save ------------------------------------------------------
         if output_prefix !== nothing && global_step % save_interval_step == 0
             @timeit to "save h5" begin
                 path = "$(output_prefix)_$(lpad(global_step, width, '0')).h5"
