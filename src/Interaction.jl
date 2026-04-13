@@ -333,38 +333,31 @@ adjust_v!(si::SystemInteraction) = _sweep_pfns!(si, si.system_b, (si.vadjust_pfn
 # apply_pair accumulates into BOTH particles i and j.  Two cells A and B
 # conflict if any particle in A's write-set overlaps B's write-set.
 #
-# Cell (ci,cj) processes pairs with itself and its 4 forward neighbours.
-# The forward stencil only goes to Δcj ∈ {0, +1} — never to Δcj=-1,
-# because backward neighbours (Δcj=-1) are owned by those cells themselves.
-# So the write-set is an asymmetric 3×2 block, not a symmetric 3×3:
+# Cell (ci,cj) processes pairs with itself and its 4 forward neighbours:
+#   (0,+1), (+1,-1), (+1,0), (+1,+1)
+# so its write-set spans an asymmetric 2×3 block:
 #
-#   Δci ∈ {-1, 0, +1},  Δcj ∈ {0, +1}
+#   Δci ∈ {0, +1},  Δcj ∈ {-1, 0, +1}
 #
-# If the stencil were symmetric (Δcj ∈ {-1,0,+1}), the write-set height
-# would be 3, conflicts would span |Δcj| ≤ 2, and we would need stride-3
-# in cj → 9 colours total.  The half-shell halves the cj stride to 2.
+# Two cells (ci,cj) and (ci',cj') conflict when those write-sets overlap:
+#   |ci - ci'| ≤ 1  AND  |cj - cj'| ≤ 2
 #
-# Two cells (ci,cj) and (ci',cj') conflict when:
-#   |ci - ci'| ≤ 2  AND  |cj - cj'| ≤ 1
-#
-# Choosing stride-3 in ci and stride-2 in cj guarantees no two active cells
+# Choosing stride-2 in ci and stride-3 in cj guarantees no two active cells
 # within a colour are closer than that, so they are write-conflict-free:
 #
-#   colour = (ci-1)%3 * 2 + (cj-1)%2,   colours 0..5
+#   colour = (ci-1)%2 * 3 + (cj-1)%3,   colours 0..5
 #
-# Visualised on a 6×4 grid (letter = colour, active cells per colour shown):
+# Visualised on a 4×6 grid (letter = colour, active cells per colour shown):
 #
-#   cj:   1  2  3  4
-#   ci 1: A  B  A  B
-#   ci 2: C  D  C  D
-#   ci 3: E  F  E  F
-#   ci 4: A  B  A  B
-#   ci 5: C  D  C  D
-#   ci 6: E  F  E  F
+#   cj:   1  2  3  4  5  6
+#   ci 1: A  B  C  A  B  C
+#   ci 2: D  E  F  D  E  F
+#   ci 3: A  B  C  A  B  C
+#   ci 4: D  E  F  D  E  F
 #
-# Within a single colour all active cells are separated by ≥3 in ci and ≥2
-# in cj — safely beyond the conflict radius — so Threads.@threads over the
-# ci loop is race-free.
+# Within a single colour all active cells are separated by ≥2 in ci and ≥3
+# in cj — safely beyond the conflict radius — so @batch over the flattened
+# active-cell loop is race-free.
 
 function _sweep_self!(si::SystemInteraction{T,2}, ::Nothing) where {T}
 end
@@ -408,14 +401,14 @@ function _sweep_self!(si::SystemInteraction{T,2}, pfn::PFN) where {T,PFN}
     val_ndims  = Val{2}()
 
     for colour in 0:5
-        cell_x_begin = colour ÷ 2 + 2
-        cell_y_begin = colour % 2 + 2
-        n_active_x = length(cell_x_begin:3:n_cells_x-1)
-        n_active_y = length(cell_y_begin:2:n_cells_y-1)
+        cell_x_begin = colour ÷ 3 + 2
+        cell_y_begin = colour % 3 + 2
+        n_active_x = length(cell_x_begin:2:n_cells_x-1)
+        n_active_y = length(cell_y_begin:3:n_cells_y-1)
         @inbounds @batch for flat_idx in 1:n_active_x*n_active_y
             step_x, step_y = divrem(flat_idx - 1, n_active_y)
-            cell_x   = cell_x_begin + step_x * 3
-            cell_y   = cell_y_begin + step_y * 2
+            cell_x   = cell_x_begin + step_x * 2
+            cell_y   = cell_y_begin + step_y * 3
             cell_idx = (cell_x - 1) * n_cells_y + cell_y
 
             # Particles in (cell_x, cell_y) and (cell_x, cell_y+1) are contiguous;
