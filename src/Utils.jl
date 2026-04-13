@@ -1,4 +1,39 @@
 # ---------------------------------------------------------------------------
+# Type-stable particle field accessors
+# ---------------------------------------------------------------------------
+
+# Type-stable field accessor: S is a compile-time constant, so getfield is fully inferred.
+@inline _getf(ps, ::Val{S}) where {S} = getfield(ps, S)
+
+# Source (reset) value for each known derivative field; zero for user-added pairs.
+# Called with a Val{S} dqdt key, so dispatch is always type-stable.
+@inline _source_for(ps::AbstractParticleSystem, ::Val{:dvdt})          = ps.source_v
+@inline _source_for(ps::AbstractParticleSystem, ::Val{:drhodt})        = ps.source_rho
+@inline _source_for(ps::AbstractParticleSystem, ::Val{name}) where {name} =
+    zero(eltype(getfield(ps, name)))
+
+# ---------------------------------------------------------------------------
+# Primitive axpy operations
+# ---------------------------------------------------------------------------
+
+@inline function _axpy_ip!(q, dqdt, a)
+    @inbounds @fastmath @batch for i in eachindex(q)
+        q[i] += a * dqdt[i]
+    end
+end
+
+@inline function _axpy_oop!(q, q0, dqdt, a)
+    @inbounds @fastmath @batch for i in eachindex(q)
+        q[i] = q0[i] + a * dqdt[i]
+    end
+end
+
+@inline function _zero_field(ps::AbstractParticleSystem, field::Symbol)
+    f = _getf(ps, Val(field))
+    fill!(f, zero(eltype(f)))
+end
+
+# ---------------------------------------------------------------------------
 # Validation helpers
 # ---------------------------------------------------------------------------
 

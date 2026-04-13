@@ -52,44 +52,68 @@ end
 # Per-system step helpers — generic over ps.pairs
 # ---------------------------------------------------------------------------
 
-# Type-stable field accessor: S is a compile-time constant, so getfield is fully inferred.
-@inline _getf(ps, ::Val{S}) where {S} = getfield(ps, S)
 
-# Source (reset) value for each known derivative field; zero for user-added pairs.
-# Called with a Val{S} dqdt key, so dispatch is always type-stable.
-@inline _source_for(ps::AbstractParticleSystem, ::Val{:dvdt})          = ps.source_v
-@inline _source_for(ps::AbstractParticleSystem, ::Val{:drhodt})        = ps.source_rho
-@inline _source_for(ps::AbstractParticleSystem, ::Val{name}) where {name} =
-    zero(eltype(getfield(ps, name)))
+# ---------------------------------------------------------------------------
+# Pair-level tuple walkers
+#
+# ps.pairs is a heterogeneous Tuple of (Val{:q}, Val{:dqdt}) pairs — one entry
+# per conjugate (q, dqdt) field that the integrator should step.  Because the
+# tuple is heterogeneous (each element has a distinct concrete type carrying the
+# field name as a type parameter), we cannot iterate it with a plain `for` loop:
+# Julia would infer the element type as a Union and box intermediate values on
+# the heap, preventing constant-folding of the Val field names.
+#
+# The solution is recursive dispatch using `Base.tail`:
+#   - The base case matches the empty tuple `::Tuple{}` and stops.
+#   - The recursive case matches any non-empty Tuple, so `first(pairs)` is
+#     always inferred as the *concrete* type of the first element (not a Union).
+#     After processing it we call ourselves with `Base.tail(pairs)`, which
+#     sheds the first element and gives a new concrete tuple type.
+# Each call is a distinct specialisation, so the whole chain is inlined by the
+# compiler into a flat sequence of array operations — zero runtime overhead.
+# ---------------------------------------------------------------------------
 
-# Barrier functions: type-stable hot loops called with concrete array types.
-@inline function _halfstep_pair!(q, dqdt, src, half_dt)
-    @inbounds @fastmath @batch for i in eachindex(q)
-        q[i]    += half_dt * dqdt[i]
-        dqdt[i]  = src
-    end
+# Advance each q field by a * dqdt (used for the leapfrog half-step).
+_halfstep_pairs!(ps, ::Tuple{}, a) = nothing
+@inline function _halfstep_pairs!(ps, pairs::Tuple, a)
+    q_val, dqdt_val = first(pairs)           # compile-time field-name constants
+    _axpy_ip!(_getf(ps, q_val), _getf(ps, dqdt_val), a)
+    _halfstep_pairs!(ps, Base.tail(pairs), a) # recurse on the remaining pairs
 end
 
-@inline function _fullstep_pair!(q, q0, dqdt, dt)
-    @inbounds @fastmath @batch for i in eachindex(q)
-        q[i] = q0[i] + dt * dqdt[i]
-    end
+# Reset each dqdt field back to its source value (gravity for dvdt, 0 for the
+# rest) so the next sweep accumulates onto a clean slate.
+_reset_dqdt_pairs!(ps, ::Tuple{}) = nothing
+@inline function _reset_dqdt_pairs!(ps, pairs::Tuple)
+    _, dqdt_val = first(pairs)
+    fill!(_getf(ps, dqdt_val), _source_for(ps, dqdt_val))
+    _reset_dqdt_pairs!(ps, Base.tail(pairs))
 end
 
-# Type-stable tuple walk over ps.pairs (which stores Val-encoded field names).
-# Base.tail recursion ensures first(pairs) always has a concrete type — the same
-# pattern used for _sweep_pfns! and _update_state_pfns!.
-_halfstep_pairs!(ps, ::Tuple{}, half_dt) = nothing
-@inline function _halfstep_pairs!(ps, pairs::Tuple, half_dt)
-    q_val, dqdt_val = first(pairs)
-    _halfstep_pair!(_getf(ps, q_val), _getf(ps, dqdt_val), _source_for(ps, dqdt_val), half_dt)
-    _halfstep_pairs!(ps, Base.tail(pairs), half_dt)
+# Half-step a single particle system: advance q, then reset dqdt.
+# Separated into two passes so the reset is a distinct, clearly-named step.
+@inline function _halfstep_ps!(ps::AbstractParticleSystem, half_dt)
+    pairs = getfield(ps, :pairs)
+    _halfstep_pairs!(ps, pairs, half_dt)
+    _reset_dqdt_pairs!(ps, pairs)
 end
-@inline _halfstep_ps!(ps::AbstractParticleSystem, half_dt) =
-    _halfstep_pairs!(ps, getfield(ps, :pairs), half_dt)
 
-# Build a typed tuple of q0 buffers (one copy per pair).
-# Returning a Tuple rather than a Vector preserves element types for _fullstep_pairs!.
+# ---------------------------------------------------------------------------
+# q0 buffer helpers
+#
+# The leapfrog full-step computes q = q0 + dt * dqdt, where q0 is the value
+# of q at the *start* of the timestep (before the half-step advance).  We
+# pre-allocate a typed tuple of arrays — one per conjugate pair — and copy q
+# into them before the half-step so the original values are preserved.
+#
+# Using a Tuple (rather than a Vector) to hold the buffers is important: a
+# Vector would erase the element types of each array (e.g. Vector{SVector{2,F}}
+# vs Vector{SVector{3,F}}), forcing _fullstep_pairs! to box values or fall back
+# to dynamic dispatch.  A Tuple keeps each buffer's concrete type visible to
+# the compiler throughout the full-step walk.
+# ---------------------------------------------------------------------------
+
+# Allocate one copy-buffer per pair by recursing through ps.pairs at startup.
 _make_q0_bufs(ps, ::Tuple{}) = ()
 @inline function _make_q0_bufs(ps, pairs::Tuple)
     q_val = first(first(pairs))
@@ -97,73 +121,46 @@ _make_q0_bufs(ps, ::Tuple{}) = ()
 end
 @inline _make_q0_bufs(ps::AbstractParticleSystem) = _make_q0_bufs(ps, getfield(ps, :pairs))
 
-@inline function _parallel_copy!(dst, src)
-    @inbounds @batch for i in eachindex(dst)
-        dst[i] = src[i]
-    end
-end
-
-# Save current q values into the pre-allocated buffers.
+# Snapshot current q values into the pre-allocated buffers (buf = q + 0*q).
 _save_q0_pairs!(ps, ::Tuple{}, ::Tuple{}) = nothing
 @inline function _save_q0_pairs!(ps, pairs::Tuple, bufs::Tuple)
     q_val = first(first(pairs))
-    _parallel_copy!(first(bufs), _getf(ps, q_val))
+    _axpy_oop!(first(bufs), _getf(ps, q_val), _getf(ps, q_val), 0)
     _save_q0_pairs!(ps, Base.tail(pairs), Base.tail(bufs))
 end
 
-# Full-step: q = q0 + dt * dqdt, walking pairs and bufs in lockstep.
+# Full-step: q = q0 + dt * dqdt.  pairs and bufs are walked in lockstep so
+# each q array is matched with its corresponding saved q0 buffer.
 _fullstep_pairs!(ps, ::Tuple{}, ::Tuple{}, dt) = nothing
 @inline function _fullstep_pairs!(ps, pairs::Tuple, bufs::Tuple, dt)
     q_val, dqdt_val = first(pairs)
-    _fullstep_pair!(_getf(ps, q_val), first(bufs), _getf(ps, dqdt_val), dt)
+    _axpy_oop!(_getf(ps, q_val), first(bufs), _getf(ps, dqdt_val), dt)
     _fullstep_pairs!(ps, Base.tail(pairs), Base.tail(bufs), dt)
 end
-@inline _fullstep_ps!(ps::AbstractParticleSystem, q0_bufs, dt) =
-    _fullstep_pairs!(ps, getfield(ps, :pairs), q0_bufs, dt)
-
-@inline function _update_positions!(ps::AbstractParticleSystem, dt)
-    x = ps.x; v = ps.v
-    @inbounds @fastmath @batch for i in eachindex(x)
-        x[i] += dt * v[i]
-    end
-end
-
-@inline function _apply_v_adjustments!(ps::AbstractParticleSystem)
-    v = ps.v ; v_adjustment = ps.v_adjustment
-    @inbounds @fastmath @batch for i in eachindex(v)
-        v[i] += v_adjustment[i]
-    end
-end
-
-@inline function _subtract_v_adjustments!(ps::AbstractParticleSystem)
-    v = ps.v ; v_adjustment = ps.v_adjustment
-    @inbounds @fastmath @batch for i in eachindex(v)
-        v[i] -= v_adjustment[i]
-    end
-end
-
-@inline function _zero_field(ps::AbstractParticleSystem, field::Symbol)
-    f = _getf(ps, Val(field))
-    fill!(f, zero(eltype(f)))
-end
 
 # ---------------------------------------------------------------------------
-# Tuple-recursive helpers for the time loop
+# All-systems tuple walkers
 #
-# `for (i, ps) in enumerate(sys)` gives `ps::Union{A,B,...}` when sys is a
-# heterogeneous Tuple.  Any call inside the loop that dispatches on ps's
-# concrete type (e.g. _particle_arrays, _make_q0_bufs) then returns a Union
-# type, which Julia must box on the heap before passing to recursive helpers
-# like _apply_perms!.  The Base.tail pattern below ensures each call site
-# sees a fully concrete type with no Union boxing.
+# `sys` is a heterogeneous Tuple of particle systems (potentially different
+# concrete types).  A plain `for (i, ps) in enumerate(sys)` loop infers `ps`
+# as a Union of all system types.  Any function call inside the loop that
+# dispatches on `ps`'s concrete type then returns a Union result, which Julia
+# must heap-box before passing onward — preventing type inference from
+# propagating through the call chain.
+#
+# The same Base.tail recursion used for pair walkers above resolves this:
+# `first(sys)` is always a single concrete type, so every downstream call is
+# fully specialised with no Union boxing.
 # ---------------------------------------------------------------------------
 
+# Sort every real particle system by cell index (required before grid build).
 _sort_all_systems!(::Tuple{}, ::Tuple{}, cutoff, perm_buf, key_buf, to, labels, idx) = nothing
 @inline function _sort_all_systems!(sys::Tuple, scratches::Tuple, cutoff, perm_buf, key_buf, to, labels, idx)
     @timeit to labels[idx].sort sort_particles!(first(sys), cutoff, perm_buf, key_buf, first(scratches))
     _sort_all_systems!(Base.tail(sys), Base.tail(scratches), cutoff, perm_buf, key_buf, to, labels, idx + 1)
 end
 
+# Snapshot q0 for every system before the half-step.
 _save_q0_all!(::Tuple{}, ::Tuple{}) = nothing
 @inline function _save_q0_all!(sys::Tuple, q0s::Tuple)
     ps = first(sys)
@@ -171,15 +168,19 @@ _save_q0_all!(::Tuple{}, ::Tuple{}) = nothing
     _save_q0_all!(Base.tail(sys), Base.tail(q0s))
 end
 
+# Apply the leapfrog full-step (q = q0 + dt * dqdt) to every system.
 _fullstep_q_all!(::Tuple{}, ::Tuple{}, dt, to, labels, idx) = nothing
 @inline function _fullstep_q_all!(sys::Tuple, q0s::Tuple, dt, to, labels, idx)
-    @timeit to labels[idx].full _fullstep_ps!(first(sys), first(q0s), dt)
+    ps = first(sys)
+    @timeit to labels[idx].full _fullstep_pairs!(ps, getfield(ps, :pairs), first(q0s), dt)
     _fullstep_q_all!(Base.tail(sys), Base.tail(q0s), dt, to, labels, idx + 1)
 end
 
+# Integrate positions forward: x += dt * v.
 _update_positions_all!(::Tuple{}, dt, to, labels, idx) = nothing
 @inline function _update_positions_all!(sys::Tuple, dt, to, labels, idx)
-    @timeit to labels[idx].pos _update_positions!(first(sys), dt)
+    ps = first(sys)
+    @timeit to labels[idx].pos _axpy_ip!(ps.x, ps.v, dt)
     _update_positions_all!(Base.tail(sys), dt, to, labels, idx + 1)
 end
 
@@ -315,18 +316,7 @@ function time_integrate!(
             @timeit to ghost_labels[i].kin update_ghost_kinematics!(ge)
         end
 
-        # # ---- 8. Velocity adjustment Sweep ----------------------------------
-        # for (i, ps) in enumerate(sys)
-        #     @timeit to ps_labels[i].v_adjust _zero_field(ps, :v_adjustment)
-        # end
-        # for (i, inter) in enumerate(ints)
-        #     @timeit to inter_labels[i].v_adjust adjust_v!(inter)
-        # end
-        # for (i, ps) in enumerate(sys)
-        #     @timeit to ps_labels[i].v_adjust _apply_v_adjustments!(ps)
-        # end
-
-        # ---- 9. Sweep ------------------------------------------------------
+        # ---- 8. Sweep ------------------------------------------------------
         for stage in 1:num_stages
             for (i, ps) in enumerate(sys)
                 length(ps.state_updater) == num_stages || continue
@@ -342,12 +332,12 @@ function time_integrate!(
             end
         end
 
-        # ---- 10. Full-step: update q = q0 + dt·dqdt -----------------------
+        # ---- 9. Full-step: update q = q0 + dt·dqdt -----------------------
         _fullstep_q_all!(sys, q0_bufs, dt, to, ps_labels, 1)
 
-        # ---- 11. Velocity adjustment Sweep 2 --------------------------------
+        # ---- 10. Velocity adjustment Sweep 2 --------------------------------
         for (i, ps) in enumerate(sys)
-            @timeit to ps_labels[i].v_adjust _subtract_v_adjustments!(ps)
+            @timeit to ps_labels[i].v_adjust _axpy_ip!(ps.v, ps.v_adjustment, -1)
         end
         for (i, ps) in enumerate(sys)
             @timeit to ps_labels[i].v_adjust _zero_field(ps, :v_adjustment)
@@ -356,13 +346,13 @@ function time_integrate!(
             @timeit to inter_labels[i].v_adjust adjust_v!(inter)
         end
         for (i, ps) in enumerate(sys)
-            @timeit to ps_labels[i].v_adjust _apply_v_adjustments!(ps)
+            @timeit to ps_labels[i].v_adjust _axpy_ip!(ps.v, ps.v_adjustment, 1)
         end
 
-        # ---- 12. Update positions: x += dt·v -------------------------------
+        # ---- 11. Update positions: x += dt·v -------------------------------
         _update_positions_all!(sys, dt, to, ps_labels, 1)
 
-        # ---- 13. Print -----------------------------------------------------
+        # ---- 12. Print -----------------------------------------------------
         if global_step % print_interval_step == 0
             @timeit to "print summary" begin
                 sim_time = global_step * dt
@@ -373,7 +363,7 @@ function time_integrate!(
             end
         end
 
-        # ---- 14. Save ------------------------------------------------------
+        # ---- 13. Save ------------------------------------------------------
         if output_prefix !== nothing && global_step % save_interval_step == 0
             @timeit to "save h5" begin
                 path = "$(output_prefix)_$(lpad(global_step, width, '0')).h5"
