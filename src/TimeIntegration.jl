@@ -1,5 +1,7 @@
 export LeapFrogTimeIntegrator, time_integrate!, run_driver!
 
+using ArgParse
+
 # ---------------------------------------------------------------------------
 # Integrator struct
 # ---------------------------------------------------------------------------
@@ -468,34 +470,42 @@ function run_driver!(
     cur_prefix  = output_prefix
     cur_interactive = interactive
 
-    # Parse CLI flags from ARGS if any
-    i = 1
-    while i <= length(ARGS)
-        arg = ARGS[i]
-        if arg == "--steps" || arg == "-s"
-            if i + 1 <= length(ARGS)
-                cur_n = parse(Int, ARGS[i+1])
-                i += 1
-            end
-        elseif arg == "--print-freq" || arg == "-p"
-            if i + 1 <= length(ARGS)
-                cur_print = parse(Int, ARGS[i+1])
-                i += 1
-            end
-        elseif arg == "--save-freq" || arg == "-f"
-            if i + 1 <= length(ARGS)
-                cur_save = parse(Int, ARGS[i+1])
-                i += 1
-            end
-        elseif arg == "--cfl" || arg == "-c"
-            if i + 1 <= length(ARGS)
-                cur_CFL = parse(Float64, ARGS[i+1])
-                i += 1
-            end
-        elseif arg == "--non-interactive" || arg == "-n"
-            cur_interactive = false
+    # Parse CLI flags from ARGS if any.
+    # Defaults shown in the help text are the values passed to run_driver!.
+    if !isempty(ARGS)
+        ap = ArgParseSettings(; description = "Grasph SPH driver")
+        @add_arg_table! ap begin
+            "--steps", "-s"
+                help    = "number of timesteps to run"
+                arg_type = Int
+                default = cur_n
+            "--print-freq", "-p"
+                help    = "print every N steps"
+                arg_type = Int
+                default = cur_print
+            "--save-freq", "-f"
+                help    = "save every N steps"
+                arg_type = Int
+                default = cur_save
+            "--cfl", "-c"
+                help    = "CFL number"
+                arg_type = Float64
+                default = cur_CFL
+            "--non-interactive", "-n"
+                help    = "disable interactive prompt between batches"
+                action  = :store_true
+            "--output-prefix", "-o"
+                help    = "output file prefix"
+                arg_type = String
+                default = cur_prefix
         end
-        i += 1
+        parsed = parse_args(ARGS, ap)
+        cur_n           = parsed["steps"]
+        cur_print       = parsed["print-freq"]
+        cur_save        = parsed["save-freq"]
+        cur_CFL         = parsed["cfl"]
+        cur_prefix      = parsed["output-prefix"]
+        cur_interactive = interactive && !parsed["non-interactive"]
     end
 
     while true
