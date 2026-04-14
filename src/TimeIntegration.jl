@@ -155,7 +155,7 @@ end
 #
 # Using a Tuple (rather than a Vector) to hold the buffers is important: a
 # Vector would erase the element types of each array (e.g. Vector{SVector{2,F}}
-# vs Vector{SVector{3,F}}), forcing _fullstep_pairs! to box values or fall back
+# vs Vector{SVector{3,F}}), forcing _advance_q_pairs! to box values or fall back
 # to dynamic dispatch.  A Tuple keeps each buffer's concrete type visible to
 # the compiler throughout the full-step walk.
 # ---------------------------------------------------------------------------
@@ -176,14 +176,6 @@ _save_q0_pairs!(ps, ::Tuple{}, ::Tuple{}) = nothing
     _save_q0_pairs!(ps, Base.tail(pairs), Base.tail(bufs))
 end
 
-# Full-step: q = q0 + dt * dqdt.  pairs and bufs are walked in lockstep so
-# each q array is matched with its corresponding saved q0 buffer.
-_fullstep_pairs!(ps, ::Tuple{}, ::Tuple{}, dt) = nothing
-@inline function _fullstep_pairs!(ps, pairs::Tuple, bufs::Tuple, dt)
-    q_val, dqdt_val = first(pairs)
-    _axpy_oop!(_getf(ps, q_val), first(bufs), _getf(ps, dqdt_val), dt)
-    _fullstep_pairs!(ps, Base.tail(pairs), Base.tail(bufs), dt)
-end
 
 # ---------------------------------------------------------------------------
 # All-systems tuple walkers
@@ -215,11 +207,11 @@ _save_q0_all!(::Tuple{}, ::Tuple{}) = nothing
     _save_q0_all!(Base.tail(sys), Base.tail(q0s))
 end
 
-# Apply the leapfrog full-step (q = q0 + dt * dqdt) to every system.
+# Apply the full-step update (q = q0 + dt * dqdt) to every system.
 _fullstep_q_all!(::Tuple{}, ::Tuple{}, dt, to, labels, idx) = nothing
 @inline function _fullstep_q_all!(sys::Tuple, q0s::Tuple, dt, to, labels, idx)
     ps = first(sys)
-    @timeit to labels[idx].full @timeit to labels[idx].name _fullstep_pairs!(ps, getfield(ps, :pairs), first(q0s), dt)
+    @timeit to labels[idx].full @timeit to labels[idx].name _advance_q_pairs!(ps, getfield(ps, :pairs), first(q0s), dt)
     _fullstep_q_all!(Base.tail(sys), Base.tail(q0s), dt, to, labels, idx + 1)
 end
 
@@ -244,7 +236,7 @@ end
 #
 # Three new pair-level walkers, each with an _all! wrapper:
 #
-#   _rk4_advance_pairs!  q = q0 + coeff*dqdt   (stage setup for stages 2-4)
+#   _advance_q_pairs!    q = q0 + coeff*dqdt   (stage setup for stages 2-4)
 #   _acc_dqdt_pairs!     acc += weight*dqdt     (accumulate ki after each sweep)
 #   _apply_acc_pairs!    q = q0 + dt*acc        (final RK4 update)
 #
@@ -277,19 +269,19 @@ _zero_acc_all!(::Tuple{}, ::Tuple{}) = nothing
     _zero_acc_all!(Base.tail(sys), Base.tail(accs))
 end
 
-# q = q0 + coeff * dqdt  (advance q from q0 using the previous stage's dqdt).
-_rk4_advance_pairs!(ps, ::Tuple{}, ::Tuple{}, coeff) = nothing
-@inline function _rk4_advance_pairs!(ps, pairs::Tuple, q0s::Tuple, coeff)
+# q = q0 + coeff * dqdt  (used for both the LeapFrog full-step and RK4 stage advances).
+_advance_q_pairs!(ps, ::Tuple{}, ::Tuple{}, coeff) = nothing
+@inline function _advance_q_pairs!(ps, pairs::Tuple, q0s::Tuple, coeff)
     q_val, dqdt_val = first(pairs)
     _axpy_oop!(_getf(ps, q_val), first(q0s), _getf(ps, dqdt_val), coeff)
-    _rk4_advance_pairs!(ps, Base.tail(pairs), Base.tail(q0s), coeff)
+    _advance_q_pairs!(ps, Base.tail(pairs), Base.tail(q0s), coeff)
 end
 
 _rk4_advance_all!(::Tuple{}, ::Tuple{}, coeff, to, labels, idx) = nothing
 @inline function _rk4_advance_all!(sys::Tuple, q0s::Tuple, coeff, to, labels, idx)
     ps = first(sys)
     @timeit to labels[idx].mid @timeit to labels[idx].name begin
-        _rk4_advance_pairs!(ps, getfield(ps, :pairs), first(q0s), coeff)
+        _advance_q_pairs!(ps, getfield(ps, :pairs), first(q0s), coeff)
         _reset_dqdt_pairs!(ps, getfield(ps, :pairs))
     end
     _rk4_advance_all!(Base.tail(sys), Base.tail(q0s), coeff, to, labels, idx + 1)
@@ -310,7 +302,7 @@ _acc_dqdt_all!(::Tuple{}, ::Tuple{}, weight) = nothing
     _acc_dqdt_all!(Base.tail(sys), Base.tail(accs), weight)
 end
 
-# q = q0 + dt * acc  (final RK4 update; structurally identical to _fullstep_pairs!)
+# q = q0 + dt * acc  (final RK4 update; structurally identical to _advance_q_pairs!)
 _apply_acc_pairs!(ps, ::Tuple{}, ::Tuple{}, ::Tuple{}, dt) = nothing
 @inline function _apply_acc_pairs!(ps, pairs::Tuple, q0s::Tuple, accs::Tuple, dt)
     q_val, _ = first(pairs)
@@ -328,6 +320,41 @@ end
 # ---------------------------------------------------------------------------
 # Shared per-step helpers (used by both LeapFrog and RK4)
 # ---------------------------------------------------------------------------
+
+# Generate ghosts, sort them, then build all interaction grids.
+# Steps 3-5 are identical for both LeapFrog and RK4 since the grid is
+# (re)built exactly once per timestep in both integrators.
+function _prepare_grids!(ghosts, ints, sort_cutoff, sort_perm_buf, sort_key_buf,
+                          ghost_scratches, to, ghost_labels, inter_labels)
+    for (i, ge) in enumerate(ghosts)
+        @timeit to ghost_labels[i].gen @timeit to ghost_labels[i].name generate_ghosts!(ge)
+    end
+    for (i, ge) in enumerate(ghosts)
+        @timeit to ghost_labels[i].sort @timeit to ghost_labels[i].name sort_particles!(
+            ge.ghost, sort_cutoff, sort_perm_buf, sort_key_buf, ghost_scratches[i])
+    end
+    for (i, inter) in enumerate(ints)
+        @timeit to inter_labels[i].grid @timeit to inter_labels[i].name create_grid!(inter)
+    end
+end
+
+# Run one full sweep pass: state updates, ghost stage updates, then interaction
+# sweeps — in that order, for every stage.  Called once per timestep in
+# LeapFrog; called once per RK stage in RK4 (wrapped in extra @timeit there).
+function _sweep_all_stages!(sys, ghosts, ints, num_stages, to, ps_labels, ghost_labels, inter_labels)
+    for stage in 1:num_stages
+        for (i, ps) in enumerate(sys)
+            length(ps.state_updater) == num_stages || continue
+            @timeit to ps_labels[i].upd @timeit to ps_labels[i].name update_state!(ps, stage)
+        end
+        for (i, ge) in enumerate(ghosts)
+            @timeit to ghost_labels[i].stage @timeit to ghost_labels[i].name update_ghost!(ge, stage)
+        end
+        for (i, inter) in enumerate(ints)
+            @timeit to inter_labels[i].sweep @timeit to inter_labels[i].name sweep!(inter, stage)
+        end
+    end
+end
 
 # XSPH velocity correction: subtract the accumulated v_adjustment, re-run the
 # XSPH sweep via adjust_v!, then add the freshly computed adjustment back.
@@ -484,24 +511,9 @@ function time_integrate!(
         # ---- 2. Save initial values ----------------------------------------
         @timeit to "save q0" _save_q0_all!(sys, q0_bufs)
 
-        # ---- 3. Generate ghosts (positions only) ---------------------------
-        for (i, ge) in enumerate(integrator.ghosts)
-            @timeit to ghost_labels[i].gen @timeit to ghost_labels[i].name generate_ghosts!(ge)
-        end
-
-        # ---- 4. Sort ghost systems by cell index ---------------------------
-        # Ghosts are sorted after generation so their positions are fresh.
-        # idx_original is permuted alongside the physics arrays, so it
-        # continues to index correctly into the already-sorted real system.
-        for (i, ge) in enumerate(integrator.ghosts)
-            @timeit to ghost_labels[i].sort @timeit to ghost_labels[i].name sort_particles!(
-                ge.ghost, sort_cutoff, sort_perm_buf, sort_key_buf, ghost_scratches[i])
-        end
-
-        # ---- 5. Create grids -----------------------------------------------
-        for (i, inter) in enumerate(ints)
-            @timeit to inter_labels[i].grid @timeit to inter_labels[i].name create_grid!(inter)
-        end
+        # ---- 3-5. Generate ghosts, sort, build grids -----------------------
+        _prepare_grids!(integrator.ghosts, ints, sort_cutoff, sort_perm_buf, sort_key_buf,
+                        ghost_scratches, to, ghost_labels, inter_labels)
 
         # ---- 6. Half-step --------------------------------------------------
         for (i, ps) in enumerate(sys)
@@ -514,20 +526,8 @@ function time_integrate!(
         end
 
         # ---- 8. Sweep ------------------------------------------------------
-        for stage in 1:num_stages
-            for (i, ps) in enumerate(sys)
-                length(ps.state_updater) == num_stages || continue
-                @timeit to ps_labels[i].upd @timeit to ps_labels[i].name update_state!(ps, stage)
-            end
-
-            for (i, ge) in enumerate(integrator.ghosts)
-                @timeit to ghost_labels[i].stage @timeit to ghost_labels[i].name update_ghost!(ge, stage)
-            end
-
-            for (i, inter) in enumerate(ints)
-                @timeit to inter_labels[i].sweep @timeit to inter_labels[i].name sweep!(inter, stage)
-            end
-        end
+        _sweep_all_stages!(sys, integrator.ghosts, ints, num_stages, to,
+                           ps_labels, ghost_labels, inter_labels)
 
         # ---- 9. Full-step: update q = q0 + dt·dqdt -----------------------
         _fullstep_q_all!(sys, q0_bufs, dt, to, ps_labels, 1)
@@ -636,21 +636,9 @@ function time_integrate!(
         @timeit to "save q0" _save_q0_all!(sys, q0_bufs)
         _zero_acc_all!(sys, acc_bufs)
 
-        # ---- 3. Generate ghosts (positions only) ---------------------------
-        for (i, ge) in enumerate(integrator.ghosts)
-            @timeit to ghost_labels[i].gen @timeit to ghost_labels[i].name generate_ghosts!(ge)
-        end
-
-        # ---- 4. Sort ghost systems -----------------------------------------
-        for (i, ge) in enumerate(integrator.ghosts)
-            @timeit to ghost_labels[i].sort @timeit to ghost_labels[i].name sort_particles!(
-                ge.ghost, sort_cutoff, sort_perm_buf, sort_key_buf, ghost_scratches[i])
-        end
-
-        # ---- 5. Create grids -----------------------------------------------
-        for (i, inter) in enumerate(ints)
-            @timeit to inter_labels[i].grid @timeit to inter_labels[i].name create_grid!(inter)
-        end
+        # ---- 3-5. Generate ghosts, sort, build grids -----------------------
+        _prepare_grids!(integrator.ghosts, ints, sort_cutoff, sort_perm_buf, sort_key_buf,
+                        ghost_scratches, to, ghost_labels, inter_labels)
 
         # ---- 6-8. Four RK stages -------------------------------------------
         for rk_iter in 1:4
@@ -671,20 +659,8 @@ function time_integrate!(
             end
 
             # ---- 8. State updates then sweeps (all updates before any sweep)
-            @timeit to "sweep" @timeit to rk_label begin
-                for stage in 1:num_stages
-                    for (i, ps) in enumerate(sys)
-                        length(ps.state_updater) == num_stages || continue
-                        @timeit to ps_labels[i].upd @timeit to ps_labels[i].name update_state!(ps, stage)
-                    end
-                    for (i, ge) in enumerate(integrator.ghosts)
-                        @timeit to ghost_labels[i].stage @timeit to ghost_labels[i].name update_ghost!(ge, stage)
-                    end
-                    for (i, inter) in enumerate(ints)
-                        @timeit to inter_labels[i].sweep @timeit to inter_labels[i].name sweep!(inter, stage)
-                    end
-                end
-            end
+            @timeit to "sweep" @timeit to rk_label _sweep_all_stages!(
+                sys, integrator.ghosts, ints, num_stages, to, ps_labels, ghost_labels, inter_labels)
 
             # Accumulate weighted dqdt into acc_bufs.
             _acc_dqdt_all!(sys, acc_bufs, rk4_weight[rk_iter])
