@@ -158,7 +158,7 @@ end
 # Sort every real particle system by cell index (required before grid build).
 _sort_all_systems!(::Tuple{}, ::Tuple{}, cutoff, perm_buf, key_buf, to, labels, idx) = nothing
 @inline function _sort_all_systems!(sys::Tuple, scratches::Tuple, cutoff, perm_buf, key_buf, to, labels, idx)
-    @timeit to labels[idx].sort sort_particles!(first(sys), cutoff, perm_buf, key_buf, first(scratches))
+    @timeit to labels[idx].sort @timeit to labels[idx].name sort_particles!(first(sys), cutoff, perm_buf, key_buf, first(scratches))
     _sort_all_systems!(Base.tail(sys), Base.tail(scratches), cutoff, perm_buf, key_buf, to, labels, idx + 1)
 end
 
@@ -174,7 +174,7 @@ end
 _fullstep_q_all!(::Tuple{}, ::Tuple{}, dt, to, labels, idx) = nothing
 @inline function _fullstep_q_all!(sys::Tuple, q0s::Tuple, dt, to, labels, idx)
     ps = first(sys)
-    @timeit to labels[idx].full _fullstep_pairs!(ps, getfield(ps, :pairs), first(q0s), dt)
+    @timeit to labels[idx].full @timeit to labels[idx].name _fullstep_pairs!(ps, getfield(ps, :pairs), first(q0s), dt)
     _fullstep_q_all!(Base.tail(sys), Base.tail(q0s), dt, to, labels, idx + 1)
 end
 
@@ -182,7 +182,7 @@ end
 _update_positions_all!(::Tuple{}, dt, to, labels, idx) = nothing
 @inline function _update_positions_all!(sys::Tuple, dt, to, labels, idx)
     ps = first(sys)
-    @timeit to labels[idx].pos _axpy_ip!(ps.x, ps.v, dt)
+    @timeit to labels[idx].pos @timeit to labels[idx].name _axpy_ip!(ps.x, ps.v, dt)
     _update_positions_all!(Base.tail(sys), dt, to, labels, idx + 1)
 end
 
@@ -254,25 +254,28 @@ function time_integrate!(
     sys_scratches  = map(_make_sort_scratch, sys)
     ghost_scratches = [_make_empty_sort_scratch(ge.ghost) for ge in integrator.ghosts]
 
-    # Pre-compute @timeit labels to avoid string interpolation allocations in the loop
-    ps_labels = [(sort="sort [$(ps.name)]",
-                  mid="mid-step [$(ps.name)]",
-                  full="full-step [$(ps.name)]",
-                  pos="update pos [$(ps.name)]",
-                  upd="state update [$(ps.name)]",
-                  v_adjust="vel adjust [$(ps.name)]") for ps in sys]
-    
+    # Pre-compute @timeit labels to avoid string interpolation allocations in the loop.
+    # Sub-labels are short because they appear nested under the parent name.
+    ps_labels = [(name=ps.name,
+                  sort="sort",
+                  mid="half-step",
+                  full="full-step",
+                  pos="update pos",
+                  upd="state update",
+                  v_adjust="vel adjust") for ps in sys]
+
     inter_labels = []
     for inter in ints
         ps_a  = inter.system_a
         label = is_coupled(inter) ? "$(ps_a.name)×$(inter.system_b.name)" : ps_a.name
-        push!(inter_labels, (grid="grid [$label]", sweep="sweep [$label]", v_adjust="v adjust [$label]"))
+        push!(inter_labels, (name=label, grid="grid", sweep="sweep", v_adjust="vel adjust"))
     end
 
-    ghost_labels = [(gen="ghost gen [$(ge.ghost.name)]",
-                     sort="sort ghost [$(ge.ghost.name)]",
-                     kin="ghost kin [$(ge.ghost.name)]",
-                     stage="ghost stage [$(ge.ghost.name)]") for ge in integrator.ghosts]
+    ghost_labels = [(name=ge.ghost.name,
+                     gen="ghost gen",
+                     sort="ghost sort",
+                     kin="ghost kinematics",
+                     stage="ghost stage") for ge in integrator.ghosts]
 
     width = ndigits(step_offset + num_timesteps)
 
@@ -287,11 +290,11 @@ function time_integrate!(
         _sort_all_systems!(sys, sys_scratches, sort_cutoff, sort_perm_buf, sort_key_buf, to, ps_labels, 1)
 
         # ---- 2. Save initial values ----------------------------------------
-        _save_q0_all!(sys, q0_bufs)
+        @timeit to "save q0" _save_q0_all!(sys, q0_bufs)
 
         # ---- 3. Generate ghosts (positions only) ---------------------------
         for (i, ge) in enumerate(integrator.ghosts)
-            @timeit to ghost_labels[i].gen generate_ghosts!(ge)
+            @timeit to ghost_labels[i].gen @timeit to ghost_labels[i].name generate_ghosts!(ge)
         end
 
         # ---- 4. Sort ghost systems by cell index ---------------------------
@@ -299,38 +302,38 @@ function time_integrate!(
         # idx_original is permuted alongside the physics arrays, so it
         # continues to index correctly into the already-sorted real system.
         for (i, ge) in enumerate(integrator.ghosts)
-            @timeit to ghost_labels[i].sort sort_particles!(
+            @timeit to ghost_labels[i].sort @timeit to ghost_labels[i].name sort_particles!(
                 ge.ghost, sort_cutoff, sort_perm_buf, sort_key_buf, ghost_scratches[i])
         end
 
         # ---- 5. Create grids -----------------------------------------------
         for (i, inter) in enumerate(ints)
-            @timeit to inter_labels[i].grid create_grid!(inter)
+            @timeit to inter_labels[i].grid @timeit to inter_labels[i].name create_grid!(inter)
         end
 
         # ---- 6. Half-step --------------------------------------------------
         for (i, ps) in enumerate(sys)
-            @timeit to ps_labels[i].mid _halfstep_ps!(ps, dt / 2)
+            @timeit to ps_labels[i].mid @timeit to ps_labels[i].name _halfstep_ps!(ps, dt / 2)
         end
 
         # ---- 7. Update ghost kinematics (v, rho) ---------------------------
         for (i, ge) in enumerate(integrator.ghosts)
-            @timeit to ghost_labels[i].kin update_ghost_kinematics!(ge)
+            @timeit to ghost_labels[i].kin @timeit to ghost_labels[i].name update_ghost_kinematics!(ge)
         end
 
         # ---- 8. Sweep ------------------------------------------------------
         for stage in 1:num_stages
             for (i, ps) in enumerate(sys)
                 length(ps.state_updater) == num_stages || continue
-                @timeit to ps_labels[i].upd update_state!(ps, stage)
+                @timeit to ps_labels[i].upd @timeit to ps_labels[i].name update_state!(ps, stage)
             end
 
             for (i, ge) in enumerate(integrator.ghosts)
-                @timeit to ghost_labels[i].stage update_ghost!(ge, stage)
+                @timeit to ghost_labels[i].stage @timeit to ghost_labels[i].name update_ghost!(ge, stage)
             end
 
             for (i, inter) in enumerate(ints)
-                @timeit to inter_labels[i].sweep sweep!(inter, stage)
+                @timeit to inter_labels[i].sweep @timeit to inter_labels[i].name sweep!(inter, stage)
             end
         end
 
@@ -339,16 +342,16 @@ function time_integrate!(
 
         # ---- 10. Velocity adjustment Sweep 2 --------------------------------
         for (i, ps) in enumerate(sys)
-            @timeit to ps_labels[i].v_adjust _axpy_ip!(ps.v, ps.v_adjustment, -1)
+            @timeit to ps_labels[i].v_adjust @timeit to ps_labels[i].name _axpy_ip!(ps.v, ps.v_adjustment, -1)
         end
         for (i, ps) in enumerate(sys)
-            @timeit to ps_labels[i].v_adjust _zero_field(ps, :v_adjustment)
+            @timeit to ps_labels[i].v_adjust @timeit to ps_labels[i].name _zero_field(ps, :v_adjustment)
         end
         for (i, inter) in enumerate(ints)
-            @timeit to inter_labels[i].v_adjust adjust_v!(inter)
+            @timeit to inter_labels[i].v_adjust @timeit to inter_labels[i].name adjust_v!(inter)
         end
         for (i, ps) in enumerate(sys)
-            @timeit to ps_labels[i].v_adjust _axpy_ip!(ps.v, ps.v_adjustment, 1)
+            @timeit to ps_labels[i].v_adjust @timeit to ps_labels[i].name _axpy_ip!(ps.v, ps.v_adjustment, 1)
         end
 
         # ---- 11. Update positions: x += dt·v -------------------------------
