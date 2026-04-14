@@ -1,10 +1,18 @@
-export LeapFrogTimeIntegrator, time_integrate!, run_driver!
+export AbstractTimeIntegrator, LeapFrogTimeIntegrator, RK4TimeIntegrator, time_integrate!, run_driver!
 
 using ArgParse
 
 # ---------------------------------------------------------------------------
-# Integrator struct
+# Integrator types
 # ---------------------------------------------------------------------------
+
+"""
+    AbstractTimeIntegrator
+
+Abstract supertype for all time integrators.  Concrete subtypes must implement
+`time_integrate!(integrator::ConcreteType, ...)`.
+"""
+abstract type AbstractTimeIntegrator end
 
 """
     LeapFrogTimeIntegrator
@@ -20,7 +28,7 @@ Conjugate pairs `(q, dqdt)` are driven by `ps.pairs`. At each step:
 4. **Full-step**: `q = q₀ + dt * dqdt`.
 5. **Update positions**: `x += dt * v`.
 """
-struct LeapFrogTimeIntegrator{SYS<:Tuple, INTS<:Tuple, GHOSTS<:Tuple, T<:AbstractFloat}
+struct LeapFrogTimeIntegrator{SYS<:Tuple, INTS<:Tuple, GHOSTS<:Tuple, T<:AbstractFloat} <: AbstractTimeIntegrator
     systems::SYS
     interactions::INTS
     ghosts::GHOSTS
@@ -48,6 +56,43 @@ function LeapFrogTimeIntegrator(systems, interactions; ghosts=())
     c = T(maximum(ps.c           for ps   in sys))
     h = T(minimum(inter.kernel.h for inter in ints))
     LeapFrogTimeIntegrator{typeof(sys), typeof(ints), typeof(gsts), T}(sys, ints, gsts, c, h)
+end
+
+"""
+    RK4TimeIntegrator
+
+Classical 4th-order Runge-Kutta time integrator for one or more
+`AbstractParticleSystem`s.
+
+The neighbour grid is built once per timestep (frozen Lagrangian approximation).
+Each timestep evaluates the RHS four times with intermediate states:
+
+    k1 = f(q0)
+    k2 = f(q0 + dt/2 · k1)
+    k3 = f(q0 + dt/2 · k2)
+    k4 = f(q0 + dt   · k3)
+    q  = q0 + dt · (k1/6 + k2/3 + k3/3 + k4/6)
+
+Positions are updated once at the end: `x += dt · v`.
+"""
+struct RK4TimeIntegrator{SYS<:Tuple, INTS<:Tuple, GHOSTS<:Tuple, T<:AbstractFloat} <: AbstractTimeIntegrator
+    systems::SYS
+    interactions::INTS
+    ghosts::GHOSTS
+    c::T
+    h::T
+end
+
+function RK4TimeIntegrator(systems, interactions; ghosts=())
+    sys  = systems      isa AbstractParticleSystem ? (systems,)      : Tuple(systems)
+    ints = interactions isa SystemInteraction      ? (interactions,) : Tuple(interactions)
+    gsts = ghosts       isa GhostEntry             ? (ghosts,)       : Tuple(ghosts)
+    isempty(sys)  && throw(ArgumentError("systems must not be empty"))
+    isempty(ints) && throw(ArgumentError("interactions must not be empty"))
+    T = eltype(eltype(first(sys).x))
+    c = T(maximum(ps.c           for ps   in sys))
+    h = T(minimum(inter.kernel.h for inter in ints))
+    RK4TimeIntegrator{typeof(sys), typeof(ints), typeof(gsts), T}(sys, ints, gsts, c, h)
 end
 
 # ---------------------------------------------------------------------------
@@ -184,6 +229,153 @@ _update_positions_all!(::Tuple{}, dt, to, labels, idx) = nothing
     ps = first(sys)
     @timeit to labels[idx].pos @timeit to labels[idx].name _axpy_ip!(ps.x, ps.v, dt)
     _update_positions_all!(Base.tail(sys), dt, to, labels, idx + 1)
+end
+
+# Reset every dqdt field to its source value across all systems.
+_reset_dqdt_all!(::Tuple{}) = nothing
+@inline function _reset_dqdt_all!(sys::Tuple)
+    ps = first(sys)
+    _reset_dqdt_pairs!(ps, getfield(ps, :pairs))
+    _reset_dqdt_all!(Base.tail(sys))
+end
+
+# ---------------------------------------------------------------------------
+# RK4 helpers
+#
+# Three new pair-level walkers, each with an _all! wrapper:
+#
+#   _rk4_advance_pairs!  q = q0 + coeff*dqdt   (stage setup for stages 2-4)
+#   _acc_dqdt_pairs!     acc += weight*dqdt     (accumulate ki after each sweep)
+#   _apply_acc_pairs!    q = q0 + dt*acc        (final RK4 update)
+#
+# acc buffers are typed tuples parallel to q0 buffers, allocated via
+# _make_acc_bufs and zeroed at the start of each timestep via _zero_acc_all!.
+# ---------------------------------------------------------------------------
+
+# Allocate zeroed accumulator buffers (one per dqdt field, same shape as dqdt).
+_make_acc_bufs(ps, ::Tuple{}) = ()
+@inline function _make_acc_bufs(ps, pairs::Tuple)
+    _, dqdt_val = first(pairs)
+    dqdt_arr = _getf(ps, dqdt_val)
+    buf = fill!(similar(dqdt_arr), zero(eltype(dqdt_arr)))
+    (buf, _make_acc_bufs(ps, Base.tail(pairs))...)
+end
+@inline _make_acc_bufs(ps::AbstractParticleSystem) = _make_acc_bufs(ps, getfield(ps, :pairs))
+
+# Zero all accumulator buffers for one system.
+_zero_acc_pairs!(::Tuple{}) = nothing
+@inline function _zero_acc_pairs!(accs::Tuple)
+    acc = first(accs)
+    fill!(acc, zero(eltype(acc)))
+    _zero_acc_pairs!(Base.tail(accs))
+end
+
+# Zero accumulators for every system.
+_zero_acc_all!(::Tuple{}, ::Tuple{}) = nothing
+@inline function _zero_acc_all!(sys::Tuple, accs::Tuple)
+    _zero_acc_pairs!(first(accs))
+    _zero_acc_all!(Base.tail(sys), Base.tail(accs))
+end
+
+# q = q0 + coeff * dqdt  (advance q from q0 using the previous stage's dqdt).
+_rk4_advance_pairs!(ps, ::Tuple{}, ::Tuple{}, coeff) = nothing
+@inline function _rk4_advance_pairs!(ps, pairs::Tuple, q0s::Tuple, coeff)
+    q_val, dqdt_val = first(pairs)
+    _axpy_oop!(_getf(ps, q_val), first(q0s), _getf(ps, dqdt_val), coeff)
+    _rk4_advance_pairs!(ps, Base.tail(pairs), Base.tail(q0s), coeff)
+end
+
+_rk4_advance_all!(::Tuple{}, ::Tuple{}, coeff, to, labels, idx) = nothing
+@inline function _rk4_advance_all!(sys::Tuple, q0s::Tuple, coeff, to, labels, idx)
+    ps = first(sys)
+    @timeit to labels[idx].mid @timeit to labels[idx].name begin
+        _rk4_advance_pairs!(ps, getfield(ps, :pairs), first(q0s), coeff)
+        _reset_dqdt_pairs!(ps, getfield(ps, :pairs))
+    end
+    _rk4_advance_all!(Base.tail(sys), Base.tail(q0s), coeff, to, labels, idx + 1)
+end
+
+# acc += weight * dqdt
+_acc_dqdt_pairs!(ps, ::Tuple{}, ::Tuple{}, weight) = nothing
+@inline function _acc_dqdt_pairs!(ps, pairs::Tuple, accs::Tuple, weight)
+    _, dqdt_val = first(pairs)
+    _axpy_ip!(first(accs), _getf(ps, dqdt_val), weight)
+    _acc_dqdt_pairs!(ps, Base.tail(pairs), Base.tail(accs), weight)
+end
+
+_acc_dqdt_all!(::Tuple{}, ::Tuple{}, weight) = nothing
+@inline function _acc_dqdt_all!(sys::Tuple, accs::Tuple, weight)
+    ps = first(sys)
+    _acc_dqdt_pairs!(ps, getfield(ps, :pairs), first(accs), weight)
+    _acc_dqdt_all!(Base.tail(sys), Base.tail(accs), weight)
+end
+
+# q = q0 + dt * acc  (final RK4 update; structurally identical to _fullstep_pairs!)
+_apply_acc_pairs!(ps, ::Tuple{}, ::Tuple{}, ::Tuple{}, dt) = nothing
+@inline function _apply_acc_pairs!(ps, pairs::Tuple, q0s::Tuple, accs::Tuple, dt)
+    q_val, _ = first(pairs)
+    _axpy_oop!(_getf(ps, q_val), first(q0s), first(accs), dt)
+    _apply_acc_pairs!(ps, Base.tail(pairs), Base.tail(q0s), Base.tail(accs), dt)
+end
+
+_apply_acc_all!(::Tuple{}, ::Tuple{}, ::Tuple{}, dt, to, labels, idx) = nothing
+@inline function _apply_acc_all!(sys::Tuple, q0s::Tuple, accs::Tuple, dt, to, labels, idx)
+    ps = first(sys)
+    @timeit to labels[idx].full @timeit to labels[idx].name _apply_acc_pairs!(ps, getfield(ps, :pairs), first(q0s), first(accs), dt)
+    _apply_acc_all!(Base.tail(sys), Base.tail(q0s), Base.tail(accs), dt, to, labels, idx + 1)
+end
+
+# ---------------------------------------------------------------------------
+# Shared per-step helpers (used by both LeapFrog and RK4)
+# ---------------------------------------------------------------------------
+
+# XSPH velocity correction: subtract the accumulated v_adjustment, re-run the
+# XSPH sweep via adjust_v!, then add the freshly computed adjustment back.
+function _xsph_correction!(sys, ints, to, ps_labels, inter_labels)
+    for (i, ps) in enumerate(sys)
+        @timeit to ps_labels[i].v_adjust @timeit to ps_labels[i].name _axpy_ip!(ps.v, ps.v_adjustment, -1)
+    end
+    for (i, ps) in enumerate(sys)
+        @timeit to ps_labels[i].v_adjust @timeit to ps_labels[i].name _zero_field(ps, :v_adjustment)
+    end
+    for (i, inter) in enumerate(ints)
+        @timeit to inter_labels[i].v_adjust @timeit to inter_labels[i].name adjust_v!(inter)
+    end
+    for (i, ps) in enumerate(sys)
+        @timeit to ps_labels[i].v_adjust @timeit to ps_labels[i].name _axpy_ip!(ps.v, ps.v_adjustment, 1)
+    end
+end
+
+# Print a per-system summary at the requested interval.
+function _maybe_print!(sys, to, global_step, print_interval_step, dt)
+    if global_step % print_interval_step == 0
+        @timeit to "print summary" begin
+            sim_time = global_step * dt
+            println("\nStep $global_step (t = $(@sprintf("%.6g", sim_time)))")
+            for ps in sys
+                print_summary(ps)
+            end
+        end
+    end
+end
+
+# Write an HDF5 snapshot at the requested interval.
+function _maybe_save!(sys, ghosts, to, global_step, save_interval_step, output_prefix, width)
+    if output_prefix !== nothing && global_step % save_interval_step == 0
+        @timeit to "save h5" begin
+            path = "$(output_prefix)_$(lpad(global_step, width, '0')).h5"
+            d    = dirname(path)
+            !isempty(d) && mkpath(d)
+            h5open(path, "w") do f
+                for ps in sys
+                    write_h5(ps, create_group(f, ps.name))
+                end
+                for ge in ghosts
+                    write_h5(ge.ghost, create_group(f, ge.ghost.name))
+                end
+            end
+        end
+    end
 end
 
 # ---------------------------------------------------------------------------
@@ -340,50 +532,178 @@ function time_integrate!(
         # ---- 9. Full-step: update q = q0 + dt·dqdt -----------------------
         _fullstep_q_all!(sys, q0_bufs, dt, to, ps_labels, 1)
 
-        # ---- 10. Velocity adjustment Sweep 2 --------------------------------
-        for (i, ps) in enumerate(sys)
-            @timeit to ps_labels[i].v_adjust @timeit to ps_labels[i].name _axpy_ip!(ps.v, ps.v_adjustment, -1)
-        end
-        for (i, ps) in enumerate(sys)
-            @timeit to ps_labels[i].v_adjust @timeit to ps_labels[i].name _zero_field(ps, :v_adjustment)
-        end
-        for (i, inter) in enumerate(ints)
-            @timeit to inter_labels[i].v_adjust @timeit to inter_labels[i].name adjust_v!(inter)
-        end
-        for (i, ps) in enumerate(sys)
-            @timeit to ps_labels[i].v_adjust @timeit to ps_labels[i].name _axpy_ip!(ps.v, ps.v_adjustment, 1)
-        end
+        # ---- 10. XSPH velocity correction ----------------------------------
+        _xsph_correction!(sys, ints, to, ps_labels, inter_labels)
 
         # ---- 11. Update positions: x += dt·v -------------------------------
         _update_positions_all!(sys, dt, to, ps_labels, 1)
 
         # ---- 12. Print -----------------------------------------------------
-        if global_step % print_interval_step == 0
-            @timeit to "print summary" begin
-                sim_time = global_step * dt
-                println("\nStep $global_step (t = $(@sprintf("%.6g", sim_time)))")
-                for ps in sys
-                    print_summary(ps)
-                end
-            end
-        end
+        _maybe_print!(sys, to, global_step, print_interval_step, dt)
 
         # ---- 13. Save ------------------------------------------------------
-        if output_prefix !== nothing && global_step % save_interval_step == 0
-            @timeit to "save h5" begin
-                path = "$(output_prefix)_$(lpad(global_step, width, '0')).h5"
-                d    = dirname(path)
-                !isempty(d) && mkpath(d)
-                h5open(path, "w") do f
-                    for ps in sys
-                        write_h5(ps, create_group(f, ps.name))
+        _maybe_save!(sys, integrator.ghosts, to, global_step, save_interval_step, output_prefix, width)
+    end
+
+    print_timer && show(to; allocations=true, compact=false)
+    return to
+end
+
+# ---------------------------------------------------------------------------
+# RK4 time_integrate!
+# ---------------------------------------------------------------------------
+
+"""
+    time_integrate!(integrator::RK4TimeIntegrator, ...)
+
+RK4 variant.  Signature identical to the LeapFrog version.
+
+The neighbour grid is built once per timestep (frozen Lagrangian).
+The four RK stages share the same grid; intermediate states are formed by
+advancing q from q0 using the previous stage's dqdt.
+"""
+function time_integrate!(
+    integrator::RK4TimeIntegrator,
+    num_timesteps::Int,
+    print_interval_step::Int,
+    save_interval_step::Int,
+    CFL::Real,
+    output_prefix;
+    step_offset::Int  = 0,
+    print_timer::Bool = true,
+    to::TimerOutput   = TimerOutput(),
+)
+    sys  = integrator.systems
+    ints = integrator.interactions
+    T    = typeof(integrator.c)
+    dt   = T(CFL) * integrator.h / integrator.c
+
+    num_stages = length(integrator.interactions[1].pfns)
+    @assert all(length(inter.pfns) == num_stages for inter in integrator.interactions) "All interactions must have the same number of stages (pfns length), got: $(map(inter -> length(inter.pfns), integrator.interactions))"
+    for ps in sys
+        n_upd = length(ps.state_updater)
+        if n_upd != num_stages
+            @warn "ParticleSystem \"$(ps.name)\" has $n_upd state updater(s) but num_stages=$num_stages; stages $(n_upd + 1) and later will skip the state update"
+        end
+    end
+
+    # RK4 stage coefficients (typed to T to avoid conversions in the loop).
+    # advance[s]: multiply dt by this to get the intermediate state from q0.
+    # weight[s]:  accumulation weight for the weighted sum.
+    rk4_advance = (T(0),   T(0.5), T(0.5), T(1.0))
+    rk4_weight  = (T(1/6), T(1/3), T(1/3), T(1/6))
+
+    q0_bufs  = map(_make_q0_bufs,  sys)
+    acc_bufs = map(_make_acc_bufs, sys)
+
+    sort_cutoff      = T(2) * integrator.h
+    sort_nd          = first(sys).ndims
+    sort_perm_buf    = Vector{Int}(undef, maximum(ps.n for ps in sys))
+    sort_key_buf     = Vector{SVector{sort_nd,Int}}(undef, maximum(ps.n for ps in sys))
+    sys_scratches    = map(_make_sort_scratch, sys)
+    ghost_scratches  = [_make_empty_sort_scratch(ge.ghost) for ge in integrator.ghosts]
+
+    ps_labels = [(name=ps.name,
+                  sort="sort",
+                  mid="rk stage",
+                  full="rk apply",
+                  pos="update pos",
+                  upd="state update",
+                  v_adjust="vel adjust") for ps in sys]
+
+    inter_labels = []
+    for inter in ints
+        ps_a  = inter.system_a
+        label = is_coupled(inter) ? "$(ps_a.name)×$(inter.system_b.name)" : ps_a.name
+        push!(inter_labels, (name=label, grid="grid", sweep="sweep", v_adjust="vel adjust"))
+    end
+
+    ghost_labels = [(name=ge.ghost.name,
+                     gen="ghost gen",
+                     sort="ghost sort",
+                     kin="ghost kinematics",
+                     stage="ghost stage") for ge in integrator.ghosts]
+
+    width = ndigits(step_offset + num_timesteps)
+
+    for itimestep in 1:num_timesteps
+        global_step = step_offset + itimestep
+
+        # ---- 1. Sort real particle systems by cell index -------------------
+        @timeit to "sort" _sort_all_systems!(sys, sys_scratches, sort_cutoff, sort_perm_buf, sort_key_buf, to, ps_labels, 1)
+
+        # ---- 2. Save q0 and zero accumulators ------------------------------
+        @timeit to "save q0" _save_q0_all!(sys, q0_bufs)
+        _zero_acc_all!(sys, acc_bufs)
+
+        # ---- 3. Generate ghosts (positions only) ---------------------------
+        for (i, ge) in enumerate(integrator.ghosts)
+            @timeit to ghost_labels[i].gen @timeit to ghost_labels[i].name generate_ghosts!(ge)
+        end
+
+        # ---- 4. Sort ghost systems -----------------------------------------
+        for (i, ge) in enumerate(integrator.ghosts)
+            @timeit to ghost_labels[i].sort @timeit to ghost_labels[i].name sort_particles!(
+                ge.ghost, sort_cutoff, sort_perm_buf, sort_key_buf, ghost_scratches[i])
+        end
+
+        # ---- 5. Create grids -----------------------------------------------
+        for (i, inter) in enumerate(ints)
+            @timeit to inter_labels[i].grid @timeit to inter_labels[i].name create_grid!(inter)
+        end
+
+        # ---- 6-8. Four RK stages -------------------------------------------
+        for rk_iter in 1:4
+            rk_label = "rk$rk_iter"
+
+            # ---- 6. Advance q from q0 (stages 2-4); always reset dqdt ------
+            # Stage 1: q is already q0; just reset dqdt to source.
+            # Stages 2-4: q = q0 + advance_coeff*dt * dqdt, then reset dqdt.
+            if rk_iter == 1
+                @timeit to "rk stage" @timeit to rk_label _reset_dqdt_all!(sys)
+            else
+                _rk4_advance_all!(sys, q0_bufs, rk4_advance[rk_iter] * dt, to, ps_labels, 1)
+            end
+
+            # ---- 7. Update ghost kinematics --------------------------------
+            for (i, ge) in enumerate(integrator.ghosts)
+                @timeit to ghost_labels[i].kin @timeit to ghost_labels[i].name update_ghost_kinematics!(ge)
+            end
+
+            # ---- 8. State updates then sweeps (all updates before any sweep)
+            @timeit to "sweep" @timeit to rk_label begin
+                for stage in 1:num_stages
+                    for (i, ps) in enumerate(sys)
+                        length(ps.state_updater) == num_stages || continue
+                        @timeit to ps_labels[i].upd @timeit to ps_labels[i].name update_state!(ps, stage)
                     end
-                    for ge in integrator.ghosts
-                        write_h5(ge.ghost, create_group(f, ge.ghost.name))
+                    for (i, ge) in enumerate(integrator.ghosts)
+                        @timeit to ghost_labels[i].stage @timeit to ghost_labels[i].name update_ghost!(ge, stage)
+                    end
+                    for (i, inter) in enumerate(ints)
+                        @timeit to inter_labels[i].sweep @timeit to inter_labels[i].name sweep!(inter, stage)
                     end
                 end
             end
+
+            # Accumulate weighted dqdt into acc_bufs.
+            _acc_dqdt_all!(sys, acc_bufs, rk4_weight[rk_iter])
         end
+
+        # ---- 9. Apply accumulated RK4 update: q = q0 + dt * acc -----------
+        _apply_acc_all!(sys, q0_bufs, acc_bufs, dt, to, ps_labels, 1)
+
+        # ---- 10. XSPH velocity correction -----------------------------------
+        _xsph_correction!(sys, ints, to, ps_labels, inter_labels)
+
+        # ---- 11. Update positions: x += dt·v --------------------------------
+        _update_positions_all!(sys, dt, to, ps_labels, 1)
+
+        # ---- 12. Print -------------------------------------------------------
+        _maybe_print!(sys, to, global_step, print_interval_step, dt)
+
+        # ---- 13. Save --------------------------------------------------------
+        _maybe_save!(sys, integrator.ghosts, to, global_step, save_interval_step, output_prefix, width)
     end
 
     print_timer && show(to; allocations=true, compact=false)
@@ -429,7 +749,7 @@ end
     run_driver!(integrator, num_timesteps, print_interval_step,
                 save_interval_step, CFL, output_prefix; interactive=true)
 
-High-level simulation driver wrapping `LeapFrogTimeIntegrator`.
+High-level simulation driver wrapping any `AbstractTimeIntegrator`.
 
 ## Interactive mode (`interactive=true`, default)
 
@@ -456,7 +776,7 @@ Files are always numbered by the *global* step counter, so they are
 contiguous across multiple interactive batches.
 """
 function run_driver!(
-    integrator::LeapFrogTimeIntegrator,
+    integrator::AbstractTimeIntegrator,
     num_timesteps::Int,
     print_interval_step::Int,
     save_interval_step::Int,
