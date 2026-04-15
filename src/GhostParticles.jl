@@ -125,7 +125,7 @@ function GhostParticleSystem(
     name::Union{Nothing,AbstractString} = nothing,
 ) where {T,ND}
     n      = ps.n
-    gname  = name === nothing ? "ghost[$(ps.name)]" : String(name)
+    gname  = name === nothing ? "ghost($(ps.name))" : String(name)
     fields = _all_extras_fields(updaters)
     extras = _build_extras(ps, fields)
     GhostParticleSystem{T, ND, typeof(ps), typeof(extras), typeof(updaters)}(
