@@ -126,21 +126,29 @@ end
 end
 
 """
-    FluidPfn{S, T}
+    FluidPfn{S, D, E, T}
 
 Pairwise functor for weakly-compressible SPH fluid interaction.
+
+`D` is `Nothing` (no density diffusion) or `T` (δ-SPH density diffusion with
+that coefficient). Pass `delta=<value>` to the constructor to enable it.
 """
-struct FluidPfn{S, T<:AbstractFloat}
+struct FluidPfn{S, D, E, T<:AbstractFloat}
     art_visc_alpha::T
     art_visc_beta::T
     h::T
+    delta::D
+    epsilon::E
 end
-function FluidPfn(alpha, beta, h; sigma=2)
+function FluidPfn(alpha, beta, h; sigma=2, delta=nothing, epsilon=nothing)
     a, b, c = promote(float(alpha), float(beta), float(h))
-    FluidPfn{sigma, typeof(a)}(a, b, c)
+    T = typeof(a)
+    d = delta === nothing ? nothing : T(delta)
+    e = epsilon === nothing ? nothing : T(epsilon)
+    FluidPfn{sigma, typeof(d), typeof(e), T}(a, b, c, d, e)
 end
 
-@inline @Base.propagate_inbounds function (f::FluidPfn{S,T})(ps::AbstractParticleSystem{T,ND}, i::Int, j::Int, dx::SVector{ND,T}, gx::SVector{ND,T}, w::T) where {S,ND,T}
+@inline @Base.propagate_inbounds function (f::FluidPfn{S,D,E,T})(ps::AbstractParticleSystem{T,ND}, i::Int, j::Int, dx::SVector{ND,T}, gx::SVector{ND,T}, w::T) where {S,D,E,ND,T}
     vi, vj       = ps.v[i], ps.v[j]
     rho_i, rho_j = ps.rho[i], ps.rho[j]
     p_i, p_j     = ps.p[i], ps.p[j]
@@ -154,12 +162,13 @@ end
     ps.dvdt[i] += dv_tmp
     ps.dvdt[j] -= dv_tmp
 
-    dr = continuity_rate(dv, gx)
-    ps.drhodt[i] += mass * dr * continuity_density_coeff(rho_i, rho_j, Val(S))
-    ps.drhodt[j] += mass * dr * continuity_density_coeff(rho_j, rho_i, Val(S))
+    dr  = continuity_rate(dv, gx)
+    psi = diffusion_density(dx, rho_i, rho_j, ps.c, ps.c, f.h, f.h, gx, f.delta)
+    ps.drhodt[i] += mass * (dr * continuity_density_coeff(rho_i, rho_j, Val(S)) + psi / rho_j)
+    ps.drhodt[j] += mass * (dr * continuity_density_coeff(rho_j, rho_i, Val(S)) - psi / rho_i)
 end
 
-@inline @Base.propagate_inbounds function (f::FluidPfn{S,T})(ps_a::FluidParticleSystem{T,ND}, ps_b::FluidParticleSystem{T,ND}, i::Int, j::Int, dx::SVector{ND,T}, gx::SVector{ND,T}, w::T) where {S,ND,T<:AbstractFloat}
+@inline @Base.propagate_inbounds function (f::FluidPfn{S,D,E,T})(ps_a::FluidParticleSystem{T,ND}, ps_b::FluidParticleSystem{T,ND}, i::Int, j::Int, dx::SVector{ND,T}, gx::SVector{ND,T}, w::T) where {S,D,E,ND,T<:AbstractFloat}
     vi, vj       = ps_a.v[i], ps_b.v[j]
     rho_i, rho_j = ps_a.rho[i], ps_b.rho[j]
     p_i, p_j     = ps_a.p[i], ps_b.p[j]
@@ -168,18 +177,20 @@ end
 
     piv    = artificial_viscosity(dx, dv, f.h, rho_i, rho_j, f.art_visc_alpha, f.art_visc_beta, ps_a.c, ps_b.c)
     dh     = pressure_force_coeff(p_i, p_j, rho_i, rho_j, Val(S))
-    dv_tmp = (dh - piv) * gx
+    ast    = artificial_surface_tension_coeff(f.epsilon, p_i, p_j, rho_i, rho_j)
+    dv_tmp = (dh + ast - piv) * gx
 
     ps_a.dvdt[i] += mass_j*dv_tmp
     ps_b.dvdt[j] -= mass_i*dv_tmp
 
-    dr = continuity_rate(dv, gx)
-    ps_a.drhodt[i] += mass_j * dr * continuity_density_coeff(rho_i, rho_j, Val(S))
-    ps_b.drhodt[j] += mass_i * dr * continuity_density_coeff(rho_j, rho_i, Val(S))
+    dr  = continuity_rate(dv, gx)
+    psi = diffusion_density(dx, rho_i, rho_j, ps_a.c, ps_b.c, f.h, f.h, gx, f.delta)
+    ps_a.drhodt[i] += mass_j * (dr * continuity_density_coeff(rho_i, rho_j, Val(S)) + psi / rho_j)
+    ps_b.drhodt[j] += mass_i * (dr * continuity_density_coeff(rho_j, rho_i, Val(S)) - psi / rho_i)
 end
 
 # Coupled generic (one-sided, pressure-based) — covers ghosts
-@inline @Base.propagate_inbounds function (f::FluidPfn{S,T})(ps_a::AbstractParticleSystem{T,ND}, ps_b::AbstractParticleSystem{T,ND}, i::Int, j::Int, dx::SVector{ND,T}, gx::SVector{ND,T}, w::T) where {S,ND,T<:AbstractFloat}
+@inline @Base.propagate_inbounds function (f::FluidPfn{S,D,E,T})(ps_a::AbstractParticleSystem{T,ND}, ps_b::AbstractParticleSystem{T,ND}, i::Int, j::Int, dx::SVector{ND,T}, gx::SVector{ND,T}, w::T) where {S,D,E,ND,T<:AbstractFloat}
     vi, vj       = ps_a.v[i], ps_b.v[j]
     rho_i, rho_j = ps_a.rho[i], ps_b.rho[j]
     p_i, p_j     = ps_a.p[i], ps_b.p[j]
@@ -190,12 +201,13 @@ end
     dh  = pressure_force_coeff(p_i, p_j, rho_i, rho_j, Val(S))
     ps_a.dvdt[i] += mass_j * (dh - piv) * gx
 
-    dr = continuity_rate(dv, gx)
-    ps_a.drhodt[i] += mass_j * dr * continuity_density_coeff(rho_i, rho_j, Val(S))
+    dr  = continuity_rate(dv, gx)
+    psi = diffusion_density(dx, rho_i, rho_j, ps_a.c, ps_a.c, f.h, f.h, gx, f.delta)
+    ps_a.drhodt[i] += mass_j * (dr * continuity_density_coeff(rho_i, rho_j, Val(S)) + psi / rho_j)
 end
 
 # Coupled static boundary (LJ + artificial viscosity)
-@inline @Base.propagate_inbounds function (f::FluidPfn{S,T})(ps_a::AbstractParticleSystem{T,ND}, ps_b::StaticBoundarySystem{T,ND}, i::Int, j::Int, dx::SVector{ND,T}, gx::SVector{ND,T}, w::T) where {S,ND,T<:AbstractFloat}
+@inline @Base.propagate_inbounds function (f::FluidPfn{S,D,E,T})(ps_a::AbstractParticleSystem{T,ND}, ps_b::StaticBoundarySystem{T,ND}, i::Int, j::Int, dx::SVector{ND,T}, gx::SVector{ND,T}, w::T) where {S,D,E,ND,T<:AbstractFloat}
     vi, vj       = ps_a.v[i], ps_b.v[j]
     rho_i, rho_j = ps_a.rho[i], ps_b.rho[j]
     mass_j       = ps_b.mass
@@ -207,7 +219,7 @@ end
 end
 
 # Coupled dynamic boundary (derives velocity, pressure-based)
-@inline @Base.propagate_inbounds function (f::FluidPfn{S,T})(ps_a::AbstractParticleSystem{T,ND}, ps_b::DynamicBoundarySystem{T,ND}, i::Int, j::Int, dx::SVector{ND,T}, gx::SVector{ND,T}, w::T) where {S,ND,T<:AbstractFloat}
+@inline @Base.propagate_inbounds function (f::FluidPfn{S,D,E,T})(ps_a::AbstractParticleSystem{T,ND}, ps_b::DynamicBoundarySystem{T,ND}, i::Int, j::Int, dx::SVector{ND,T}, gx::SVector{ND,T}, w::T) where {S,D,E,ND,T<:AbstractFloat}
     da = dot(ps_a.x[i] - ps_b.boundary_point, ps_b.boundary_normal)
     db = dot(ps_b.x[j] - ps_b.boundary_point, ps_b.boundary_normal)
 
@@ -224,26 +236,33 @@ end
     dh  = pressure_force_coeff(p_i, p_j, rho_i, rho_j, Val(S))
     ps_a.dvdt[i] += mass * (dh - piv) * gx
 
-    dr = continuity_rate(dv, gx)
-    ps_a.drhodt[i] += mass * dr * continuity_density_coeff(rho_i, rho_j, Val(S))
+    dr  = continuity_rate(dv, gx)
+    psi = diffusion_density(dx, rho_i, rho_j, ps_a.c, ps_a.c, f.h, f.h, gx, f.delta)
+    ps_a.drhodt[i] += mass * (dr * continuity_density_coeff(rho_i, rho_j, Val(S)) + psi / rho_j)
 end
 
 """
-    CauchyFluidPfn{T}
+    CauchyFluidPfn{D, T}
 
 Pairwise functor for SPH fluid self-interaction driven by a Cauchy stress tensor.
+
+`D` is `Nothing` (no density diffusion) or `T` (δ-SPH density diffusion with
+that coefficient). Pass `delta=<value>` to the constructor to enable it.
 """
-struct CauchyFluidPfn{T<:AbstractFloat}
+struct CauchyFluidPfn{D, T<:AbstractFloat}
     art_visc_alpha::T
     art_visc_beta::T
     h::T
+    delta::D
 end
-function CauchyFluidPfn(alpha, beta, h)
+function CauchyFluidPfn(alpha, beta, h; delta=nothing)
     a, b, c = promote(float(alpha), float(beta), float(h))
-    CauchyFluidPfn{typeof(a)}(a, b, c)
+    T = typeof(a)
+    d = delta === nothing ? nothing : T(delta)
+    CauchyFluidPfn{typeof(d), T}(a, b, c, d)
 end
 
-@inline @Base.propagate_inbounds function (f::CauchyFluidPfn{T})(ps::AbstractParticleSystem{T,ND}, i::Int, j::Int, dx::SVector{ND,T}, gx::SVector{ND,T}, w::T) where {ND,T<:AbstractFloat}
+@inline @Base.propagate_inbounds function (f::CauchyFluidPfn{D,T})(ps::AbstractParticleSystem{T,ND}, i::Int, j::Int, dx::SVector{ND,T}, gx::SVector{ND,T}, w::T) where {D,ND,T<:AbstractFloat}
     vi, vj             = ps.v[i], ps.v[j]
     rho_i, rho_j       = ps.rho[i], ps.rho[j]
     stress_i, stress_j = ps.stress[i], ps.stress[j]
@@ -257,14 +276,14 @@ end
     ps.dvdt[i] += dv_tmp
     ps.dvdt[j] -= dv_tmp
 
-    psi = diffusion_density(dx, rho_i, rho_j, ps.c, ps.c, f.h, f.h, gx)
-    dr = continuity_rate(dv, gx)
-    ps.drhodt[i] += mass * (dr + psi/rho_j)
-    ps.drhodt[j] += mass * (dr - psi/rho_i)
+    dr  = continuity_rate(dv, gx)
+    psi = diffusion_density(dx, rho_i, rho_j, ps.c, ps.c, f.h, f.h, gx, f.delta)
+    ps.drhodt[i] += mass * (dr + psi / rho_j)
+    ps.drhodt[j] += mass * (dr - psi / rho_i)
 end
 
 # Coupled generic (one-sided, stress-based) — covers ghosts
-@inline @Base.propagate_inbounds function (f::CauchyFluidPfn{T})(ps_a::AbstractParticleSystem{T,ND}, ps_b::AbstractParticleSystem{T,ND}, i::Int, j::Int, dx::SVector{ND,T}, gx::SVector{ND,T}, w::T) where {ND,T<:AbstractFloat}
+@inline @Base.propagate_inbounds function (f::CauchyFluidPfn{D,T})(ps_a::AbstractParticleSystem{T,ND}, ps_b::AbstractParticleSystem{T,ND}, i::Int, j::Int, dx::SVector{ND,T}, gx::SVector{ND,T}, w::T) where {D,ND,T<:AbstractFloat}
     vi, vj             = ps_a.v[i], ps_b.v[j]
     rho_i, rho_j       = ps_a.rho[i], ps_b.rho[j]
     stress_i, stress_j = ps_a.stress[i], ps_b.stress[j]
@@ -275,13 +294,13 @@ end
     h_vec = cauchy_stress_force(stress_i, stress_j, rho_i, rho_j, gx)
     ps_a.dvdt[i] += mass_j * (h_vec - piv * gx)
 
-    psi = diffusion_density(dx, rho_i, rho_j, ps_a.c, ps_a.c, f.h, f.h, gx)
     dr  = continuity_rate(dv, gx)
+    psi = diffusion_density(dx, rho_i, rho_j, ps_a.c, ps_a.c, f.h, f.h, gx, f.delta)
     ps_a.drhodt[i] += mass_j * (dr + psi / rho_j)
 end
 
 # Coupled static boundary (LJ + artificial viscosity)
-@inline @Base.propagate_inbounds function (f::CauchyFluidPfn{T})(ps_a::AbstractParticleSystem{T,ND}, ps_b::StaticBoundarySystem{T,ND}, i::Int, j::Int, dx::SVector{ND,T}, gx::SVector{ND,T}, w::T) where {ND,T<:AbstractFloat}
+@inline @Base.propagate_inbounds function (f::CauchyFluidPfn{D,T})(ps_a::AbstractParticleSystem{T,ND}, ps_b::StaticBoundarySystem{T,ND}, i::Int, j::Int, dx::SVector{ND,T}, gx::SVector{ND,T}, w::T) where {D,ND,T<:AbstractFloat}
     vi, vj       = ps_a.v[i], ps_b.v[j]
     rho_i, rho_j = ps_a.rho[i], ps_b.rho[j]
     mass_j       = ps_b.mass
@@ -293,7 +312,7 @@ end
 end
 
 # Coupled dynamic boundary (derives velocity, stress-based)
-@inline @Base.propagate_inbounds function (f::CauchyFluidPfn{T})(ps_a::AbstractParticleSystem{T,ND}, ps_b::DynamicBoundarySystem{T,ND}, i::Int, j::Int, dx::SVector{ND,T}, gx::SVector{ND,T}, w::T) where {ND,T<:AbstractFloat}
+@inline @Base.propagate_inbounds function (f::CauchyFluidPfn{D,T})(ps_a::AbstractParticleSystem{T,ND}, ps_b::DynamicBoundarySystem{T,ND}, i::Int, j::Int, dx::SVector{ND,T}, gx::SVector{ND,T}, w::T) where {D,ND,T<:AbstractFloat}
     da = dot(ps_a.x[i] - ps_b.boundary_point, ps_b.boundary_normal)
     db = dot(ps_b.x[j] - ps_b.boundary_point, ps_b.boundary_normal)
 
@@ -311,8 +330,8 @@ end
     dv_tmp = mass * (h_vec - piv * gx)
     ps_a.dvdt[i] += dv_tmp
 
-    psi = diffusion_density(dx, rho_i, rho_j, ps_a.c, ps_a.c, f.h, f.h, gx)
     dr  = continuity_rate(dv, gx)
+    psi = diffusion_density(dx, rho_i, rho_j, ps_a.c, ps_a.c, f.h, f.h, gx, f.delta)
     ps_a.drhodt[i] += mass * (dr + psi / rho_j)
 end
 

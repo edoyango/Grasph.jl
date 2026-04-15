@@ -1,6 +1,6 @@
 export artificial_viscosity, pressure_force_coeff, continuity_rate, lennard_jones,
-       strain_rate_tensor, vorticity_tensor, cauchy_stress_force, diffusion_density, 
-       xsph_veladjust
+       strain_rate_tensor, vorticity_tensor, cauchy_stress_force, diffusion_density,
+       xsph_veladjust, interface_sharpness_coeff, artificial_surface_tension_coeff
 
 using StaticArrays
 using LinearAlgebra
@@ -230,17 +230,21 @@ diffusion flux `psi`. Apply as:
     drhodt[i] += mass_j / rho_j * psi
     drhodt[j] -= mass_i / rho_i * psi
 """
-@inline function diffusion_density(dx::SVector{ND,T}, rho_i::T, rho_j::T, c::T, h::T, gx::SVector{ND,T}, delta::T=0.1) where {ND,T<:AbstractFloat}
+@inline function diffusion_density(dx::SVector{ND,T}, rho_i::T, rho_j::T, c::T, h::T, gx::SVector{ND,T}, delta::T=T(0.1)) where {ND,T<:AbstractFloat}
     rr  = dot(dx, dx)
-    return T(2) * T(delta) * c * h * (rho_i - rho_j) * dot(dx, gx) / rr
+    return T(2) * delta * c * h * (rho_i - rho_j) * dot(dx, gx) / rr
 end
 
-@inline function diffusion_density(dx::SVector{ND,T}, rho_i::T, rho_j::T, c_i::T, c_j::T, h_i::T, h_j::T, gx::SVector{ND,T}, delta::T=0.1) where {ND,T<:AbstractFloat}
+@inline function diffusion_density(dx::SVector{ND,T}, rho_i::T, rho_j::T, c_i::T, c_j::T, h_i::T, h_j::T, gx::SVector{ND,T}, delta::T=T(0.1)) where {ND,T<:AbstractFloat}
     rr = dot(dx, dx)
     c  = T(0.5) * (c_i + c_j)
     h  = T(0.5) * (h_i + h_j)
-    return T(2) * T(delta) * c * h * (rho_i - rho_j) * dot(dx, gx) / rr
+    return T(2) * delta * c * h * (rho_i - rho_j) * dot(dx, gx) / rr
 end
+
+# Nothing dispatch — compiles away entirely (returns typed zero, no computation).
+@inline diffusion_density(dx, rho_i::T, rho_j, c, h, gx, ::Nothing) where {T} = zero(T)
+@inline diffusion_density(dx, rho_i::T, rho_j, c_i, c_j, h_i, h_j, gx, ::Nothing) where {T} = zero(T)
 
 """
     lennard_jones(dx, cutoff, c, p1) -> f
@@ -264,3 +268,23 @@ end
 @inline function xsph_veladjust(epsilon::T, dv::SVector{ND,T}, rho_i::T, rho_j::T, w::T) where {ND,T<:AbstractFloat}
     return -epsilon*dv*w/(rho_i+rho_j)
 end
+
+@inline function interface_sharpness_coeff(alpha::T, rho_i::T, rho_j::T) where {T<:AbstractFloat}
+    return alpha * (rho_i*rho_i + rho_j*rho_j)/(rho_i*rho_j)
+end
+
+"""
+    artificial_surface_tension_coeff(epsilon, p_i, p_j, rho_i, rho_j) -> T
+
+Artificial surface tension pressure coefficient (Monaghan 2000).
+
+Returns `epsilon * pressure_force_coeff(|p_i|, |p_j|, ρ_i, ρ_j, Val{1})`.
+The `Nothing` overload compiles away entirely (returns typed zero).
+
+Usage: `dvdt[i] += mass_j * (pressure_coeff + artificial_surface_tension_coeff(...)) * gx`
+"""
+@inline function artificial_surface_tension_coeff(epsilon::T, p_i::T, p_j::T, rho_i::T, rho_j::T) where {T<:AbstractFloat}
+    return epsilon * pressure_force_coeff(abs(p_i), abs(p_j), rho_i, rho_j, Val(1))
+end
+
+@inline artificial_surface_tension_coeff(::Nothing, p_i::T, p_j, rho_i, rho_j) where {T} = zero(T)

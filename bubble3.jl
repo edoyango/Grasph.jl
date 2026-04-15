@@ -1,16 +1,13 @@
-# bubble3.jl — Similar setup to bubble2.jl but with XSPH corrections.
+# bubble3.jl — Similar setup to bubble2.jl but with XSPH corrections and artificial surface tension.
 #
-# In addition to bubble2.jl, uses equation 22 and 23 and velocity update and continuity equation.
+# In addition to bubble2.jl, XSPH correction and artificial surface tension. XSPH correction follows
+# equation 22, but the artificial surface tension deviates from the paper and instead follows
+# equation 17 in Hammani et al. (2020). The description in the original work wasn't well described.
+# Another deviation was to use the Wenland C2 kernel (also in line with Hammani et al.).
 # Colagrossi, A., Landrini, M. (2003) Numerical simulation of interfacial flows by smoothed particle hydrodynamics. Journal of Computational Physics, 191, 448-475.
 # https://doi.org/10.1016/S0021-9991(03)00324-3
-#
-# This initializes a 6m x 10m column of "heavy" fluid with a bubble of lighter fluid located at 2m
-# from the bottom. The column is positions such that the bubble centre is at the origin. The bubble
-# fluid's density is half that of the heavier fluid. Both fluids use the Tait equation of state to
-# link their density to pressure. Simulation setup follows the paper, except the basic Cubic Bspline
-# kernel and Leap Frog time integartion are used instead of the modified gaussian kernel, and RK4
-# integration. Additionally, no background pressure is applied. Instead, particles' density are
-# initialized using a hydrostatic pressure condition to mitigate the initial pressure waves.
+# I. Hammani, S. Marrone, A. Colagrossi, G. Oger, D. Le Touzé, Detailed study on the extension of the δ-SPH model to multi-phase flow. Computer Methods in Applied Mechanics and Engineering, 368, 113189.
+# https://doi.org/10.1016/j.cma.2020.113189 
 #
 # Run from the Grasph.jl directory:
 #   julia --project=. bubble3.jl
@@ -26,16 +23,16 @@ const R              = 1.0               # radius of bubble
 const height         = 10.0*R            # height of fluid column
 const width          = 6.0*R             # width of fluid column
 const y_min          = -2.0*R            # puts centre of circle at origin
-const y_max          = y_min + height
-const x_min          = -3.0*R            # "                             "
-const x_max          = x_min + width
-const dx_spacing     = 0.05              # initial spacing between particles
+const y_max          = y_min + height    # maximum extent in y
+const x_min          = -3.0*R            # puts centre of circle at origin
+const x_max          = x_min + width     # maximum extent in x
+const dx_spacing     = 0.04              # initial spacing between particles
 const h_sph          = 1.2 * dx_spacing  # kernel smoothing length
 const rho_X          = 1000.0            # reference density of heavier fluid particles
-const rho_Y          = 100.0             # "                  " lighter "             "
-const g              = 9.81
+const rho_Y          = 1.0               # "                  " lighter "             "
+const g              = 9.81              # gravity
 const c_sound_X = sqrt(800.0*g*R)        # speed of sound for X particles
-const c_sound_Y = 40.0*sqrt(g*R)       # "                " Y particles - 
+const c_sound_Y = 400.0*sqrt(g*R)        # "                " Y particles - 
                                          #   chosen so that rho0*c^2/gamma (tait equation) is equal 
                                          #   in both fluix X and Y. i.e. found by solving for
                                          #   rho_X*c_sound_X^2/γ_X = rho_Y*c_sound_X^2/γ_Y
@@ -142,7 +139,7 @@ boundary_ghost_entry = GhostEntry(boundary_ghost, 3.0 * h_sph,
 # ---------------------------------------------------------------------------
 
 # initialize kernel
-kernel = CubicSplineKernel(h_sph; ndims=2)
+kernel = WenlandC2Kernel(h_sph; ndims=2)
 
 # heavy fluid particles interacting with themselves
 fluid_X_interaction = SystemInteraction(
@@ -163,7 +160,7 @@ fluid_Y_interaction = SystemInteraction(
 # bubble/heavy fluid particles interacting with eachother
 fluid_XY_interaction = SystemInteraction(
     kernel,
-    FluidPfn(art_visc_alpha, art_visc_beta, h_sph; sigma=1),
+    FluidPfn(art_visc_alpha, art_visc_beta, h_sph; sigma=1, epsilon=0.1),
     fluid_Y, # useful to make Y the first system as the iteration space is smaller
     fluid_X,
 )
@@ -180,7 +177,7 @@ fluid_boundary_interaction = SystemInteraction(
     velocity_adjust_pairwise_fn=XSPHPfn(0.5)
 )
 
-integrator = LeapFrogTimeIntegrator(
+integrator = RK4TimeIntegrator(
     # vector of particle systems involved in the simulation.
     # the boundary system could be omitted, as their positions and properties don't get
     # updated, but they're included here so their data is written and can be visualised.
@@ -195,9 +192,9 @@ integrator = LeapFrogTimeIntegrator(
 
 run_driver!(
     integrator, 
-    100000,               # run to just before bubble hits boundary.
-    500,                  # frequency to print summary stats to terminal
-    500,                  # frequency to save particle data to disk
-    0.05,                 # the CFL coefficient
+    60000,                # run to just before bubble hits boundary.
+    200,                  # frequency to print summary stats to terminal
+    200,                  # frequency to save particle data to disk
+    1.5,                 # the CFL coefficient
     "bubble3-output/sph"  # the output path prefix
 )

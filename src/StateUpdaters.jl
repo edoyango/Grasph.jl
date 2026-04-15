@@ -55,15 +55,14 @@ Construct with p0, rho0 and p_b, then pass to `state_updater` in `FluidParticleS
 """
 struct TaitEOSUpdater{T} <: EOSUpdater
     rho0::T
-    p_b::T
     gamma::T
 end
-TaitEOSUpdater(rho0::T, gamma::T = T(7), p_b::T = T(0.0)) where {T<:AbstractFloat} = TaitEOSUpdater{T}(rho0, p_b, gamma)
+TaitEOSUpdater(rho0::T; gamma::T = T(7)) where {T<:AbstractFloat} = TaitEOSUpdater{T}(rho0, gamma)
 
 @inline @Base.propagate_inbounds function (u::TaitEOSUpdater{T})(ps::AbstractParticleSystem{T}, i::Int) where {T}
     p = ps.p ; rho = ps.rho
-    rho0 = T(u.rho0) ; c = ps.c ; p_b = u.p_b ; gamma = u.gamma
-    p[i] = rho0 * c * c / gamma * ((rho[i] / rho0)^gamma - one(T)) + p_b
+    rho0 = T(u.rho0) ; c = ps.c ; gamma = u.gamma
+    p[i] = rho0 * c * c / gamma * ((rho[i] / rho0)^gamma - one(T))
 end
 
 """

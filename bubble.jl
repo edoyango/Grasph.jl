@@ -27,14 +27,14 @@ const R              = 1.0               # radius of bubble
 const height         = 10.0*R            # height of fluid column
 const width          = 6.0*R             # width of fluid column
 const y_min          = -2.0*R            # puts centre of circle at origin
-const y_max          = y_min + height
-const x_min          = -3.0*R            # "                             "
-const x_max          = x_min + width
+const y_max          = y_min + height    # maximum extent in y
+const x_min          = -3.0*R            # puts centre of circle at origin
+const x_max          = x_min + width     # maximum extent in x
 const dx_spacing     = 0.05              # initial spacing between particles
 const h_sph          = 1.2 * dx_spacing  # kernel smoothing length
 const rho_X          = 1000.0            # reference density of heavier fluid particles
 const rho_Y          = 500.0             # "                  " lighter "             "
-const g              = 9.81
+const g              = 9.81              # gravity
 const c_sound_X = sqrt(800.0*g*R)        # speed of sound for X particles
 const c_sound_Y = 40.0*sqrt(g*R)         # "                " Y particles - 
                                          #   chosen so that rho0*c^2/gamma (tait equation) is equal 
@@ -142,7 +142,7 @@ boundary_ghost_entry = GhostEntry(boundary_ghost, 3.0 * h_sph,
 # ---------------------------------------------------------------------------
 
 # initialize kernel
-kernel = CubicSplineKernel(h_sph; ndims=2)
+kernel = WenlandC2Kernel(h_sph; ndims=2)
 
 # heavy fluid particles interacting with themselves
 fluid_X_interaction = SystemInteraction(
@@ -177,7 +177,7 @@ fluid_boundary_interaction = SystemInteraction(
     boundary_ghost
 )
 
-integrator = LeapFrogTimeIntegrator(
+integrator = RK4TimeIntegrator(
     # vector of particle systems involved in the simulation.
     # the boundary system could be omitted, as their positions and properties don't get
     # updated, but they're included here so their data is written and can be visualised.
@@ -192,9 +192,9 @@ integrator = LeapFrogTimeIntegrator(
 
 run_driver!(
     integrator, 
-    150000,               # number of timesteps to run for
-    500,                  # frequency to print summary stats to terminal
-    500,                  # frequency to save particle data to disk
-    0.05,                 # the CFL coefficient
+    6000,               # number of timesteps to run for
+    50,                  # frequency to print summary stats to terminal
+    50,                  # frequency to save particle data to disk
+    1.5,                 # the CFL coefficient
     "bubble-output/sph"  # the output path prefix
 )
