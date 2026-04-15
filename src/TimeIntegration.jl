@@ -387,13 +387,14 @@ function _maybe_print!(sys, to, global_step, print_interval_step, dt)
 end
 
 # Write an HDF5 snapshot at the requested interval.
-function _maybe_save!(sys, ghosts, to, global_step, save_interval_step, output_prefix, width)
+function _maybe_save!(sys, ghosts, to, global_step, save_interval_step, output_prefix, width, dt)
     if output_prefix !== nothing && global_step % save_interval_step == 0
         @timeit to "save h5" begin
             path = "$(output_prefix)_$(lpad(global_step, width, '0')).h5"
             d    = dirname(path)
             !isempty(d) && mkpath(d)
             h5open(path, "w") do f
+                HDF5.attrs(f)["sim_time"] = Float64(global_step * dt)
                 for ps in sys
                     write_h5(ps, create_group(f, ps.name))
                 end
@@ -542,7 +543,7 @@ function time_integrate!(
         _maybe_print!(sys, to, global_step, print_interval_step, dt)
 
         # ---- 13. Save ------------------------------------------------------
-        _maybe_save!(sys, integrator.ghosts, to, global_step, save_interval_step, output_prefix, width)
+        _maybe_save!(sys, integrator.ghosts, to, global_step, save_interval_step, output_prefix, width, dt)
     end
 
     print_timer && show(to; allocations=true, compact=false)
@@ -679,7 +680,7 @@ function time_integrate!(
         _maybe_print!(sys, to, global_step, print_interval_step, dt)
 
         # ---- 13. Save --------------------------------------------------------
-        _maybe_save!(sys, integrator.ghosts, to, global_step, save_interval_step, output_prefix, width)
+        _maybe_save!(sys, integrator.ghosts, to, global_step, save_interval_step, output_prefix, width, dt)
     end
 
     print_timer && show(to; allocations=true, compact=false)
