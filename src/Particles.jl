@@ -470,6 +470,7 @@ struct VirtualParticleSystem{T<:AbstractFloat, ND, PS<:AbstractParticleSystem{T,
     source::PS
     w_sum::Vector{T}
     state_updater::UPD
+    prescribed_v::SVector{ND,T}
     function VirtualParticleSystem{T,ND,PS,UPD,ZF}(args...) where {T,ND,PS,UPD,ZF}
         ND isa Int || throw(ArgumentError("ND must be an Int, got $(typeof(ND))"))
         new{T,ND,PS,UPD,ZF}(args...)
@@ -486,21 +487,23 @@ function VirtualParticleSystem(
     dtype::Type{<:AbstractFloat} = T,
     state_updater = (),
     zero_fields::Tuple = (),
+    prescribed_v = nothing,
 ) where {T,ND}
     n = Int(n); ndims = Int(ndims)
     ndims == ND  || throw(ArgumentError("ndims=$ndims does not match source ndims=$ND"))
     n    == ps.n || throw(ArgumentError("n=$n does not match source n=$(ps.n)"))
     state_updaters = state_updater isa Tuple ? state_updater : (state_updater,)
     _check_functors_eltype(state_updaters, T, "state updater")
+    pv = prescribed_v === nothing ? zero(SVector{ND,T}) : SVector{ND,T}(prescribed_v)
     VirtualParticleSystem{T, ND, typeof(ps), typeof(state_updaters), zero_fields}(
-        String(name), ps, zeros(T, n), state_updaters,
+        String(name), ps, zeros(T, n), state_updaters, pv,
     )
 end
 
 @inline function Base.getproperty(vps::VirtualParticleSystem{T,ND,PS,UPD,ZF}, s::Symbol) where {T,ND,PS,UPD,ZF}
     s === :ndims && return ND
     s === :n     && return length(getfield(getfield(vps, :source), :x))
-    s in (:name, :source, :w_sum, :state_updater) && return getfield(vps, s)
+    s in (:name, :source, :w_sum, :state_updater, :prescribed_v) && return getfield(vps, s)
     return getproperty(getfield(vps, :source), s)
 end
 

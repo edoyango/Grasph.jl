@@ -62,15 +62,15 @@ VirtualNormUpdater(v_mult::SVector{ND,T}, fields::Symbol...) where {ND,T<:Abstra
     VirtualNormUpdater{fields, ND, T}(v_mult)
 
 @inline @Base.propagate_inbounds function (u::VirtualNormUpdater{Syms,ND,T})(ps, i::Int) where {Syms,ND,T}
-    _normalize_fields!(ps, i, ps.w_sum[i], u.v_mult, Syms)
+    _normalize_fields!(ps, i, ps.w_sum[i], u.v_mult, getfield(ps, :prescribed_v), Syms)
 end
 
-@inline _normalize_fields!(ps, i, w, v_mult, ::Tuple{}) = nothing
-@inline @Base.propagate_inbounds function _normalize_fields!(ps, i, w, v_mult, syms::Tuple)
+@inline _normalize_fields!(ps, i, w, v_mult, prescribed_v, ::Tuple{}) = nothing
+@inline @Base.propagate_inbounds function _normalize_fields!(ps, i, w, v_mult, prescribed_v, syms::Tuple)
     arr = getproperty(ps, first(syms))
     val = iszero(w) ? zero(eltype(arr)) : arr[i] / w
-    arr[i] = first(syms) === :v ? val .* v_mult : val
-    _normalize_fields!(ps, i, w, v_mult, Base.tail(syms))
+    arr[i] = first(syms) === :v ? val .* v_mult .+ prescribed_v : val
+    _normalize_fields!(ps, i, w, v_mult, prescribed_v, Base.tail(syms))
 end
 
 abstract type EOSUpdater <: StateUpdater end

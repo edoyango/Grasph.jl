@@ -352,12 +352,14 @@ _auto_zero_all_virtual!(::Tuple{}) = nothing
     _auto_zero_all_virtual!(Base.tail(vsys))
 end
 
-# Zero virtual systems' velocity then update positions (x += v·dt = no change for fixed).
+# Advance virtual particle positions by prescribed_v·dt (zero for fixed boundaries).
 _update_virtual_positions!(::Tuple{}, dt) = nothing
 @inline function _update_virtual_positions!(vsys::Tuple, dt)
     vps = first(vsys)
-    fill!(vps.v, zero(eltype(vps.v)))
-    _axpy_ip!(vps.x, vps.v, dt)
+    pv  = getfield(vps, :prescribed_v)
+    @inbounds for i in 1:vps.n
+        vps.x[i] += pv * dt
+    end
     _update_virtual_positions!(Base.tail(vsys), dt)
 end
 
