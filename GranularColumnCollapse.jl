@@ -22,14 +22,16 @@ using StaticArrays
 const dx_spacing     = 0.002             # initial spacing between particles
 const h_sph          = 1.2 * dx_spacing  # kernel smoothing length
 const rho0           = 1850.0            # initial/reference density of particles
-const c_sound        = 20.0              # speed of sound (artificial)
+const E              = 0.84e6            # Young's modulus
+const nu             = 0.3               # Poisson's ratio
+const c_sound        = sqrt(E*(1-nu)/(rho0*(1+nu)*(1-2*nu))) # speed of sound in solid
 const art_visc_alpha = 0.1               # artificial viscosity alpha coefficient
 const art_visc_beta  = 0.1               # "                  " beta coefficient
 const soil_friction_angle = 19.8*π/180.0 # soil friction angle in radians
 
 const nfx = Int(floor(0.2 / dx_spacing)) # no. of soil particles in the x direction (= 100)
 const nfy = Int(floor(0.1 / dx_spacing)) # "                          " y direction (= 50)
-const nbx = Int(floor(0.8 / dx_spacing)) # no. of boundary particles in the x direction (= 400)
+const nbx = Int(floor(0.5 / dx_spacing)) # no. of boundary particles in the x direction (= 400)
 const nby = nfy                          # "                              " y direction (= 50)
 
 # ---------------------------------------------------------------------------
@@ -102,7 +104,7 @@ kernel = CubicSplineKernel(h_sph; ndims=2)
 dynamic_bottom = DynamicBoundarySystem(bottom_boundary, SVector(0.0, 1.0), SVector(0.0, 0.0), 3.0)
 
 sr_pfn = StrainRatePfn()
-kinematics_pfn = CauchyFluidPfn(art_visc_alpha, art_visc_beta, h_sph)
+kinematics_pfn = CauchyFluidPfn(art_visc_alpha, art_visc_beta, h_sph; delta=0.1)
 
 fluid_interaction = SystemInteraction(
     kernel,                # the kernel to be used in this interaction

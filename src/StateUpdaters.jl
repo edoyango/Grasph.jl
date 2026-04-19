@@ -115,13 +115,24 @@ end
         mag_strain_rate = strain_rate[i][1]^2 + strain_rate[i][2]^2 + strain_rate[i][3]^2 + 2*(strain_rate[i][4]^2 + strain_rate[i][5]^2 + strain_rate[i][6]^2)
     end
     mag_strain_rate = max(sqrt(mag_strain_rate), eps(typeof(mag_strain_rate)))
-    stress[i] = (cohesion + pval*tan(friction_angle))*strain_rate[i]/mag_strain_rate
+    stress[i] = T(2.0)*(cohesion + pval*tan(friction_angle))*strain_rate[i]/mag_strain_rate
+    
+    # subtract pressure and then emulate stress surface apex at σ_11 = σ_22 = σ_33 = 0
     if nelem == 3
         stress[i] -= SVector(pval, pval, zT)
+        if stress[i][1] + stress[i][2] > 0.0
+            stress[i] = zero(eltype(stress))
+        end
     elseif nelem == 4
         stress[i] -= SVector(pval, pval, pval, zT)
+        if stress[i][1] + stress[i][2] + stress[i][3] > 0.0
+            stress[i] = zero(eltype(stress))
+        end
     elseif nelem == 6
         stress[i] -= SVector(pval, pval, pval, zT, zT, zT)
+        if stress[i][1] + stress[i][2] + stress[i][3] > 0.0
+            stress[i] = zero(eltype(stress))
+        end
     end
 end
 

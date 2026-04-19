@@ -243,6 +243,7 @@ struct StressParticleSystem{T<:AbstractFloat, ND, NS, PAIRS<:Tuple, UPD<:Tuple} 
     n::Int
     x::Vector{SVector{ND,T}}
     v::Vector{SVector{ND,T}}
+    v_adjustment::Vector{SVector{ND,T}}
     rho::Vector{T}
     dvdt::Vector{SVector{ND,T}}
     drhodt::Vector{T}
@@ -284,21 +285,22 @@ function StressParticleSystem(
 
     T = dtype
 
-    x           = Vector{SVector{ndims,T}}(undef, n)
-    v           = Vector{SVector{ndims,T}}(undef, n)
-    rho         = Vector{T}(undef, n)
-    dvdt        = fill(zero(SVector{ndims,T}), n)
-    drhodt      = zeros(T, n)
-    p           = zeros(T, n)
-    stress      = fill(zero(SVector{ns,T}), n)
-    strain_rate = fill(zero(SVector{ns,T}), n)
+    x            = Vector{SVector{ndims,T}}(undef, n)
+    v            = Vector{SVector{ndims,T}}(undef, n)
+    v_adjustment = fill(zero(SVector{ndims,T}), n)
+    rho          = Vector{T}(undef, n)
+    dvdt         = fill(zero(SVector{ndims,T}), n)
+    drhodt       = zeros(T, n)
+    p            = zeros(T, n)
+    stress       = fill(zero(SVector{ns,T}), n)
+    strain_rate  = fill(zero(SVector{ns,T}), n)
 
     state_updaters = state_updater isa Tuple ? state_updater : (state_updater,)
     _check_functors_eltype(state_updaters, T, "state updater")
 
     StressParticleSystem{T, ndims, ns, typeof(_DEFAULT_PAIRS), typeof(state_updaters)}(
         String(name), n,
-        x, v, rho, dvdt, drhodt, p, stress, strain_rate,
+        x, v, v_adjustment, rho, dvdt, drhodt, p, stress, strain_rate,
         T(mass), T(c),
         SVector{ndims,T}(source_v),
         T(source_rho),
@@ -345,6 +347,7 @@ struct ElastoPlasticParticleSystem{T<:AbstractFloat, ND, NS, VT, PAIRS<:Tuple, U
     n::Int
     x::Vector{SVector{ND,T}}
     v::Vector{SVector{ND,T}}
+    v_adjustment::Vector{SVector{ND,T}}
     rho::Vector{T}
     dvdt::Vector{SVector{ND,T}}
     drhodt::Vector{T}
@@ -390,24 +393,25 @@ function ElastoPlasticParticleSystem(
     T = dtype
     VT = ndims == 2 ? T : SVector{3, T}
 
-    x           = Vector{SVector{ndims,T}}(undef, n)
-    v           = Vector{SVector{ndims,T}}(undef, n)
-    rho         = Vector{T}(undef, n)
-    dvdt        = fill(zero(SVector{ndims,T}), n)
-    drhodt      = zeros(T, n)
-    p           = zeros(T, n)
-    stress      = fill(zero(SVector{ns,T}), n)
-    strain_rate = fill(zero(SVector{ns,T}), n)
-    vorticity   = fill(zero(VT), n)
-    strain      = fill(zero(SVector{ns,T}), n)
-    strain_p    = fill(zero(SVector{ns,T}), n)
+    x            = Vector{SVector{ndims,T}}(undef, n)
+    v            = Vector{SVector{ndims,T}}(undef, n)
+    v_adjustment = fill(zero(SVector{ndims,T}), n)
+    rho          = Vector{T}(undef, n)
+    dvdt         = fill(zero(SVector{ndims,T}), n)
+    drhodt       = zeros(T, n)
+    p            = zeros(T, n)
+    stress       = fill(zero(SVector{ns,T}), n)
+    strain_rate  = fill(zero(SVector{ns,T}), n)
+    vorticity    = fill(zero(VT), n)
+    strain       = fill(zero(SVector{ns,T}), n)
+    strain_p     = fill(zero(SVector{ns,T}), n)
 
     state_updaters = state_updater isa Tuple ? state_updater : (state_updater,)
     _check_functors_eltype(state_updaters, T, "state updater")
 
     ElastoPlasticParticleSystem{T, ndims, ns, VT, typeof(_DEFAULT_PAIRS), typeof(state_updaters)}(
         String(name), n,
-        x, v, rho, dvdt, drhodt, p, stress, strain_rate, vorticity, strain, strain_p,
+        x, v, v_adjustment, rho, dvdt, drhodt, p, stress, strain_rate, vorticity, strain, strain_p,
         T(mass), T(c),
         SVector{ndims,T}(source_v),
         T(source_rho),
