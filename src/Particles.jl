@@ -1,6 +1,6 @@
 export AbstractParticleSystem,
        BasicParticleSystem, FluidParticleSystem, StressParticleSystem,
-       ElastoPlasticParticleSystem,
+       ElastoPlasticParticleSystem, VirtualParticleSystem,
        update_state!, write_h5, read_h5!, print_summary,
        add_print_field!, remove_print_field!
 
@@ -444,6 +444,79 @@ function ElastoPlasticParticleSystem(
 end
 
 # ---------------------------------------------------------------------------
+# VirtualParticleSystem
+# ---------------------------------------------------------------------------
+
+"""
+    VirtualParticleSystem{T, ND, PS, UPD} <: AbstractParticleSystem{T, ND}
+
+A lightweight wrapper around a source particle system that exposes all of its
+fields and additionally owns `w_sum::Vector{T}` for kernel-weight accumulation
+(SPH normalisation denominator).
+
+All per-particle and scalar properties are forwarded to the wrapped `source`
+system. `w_sum` and `state_updater` are owned by the virtual system.
+
+State updaters are called by `update_state!` in the usual way — useful for
+zeroing accumulated arrays before a sweep or normalising by `w_sum` after one.
+
+    vps = VirtualParticleSystem(source_ps, name, n, ndims, mass, c;
+                                state_updater=(ZeroFn(), NormaliseFn()))
+
+`n`, `ndims`, `mass`, and `c` are validated against the source system.
+"""
+struct VirtualParticleSystem{T<:AbstractFloat, ND, PS<:AbstractParticleSystem{T,ND}, UPD<:Tuple, ZF} <: AbstractParticleSystem{T, ND}
+    name::String
+    source::PS
+    w_sum::Vector{T}
+    state_updater::UPD
+    function VirtualParticleSystem{T,ND,PS,UPD,ZF}(args...) where {T,ND,PS,UPD,ZF}
+        ND isa Int || throw(ArgumentError("ND must be an Int, got $(typeof(ND))"))
+        new{T,ND,PS,UPD,ZF}(args...)
+    end
+end
+
+function VirtualParticleSystem(
+    ps::AbstractParticleSystem{T,ND},
+    name::AbstractString,
+    n::Integer,
+    ndims::Integer,
+    mass::Real,
+    c::Real;
+    dtype::Type{<:AbstractFloat} = T,
+    state_updater = (),
+    zero_fields::Tuple = (),
+) where {T,ND}
+    n = Int(n); ndims = Int(ndims)
+    ndims == ND  || throw(ArgumentError("ndims=$ndims does not match source ndims=$ND"))
+    n    == ps.n || throw(ArgumentError("n=$n does not match source n=$(ps.n)"))
+    state_updaters = state_updater isa Tuple ? state_updater : (state_updater,)
+    _check_functors_eltype(state_updaters, T, "state updater")
+    VirtualParticleSystem{T, ND, typeof(ps), typeof(state_updaters), zero_fields}(
+        String(name), ps, zeros(T, n), state_updaters,
+    )
+end
+
+@inline function Base.getproperty(vps::VirtualParticleSystem{T,ND,PS,UPD,ZF}, s::Symbol) where {T,ND,PS,UPD,ZF}
+    s === :ndims && return ND
+    s === :n     && return length(getfield(getfield(vps, :source), :x))
+    s in (:name, :source, :w_sum, :state_updater) && return getfield(vps, s)
+    return getproperty(getfield(vps, :source), s)
+end
+
+# Auto-zero: clears w_sum and all ZF fields before each sweep loop.
+_auto_zero_virtual!(::Tuple{}, vps) = nothing
+@inline @Base.propagate_inbounds function _auto_zero_virtual!(zf::Tuple, vps)
+    arr = getproperty(vps, first(zf))
+    fill!(arr, zero(eltype(arr)))
+    _auto_zero_virtual!(Base.tail(zf), vps)
+end
+@inline function auto_zero_virtual!(vps::VirtualParticleSystem{T,ND,PS,UPD,ZF}) where {T,ND,PS,UPD,ZF}
+    fill!(getfield(vps, :w_sum), zero(T))
+    _auto_zero_virtual!(ZF, vps)
+end
+
+# ---------------------------------------------------------------------------
 # State update
 # ---------------------------------------------------------------------------
 
@@ -609,6 +682,7 @@ _sim_field_names(::BasicParticleSystem)  = (:v, :rho, :dvdt, :drhodt)
 _sim_field_names(::FluidParticleSystem)  = (:v, :rho, :dvdt, :drhodt, :p)
 _sim_field_names(::StressParticleSystem) = (:v, :rho, :dvdt, :drhodt, :p, :stress, :strain_rate)
 _sim_field_names(::ElastoPlasticParticleSystem) = (:v, :rho, :dvdt, :drhodt, :p, :stress, :strain_rate, :vorticity, :strain, :strain_p)
+_sim_field_names(vps::VirtualParticleSystem) = _sim_field_names(getfield(vps, :source))
 
 """
     write_h5(ps::AbstractParticleSystem, target)
@@ -633,7 +707,7 @@ function _write_to_group!(ps::AbstractParticleSystem, group)
     HDF5.attrs(group)["c"]     = ps.c
     group["x"] = reinterpret(reshape, eltype(eltype(ps.x)), ps.x)
     for k in _sim_field_names(ps)
-        arr = getfield(ps, k)
+        arr = getproperty(ps, k)
         if arr isa AbstractVector{<:SVector}
             group[String(k)] = reinterpret(reshape, eltype(eltype(arr)), arr)
         else

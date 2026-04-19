@@ -1,4 +1,4 @@
-export FluidPfn, MultiPhaseFluidPfn, StrainRatePfn, StrainRateVorticityPfn, CauchyFluidPfn, XSPHPfn
+export FluidPfn, MultiPhaseFluidPfn, StrainRatePfn, StrainRateVorticityPfn, CauchyFluidPfn, XSPHPfn, InterpolateFieldFn
 
 # ---------------------------------------------------------------------------
 # Premade pairwise interaction functors
@@ -282,8 +282,8 @@ end
     ps.drhodt[j] += mass * (dr - psi / rho_i)
 end
 
-# Coupled generic (one-sided, stress-based) — covers ghosts
-@inline @Base.propagate_inbounds function (f::CauchyFluidPfn{D,T})(ps_a::AbstractParticleSystem{T,ND}, ps_b::AbstractParticleSystem{T,ND}, i::Int, j::Int, dx::SVector{ND,T}, gx::SVector{ND,T}, w::T) where {D,ND,T<:AbstractFloat}
+# Coupled boundary (one-sided) — virtual or ghost ps_b
+@inline @Base.propagate_inbounds function (f::CauchyFluidPfn{D,T})(ps_a::AbstractParticleSystem{T,ND}, ps_b::Union{VirtualParticleSystem{T,ND}, AbstractGhostParticleSystem{T,ND}}, i::Int, j::Int, dx::SVector{ND,T}, gx::SVector{ND,T}, w::T) where {D,ND,T<:AbstractFloat}
     vi, vj             = ps_a.v[i], ps_b.v[j]
     rho_i, rho_j       = ps_a.rho[i], ps_b.rho[j]
     stress_i, stress_j = ps_a.stress[i], ps_b.stress[j]
@@ -297,6 +297,25 @@ end
     dr  = continuity_rate(dv, gx)
     psi = diffusion_density(dx, rho_i, rho_j, ps_a.c, ps_a.c, f.h, f.h, gx, f.delta)
     ps_a.drhodt[i] += mass_j * (dr + psi / rho_j)
+end
+
+# Coupled general (two-sided) — both real particle systems
+@inline @Base.propagate_inbounds function (f::CauchyFluidPfn{D,T})(ps_a::AbstractParticleSystem{T,ND}, ps_b::AbstractParticleSystem{T,ND}, i::Int, j::Int, dx::SVector{ND,T}, gx::SVector{ND,T}, w::T) where {D,ND,T<:AbstractFloat}
+    vi, vj             = ps_a.v[i], ps_b.v[j]
+    rho_i, rho_j       = ps_a.rho[i], ps_b.rho[j]
+    stress_i, stress_j = ps_a.stress[i], ps_b.stress[j]
+    mass_i, mass_j     = ps_a.mass, ps_b.mass
+    dv                 = vi - vj
+
+    piv   = artificial_viscosity(dx, dv, f.h, rho_i, rho_j, f.art_visc_alpha, f.art_visc_beta, ps_a.c, ps_b.c)
+    h_vec = cauchy_stress_force(stress_i, stress_j, rho_i, rho_j, gx)
+    ps_a.dvdt[i] += mass_j * (h_vec - piv * gx)
+    ps_b.dvdt[j] -= mass_i * (h_vec - piv * gx)
+
+    dr  = continuity_rate(dv, gx)
+    psi = diffusion_density(dx, rho_i, rho_j, ps_a.c, ps_b.c, f.h, f.h, gx, f.delta)
+    ps_a.drhodt[i] += mass_j * (dr + psi / rho_j)
+    ps_b.drhodt[j] += mass_i * (dr - psi / rho_i)
 end
 
 # Coupled static boundary (LJ + artificial viscosity)
@@ -368,4 +387,42 @@ end
     ps_a.v_adjustment[i] += du*mass_j
     ps_b.v_adjustment[j] -= du*mass_i
 
+end
+
+"""
+    InterpolateFieldFn(:field1, :field2, …)
+
+Pairwise functor that accumulates the standard SPH field interpolation
+
+    f_j += (m_i / ρ_i) * f_i * W_ij
+
+into the virtual particle system `ps_b` from real particles `ps_a`.
+Use with a coupled interaction where `ps_a` is the real (source) system
+and `ps_b` is the VirtualParticleSystem being filled.
+
+Zero the target fields before the sweep to obtain the SPH estimate.
+"""
+struct InterpolateFieldFn{fields, ACC_WSUM}
+    InterpolateFieldFn(fields::Symbol...; accumulate_wsum::Bool=true) =
+        new{fields, accumulate_wsum}()
+end
+
+@inline @Base.propagate_inbounds function (::InterpolateFieldFn{fields, ACC_WSUM})(ps_a::AbstractParticleSystem{T,ND}, ps_b::VirtualParticleSystem{T,ND}, i::Int, j::Int, dx::SVector{ND,T}, gx::SVector{ND,T}, w::T) where {fields, ACC_WSUM, ND, T<:AbstractFloat}
+    rho_i  = ps_a.rho[i]
+    mass_i = ps_a.mass
+    kernel_weight = w * (mass_i / rho_i)
+    for fname in fields
+        getproperty(ps_b, fname)[j] += kernel_weight * getproperty(ps_a, fname)[i]
+    end
+    ACC_WSUM && (ps_b.w_sum[j] += kernel_weight)
+end
+
+@inline @Base.propagate_inbounds function (::InterpolateFieldFn{fields, ACC_WSUM})(ps_a::VirtualParticleSystem{T,ND}, ps_b::AbstractParticleSystem{T,ND}, i::Int, j::Int, dx::SVector{ND,T}, gx::SVector{ND,T}, w::T) where {fields, ACC_WSUM, ND, T<:AbstractFloat}
+    rho_j  = ps_b.rho[j]
+    mass_j = ps_b.mass
+    kernel_weight = w * (mass_j / rho_j)
+    for fname in fields
+        getproperty(ps_a, fname)[i] += kernel_weight * getproperty(ps_b, fname)[j]
+    end
+    ACC_WSUM && (ps_a.w_sum[i] += kernel_weight)
 end

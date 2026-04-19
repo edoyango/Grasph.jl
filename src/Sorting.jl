@@ -19,11 +19,14 @@ _particle_arrays(ps::FluidParticleSystem) =
     (ps.x, ps.v, ps.v_adjustment, ps.rho, ps.dvdt, ps.drhodt, ps.p)
 
 _particle_arrays(ps::StressParticleSystem) =
-    (ps.x, ps.v, ps.rho, ps.dvdt, ps.drhodt, ps.p, ps.stress, ps.strain_rate)
+    (ps.x, ps.v, ps.v_adjustment, ps.rho, ps.dvdt, ps.drhodt, ps.p, ps.stress, ps.strain_rate)
 
 _particle_arrays(ps::ElastoPlasticParticleSystem) =
-    (ps.x, ps.v, ps.rho, ps.dvdt, ps.drhodt, ps.p,
+    (ps.x, ps.v, ps.v_adjustment, ps.rho, ps.dvdt, ps.drhodt, ps.p,
      ps.stress, ps.strain_rate, ps.vorticity, ps.strain, ps.strain_p)
+
+# Virtual: delegate to source — w_sum is auto-zeroed before each sweep so order doesn't matter.
+_particle_arrays(vps::VirtualParticleSystem) = _particle_arrays(getfield(vps, :source))
 
 # Ghost: first-class fields + idx_original (must move with the ghost) + extras.
 # x is still first so sort_particles! can read it as the sort key.

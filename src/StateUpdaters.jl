@@ -1,5 +1,5 @@
 export EOSUpdater, TaitEOSUpdater, LinearEOSUpdater, ViscoPlasticMCStressUpdater,
-       ZeroFieldUpdater, ElastoPlasticStressUpdater
+       ZeroFieldUpdater, ElastoPlasticStressUpdater, VirtualNormUpdater
 
 # ---------------------------------------------------------------------------
 # EOS state updater functors
@@ -38,6 +38,39 @@ ZeroFieldUpdater(fields::Symbol...) = ZeroFieldUpdater{fields}()
     arr = getproperty(ps, first(syms))
     arr[i] = zero(eltype(arr))
     _zero_fields!(ps, i, Base.tail(syms))
+end
+
+"""
+    VirtualNormUpdater(v_mult::SVector{ND,T}, :field1, :field2, …)
+
+State updater for `VirtualParticleSystem`. On each call:
+
+1. Divides every listed field by `ps.w_sum[i]` (SPH normalisation).
+2. Multiplies `ps.v[i]` component-wise by `v_mult` (boundary condition).
+
+`v_mult` encodes the velocity boundary condition:
+- `SVector(-1,-1,-1)` — fully fixed (no-slip, all components negated)
+- `SVector(1,1,-1)`   — free-slip with wall normal along z (negate z only)
+
+Fields for particles with zero `w_sum` are set to zero.
+"""
+struct VirtualNormUpdater{Syms, ND, T<:AbstractFloat} <: StateUpdater
+    v_mult::SVector{ND,T}
+end
+
+VirtualNormUpdater(v_mult::SVector{ND,T}, fields::Symbol...) where {ND,T<:AbstractFloat} =
+    VirtualNormUpdater{fields, ND, T}(v_mult)
+
+@inline @Base.propagate_inbounds function (u::VirtualNormUpdater{Syms,ND,T})(ps, i::Int) where {Syms,ND,T}
+    _normalize_fields!(ps, i, ps.w_sum[i], u.v_mult, Syms)
+end
+
+@inline _normalize_fields!(ps, i, w, v_mult, ::Tuple{}) = nothing
+@inline @Base.propagate_inbounds function _normalize_fields!(ps, i, w, v_mult, syms::Tuple)
+    arr = getproperty(ps, first(syms))
+    val = iszero(w) ? zero(eltype(arr)) : arr[i] / w
+    arr[i] = first(syms) === :v ? val .* v_mult : val
+    _normalize_fields!(ps, i, w, v_mult, Base.tail(syms))
 end
 
 abstract type EOSUpdater <: StateUpdater end

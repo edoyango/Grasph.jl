@@ -28,34 +28,38 @@ Conjugate pairs `(q, dqdt)` are driven by `ps.pairs`. At each step:
 4. **Full-step**: `q = q₀ + dt * dqdt`.
 5. **Update positions**: `x += dt * v`.
 """
-struct LeapFrogTimeIntegrator{SYS<:Tuple, INTS<:Tuple, GHOSTS<:Tuple, T<:AbstractFloat} <: AbstractTimeIntegrator
+struct LeapFrogTimeIntegrator{SYS<:Tuple, INTS<:Tuple, GHOSTS<:Tuple, VSYS<:Tuple, T<:AbstractFloat} <: AbstractTimeIntegrator
     systems::SYS
     interactions::INTS
     ghosts::GHOSTS
+    virtual_systems::VSYS
     c::T
     h::T
 end
 
 """
-    LeapFrogTimeIntegrator(systems, interactions; ghosts=()) -> LeapFrogTimeIntegrator
+    LeapFrogTimeIntegrator(systems, interactions; ghosts=(), virtual_systems=()) -> LeapFrogTimeIntegrator
 
 Construct a `LeapFrogTimeIntegrator`.
 
 - `systems`: an `AbstractParticleSystem` or iterable of `AbstractParticleSystem`s.
 - `interactions`: a `SystemInteraction` or iterable of `SystemInteraction`s.
+- `virtual_systems`: `VirtualParticleSystem`s that are sorted and state-updated each step
+  but whose velocity is zeroed before position integration (fixed boundaries).
 
 Raises `ArgumentError` if either collection is empty.
 """
-function LeapFrogTimeIntegrator(systems, interactions; ghosts=())
-    sys  = systems      isa AbstractParticleSystem ? (systems,)      : Tuple(systems)
-    ints = interactions isa SystemInteraction      ? (interactions,) : Tuple(interactions)
-    gsts = ghosts       isa GhostEntry             ? (ghosts,)       : Tuple(ghosts)
+function LeapFrogTimeIntegrator(systems, interactions; ghosts=(), virtual_systems=())
+    sys  = systems         isa AbstractParticleSystem  ? (systems,)         : Tuple(systems)
+    ints = interactions    isa SystemInteraction       ? (interactions,)    : Tuple(interactions)
+    gsts = ghosts          isa GhostEntry              ? (ghosts,)          : Tuple(ghosts)
+    vsys = virtual_systems isa VirtualParticleSystem   ? (virtual_systems,) : Tuple(virtual_systems)
     isempty(sys)  && throw(ArgumentError("systems must not be empty"))
     isempty(ints) && throw(ArgumentError("interactions must not be empty"))
     T = eltype(eltype(first(sys).x))
     c = T(maximum(ps.c           for ps   in sys))
     h = T(minimum(inter.kernel.h for inter in ints))
-    LeapFrogTimeIntegrator{typeof(sys), typeof(ints), typeof(gsts), T}(sys, ints, gsts, c, h)
+    LeapFrogTimeIntegrator{typeof(sys), typeof(ints), typeof(gsts), typeof(vsys), T}(sys, ints, gsts, vsys, c, h)
 end
 
 """
@@ -75,24 +79,26 @@ Each timestep evaluates the RHS four times with intermediate states:
 
 Positions are updated once at the end: `x += dt · v`.
 """
-struct RK4TimeIntegrator{SYS<:Tuple, INTS<:Tuple, GHOSTS<:Tuple, T<:AbstractFloat} <: AbstractTimeIntegrator
+struct RK4TimeIntegrator{SYS<:Tuple, INTS<:Tuple, GHOSTS<:Tuple, VSYS<:Tuple, T<:AbstractFloat} <: AbstractTimeIntegrator
     systems::SYS
     interactions::INTS
     ghosts::GHOSTS
+    virtual_systems::VSYS
     c::T
     h::T
 end
 
-function RK4TimeIntegrator(systems, interactions; ghosts=())
-    sys  = systems      isa AbstractParticleSystem ? (systems,)      : Tuple(systems)
-    ints = interactions isa SystemInteraction      ? (interactions,) : Tuple(interactions)
-    gsts = ghosts       isa GhostEntry             ? (ghosts,)       : Tuple(ghosts)
+function RK4TimeIntegrator(systems, interactions; ghosts=(), virtual_systems=())
+    sys  = systems         isa AbstractParticleSystem  ? (systems,)         : Tuple(systems)
+    ints = interactions    isa SystemInteraction       ? (interactions,)    : Tuple(interactions)
+    gsts = ghosts          isa GhostEntry              ? (ghosts,)          : Tuple(ghosts)
+    vsys = virtual_systems isa VirtualParticleSystem   ? (virtual_systems,) : Tuple(virtual_systems)
     isempty(sys)  && throw(ArgumentError("systems must not be empty"))
     isempty(ints) && throw(ArgumentError("interactions must not be empty"))
     T = eltype(eltype(first(sys).x))
     c = T(maximum(ps.c           for ps   in sys))
     h = T(minimum(inter.kernel.h for inter in ints))
-    RK4TimeIntegrator{typeof(sys), typeof(ints), typeof(gsts), T}(sys, ints, gsts, c, h)
+    RK4TimeIntegrator{typeof(sys), typeof(ints), typeof(gsts), typeof(vsys), T}(sys, ints, gsts, vsys, c, h)
 end
 
 # ---------------------------------------------------------------------------
@@ -321,11 +327,9 @@ end
 # Shared per-step helpers (used by both LeapFrog and RK4)
 # ---------------------------------------------------------------------------
 
-# Generate ghosts, sort them, then build all interaction grids.
-# Steps 3-5 are identical for both LeapFrog and RK4 since the grid is
-# (re)built exactly once per timestep in both integrators.
-function _prepare_grids!(ghosts, ints, sort_cutoff, sort_perm_buf, sort_key_buf,
-                          ghost_scratches, to, ghost_labels, inter_labels)
+# Generate ghosts, sort them, sort virtual systems, then build all interaction grids.
+function _prepare_grids!(ghosts, virtual_sys, ints, sort_cutoff, sort_perm_buf, sort_key_buf,
+                          ghost_scratches, virtual_scratches, to, ghost_labels, inter_labels)
     for (i, ge) in enumerate(ghosts)
         @timeit to ghost_labels[i].gen @timeit to ghost_labels[i].name generate_ghosts!(ge)
     end
@@ -333,15 +337,34 @@ function _prepare_grids!(ghosts, ints, sort_cutoff, sort_perm_buf, sort_key_buf,
         @timeit to ghost_labels[i].sort @timeit to ghost_labels[i].name sort_particles!(
             ge.ghost, sort_cutoff, sort_perm_buf, sort_key_buf, ghost_scratches[i])
     end
+    for (i, vps) in enumerate(virtual_sys)
+        sort_particles!(vps, sort_cutoff, sort_perm_buf, sort_key_buf, virtual_scratches[i])
+    end
     for (i, inter) in enumerate(ints)
         @timeit to inter_labels[i].grid @timeit to inter_labels[i].name create_grid!(inter)
     end
 end
 
-# Run one full sweep pass: state updates, ghost stage updates, then interaction
-# sweeps — in that order, for every stage.  Called once per timestep in
-# LeapFrog; called once per RK stage in RK4 (wrapped in extra @timeit there).
-function _sweep_all_stages!(sys, ghosts, ints, num_stages, to, ps_labels, ghost_labels, inter_labels)
+# Auto-zero all virtual systems' w_sum and ZF fields before the stage loop.
+_auto_zero_all_virtual!(::Tuple{}) = nothing
+@inline function _auto_zero_all_virtual!(vsys::Tuple)
+    auto_zero_virtual!(first(vsys))
+    _auto_zero_all_virtual!(Base.tail(vsys))
+end
+
+# Zero virtual systems' velocity then update positions (x += v·dt = no change for fixed).
+_update_virtual_positions!(::Tuple{}, dt) = nothing
+@inline function _update_virtual_positions!(vsys::Tuple, dt)
+    vps = first(vsys)
+    fill!(vps.v, zero(eltype(vps.v)))
+    _axpy_ip!(vps.x, vps.v, dt)
+    _update_virtual_positions!(Base.tail(vsys), dt)
+end
+
+# Run one full sweep pass: auto-zero virtuals, then per-stage state updates,
+# ghost updates, virtual state updates, and interaction sweeps.
+function _sweep_all_stages!(sys, virtual_sys, ghosts, ints, num_stages, to, ps_labels, ghost_labels, inter_labels)
+    _auto_zero_all_virtual!(virtual_sys)
     for stage in 1:num_stages
         for (i, ps) in enumerate(sys)
             length(ps.state_updater) == num_stages || continue
@@ -349,6 +372,10 @@ function _sweep_all_stages!(sys, ghosts, ints, num_stages, to, ps_labels, ghost_
         end
         for (i, ge) in enumerate(ghosts)
             @timeit to ghost_labels[i].stage @timeit to ghost_labels[i].name update_ghost!(ge, stage)
+        end
+        for vps in virtual_sys
+            length(vps.state_updater) == num_stages || continue
+            update_state!(vps, stage)
         end
         for (i, inter) in enumerate(ints)
             @timeit to inter_labels[i].sweep @timeit to inter_labels[i].name sweep!(inter, stage)
@@ -387,7 +414,7 @@ function _maybe_print!(sys, to, global_step, print_interval_step, dt)
 end
 
 # Write an HDF5 snapshot at the requested interval.
-function _maybe_save!(sys, ghosts, to, global_step, save_interval_step, output_prefix, width, dt)
+function _maybe_save!(sys, ghosts, virtual_sys, to, global_step, save_interval_step, output_prefix, width, dt)
     if output_prefix !== nothing && global_step % save_interval_step == 0
         @timeit to "save h5" begin
             path = "$(output_prefix)_$(lpad(global_step, width, '0')).h5"
@@ -400,6 +427,9 @@ function _maybe_save!(sys, ghosts, to, global_step, save_interval_step, output_p
                 end
                 for ge in ghosts
                     write_h5(ge.ghost, create_group(f, ge.ghost.name))
+                end
+                for vps in virtual_sys
+                    write_h5(vps, create_group(f, vps.name))
                 end
             end
         end
@@ -444,6 +474,7 @@ function time_integrate!(
 )
     sys   = integrator.systems
     ints  = integrator.interactions
+    vsys  = integrator.virtual_systems
     T     = typeof(integrator.c)
     dt    = T(CFL) * integrator.h / integrator.c
 
@@ -456,26 +487,17 @@ function time_integrate!(
         end
     end
 
-    # Pre-allocate q0 buffers: one typed tuple of arrays per system.
-    # map on a Tuple preserves element types (unlike a comprehension, which
-    # would produce Vector{Any} when systems have different concrete types).
     q0_bufs = map(_make_q0_bufs, sys)
 
-    # Pre-allocate sort infrastructure.  All interactions share the same cutoff
-    # (enforced at construction), so 2h is the canonical cell-lattice spacing.
-    # perm_buf and key_buf are shared across all sort calls within a timestep.
-    # sys_scratches is a tuple of scratch tuples (one per real system, fixed size).
-    # ghost_scratches is a vector of scratch tuples (one per ghost, resized each step).
-    sort_cutoff    = T(2) * integrator.h
-    sort_nd        = first(sys).ndims
-    sort_max_n     = maximum(ps.n for ps in sys)
-    sort_perm_buf  = Vector{Int}(undef, sort_max_n)
-    sort_key_buf   = Vector{SVector{sort_nd,Int}}(undef, sort_max_n)
-    sys_scratches  = map(_make_sort_scratch, sys)
-    ghost_scratches = [_make_empty_sort_scratch(ge.ghost) for ge in integrator.ghosts]
+    sort_cutoff      = T(2) * integrator.h
+    sort_nd          = first(sys).ndims
+    sort_max_n       = maximum(ps.n for ps in sys)
+    sort_perm_buf    = Vector{Int}(undef, sort_max_n)
+    sort_key_buf     = Vector{SVector{sort_nd,Int}}(undef, sort_max_n)
+    sys_scratches    = map(_make_sort_scratch, sys)
+    ghost_scratches  = [_make_empty_sort_scratch(ge.ghost) for ge in integrator.ghosts]
+    virtual_scratches = [_make_sort_scratch(vps) for vps in vsys]
 
-    # Pre-compute @timeit labels to avoid string interpolation allocations in the loop.
-    # Sub-labels are short because they appear nested under the parent name.
     ps_labels = [(name=ps.name,
                   sort="sort",
                   mid="half-step",
@@ -502,19 +524,15 @@ function time_integrate!(
     for itimestep in 1:num_timesteps
         global_step = step_offset + itimestep
 
-        # ---- 1. Sort real particle systems by cell index -------------------
-        # Sorting before saving q0 keeps q0 and dqdt in the same index space
-        # throughout the step, so the full-step q = q0 + dt·dqdt is correct.
-        # Positions come from the previous step's update, so spatially nearby
-        # particles are already nearly sorted — the cost is low.
+        # ---- 1. Sort real particle systems ---------------------------------
         _sort_all_systems!(sys, sys_scratches, sort_cutoff, sort_perm_buf, sort_key_buf, to, ps_labels, 1)
 
         # ---- 2. Save initial values ----------------------------------------
         @timeit to "save q0" _save_q0_all!(sys, q0_bufs)
 
-        # ---- 3-5. Generate ghosts, sort, build grids -----------------------
-        _prepare_grids!(integrator.ghosts, ints, sort_cutoff, sort_perm_buf, sort_key_buf,
-                        ghost_scratches, to, ghost_labels, inter_labels)
+        # ---- 3-5. Generate ghosts, sort ghosts + virtuals, build grids -----
+        _prepare_grids!(integrator.ghosts, vsys, ints, sort_cutoff, sort_perm_buf, sort_key_buf,
+                        ghost_scratches, virtual_scratches, to, ghost_labels, inter_labels)
 
         # ---- 6. Half-step --------------------------------------------------
         for (i, ps) in enumerate(sys)
@@ -526,24 +544,25 @@ function time_integrate!(
             @timeit to ghost_labels[i].kin @timeit to ghost_labels[i].name update_ghost_kinematics!(ge)
         end
 
-        # ---- 8. Sweep ------------------------------------------------------
-        _sweep_all_stages!(sys, integrator.ghosts, ints, num_stages, to,
+        # ---- 8. Sweep (auto-zeros virtual fields before stage loop) --------
+        _sweep_all_stages!(sys, vsys, integrator.ghosts, ints, num_stages, to,
                            ps_labels, ghost_labels, inter_labels)
 
-        # ---- 9. Full-step: update q = q0 + dt·dqdt -----------------------
+        # ---- 9. Full-step: update q = q0 + dt·dqdt -------------------------
         _fullstep_q_all!(sys, q0_bufs, dt, to, ps_labels, 1)
 
-        # ---- 10. XSPH velocity correction ----------------------------------
+        # ---- 10. XSPH velocity correction -----------------------------------
         _xsph_correction!(sys, ints, to, ps_labels, inter_labels)
 
-        # ---- 11. Update positions: x += dt·v -------------------------------
+        # ---- 11. Update positions -------------------------------------------
         _update_positions_all!(sys, dt, to, ps_labels, 1)
+        _update_virtual_positions!(vsys, dt)
 
-        # ---- 12. Print -----------------------------------------------------
+        # ---- 12. Print ------------------------------------------------------
         _maybe_print!(sys, to, global_step, print_interval_step, dt)
 
-        # ---- 13. Save ------------------------------------------------------
-        _maybe_save!(sys, integrator.ghosts, to, global_step, save_interval_step, output_prefix, width, dt)
+        # ---- 13. Save -------------------------------------------------------
+        _maybe_save!(sys, integrator.ghosts, vsys, to, global_step, save_interval_step, output_prefix, width, dt)
     end
 
     print_timer && show(to; allocations=true, compact=false)
@@ -576,6 +595,7 @@ function time_integrate!(
 )
     sys  = integrator.systems
     ints = integrator.interactions
+    vsys = integrator.virtual_systems
     T    = typeof(integrator.c)
     dt   = T(CFL) * integrator.h / integrator.c
 
@@ -588,21 +608,19 @@ function time_integrate!(
         end
     end
 
-    # RK4 stage coefficients (typed to T to avoid conversions in the loop).
-    # advance[s]: multiply dt by this to get the intermediate state from q0.
-    # weight[s]:  accumulation weight for the weighted sum.
     rk4_advance = (T(0),   T(0.5), T(0.5), T(1.0))
     rk4_weight  = (T(1/6), T(1/3), T(1/3), T(1/6))
 
     q0_bufs  = map(_make_q0_bufs,  sys)
     acc_bufs = map(_make_acc_bufs, sys)
 
-    sort_cutoff      = T(2) * integrator.h
-    sort_nd          = first(sys).ndims
-    sort_perm_buf    = Vector{Int}(undef, maximum(ps.n for ps in sys))
-    sort_key_buf     = Vector{SVector{sort_nd,Int}}(undef, maximum(ps.n for ps in sys))
-    sys_scratches    = map(_make_sort_scratch, sys)
-    ghost_scratches  = [_make_empty_sort_scratch(ge.ghost) for ge in integrator.ghosts]
+    sort_cutoff       = T(2) * integrator.h
+    sort_nd           = first(sys).ndims
+    sort_perm_buf     = Vector{Int}(undef, maximum(ps.n for ps in sys))
+    sort_key_buf      = Vector{SVector{sort_nd,Int}}(undef, maximum(ps.n for ps in sys))
+    sys_scratches     = map(_make_sort_scratch, sys)
+    ghost_scratches   = [_make_empty_sort_scratch(ge.ghost) for ge in integrator.ghosts]
+    virtual_scratches = [_make_sort_scratch(vps) for vps in vsys]
 
     ps_labels = [(name=ps.name,
                   sort="sort",
@@ -630,57 +648,52 @@ function time_integrate!(
     for itimestep in 1:num_timesteps
         global_step = step_offset + itimestep
 
-        # ---- 1. Sort real particle systems by cell index -------------------
+        # ---- 1. Sort real particle systems ----------------------------------
         @timeit to "sort" _sort_all_systems!(sys, sys_scratches, sort_cutoff, sort_perm_buf, sort_key_buf, to, ps_labels, 1)
 
-        # ---- 2. Save q0 and zero accumulators ------------------------------
+        # ---- 2. Save q0 and zero accumulators -------------------------------
         @timeit to "save q0" _save_q0_all!(sys, q0_bufs)
         _zero_acc_all!(sys, acc_bufs)
 
-        # ---- 3-5. Generate ghosts, sort, build grids -----------------------
-        _prepare_grids!(integrator.ghosts, ints, sort_cutoff, sort_perm_buf, sort_key_buf,
-                        ghost_scratches, to, ghost_labels, inter_labels)
+        # ---- 3-5. Generate ghosts, sort ghosts + virtuals, build grids ------
+        _prepare_grids!(integrator.ghosts, vsys, ints, sort_cutoff, sort_perm_buf, sort_key_buf,
+                        ghost_scratches, virtual_scratches, to, ghost_labels, inter_labels)
 
-        # ---- 6-8. Four RK stages -------------------------------------------
+        # ---- 6-8. Four RK stages --------------------------------------------
         for rk_iter in 1:4
             rk_label = "rk$rk_iter"
 
-            # ---- 6. Advance q from q0 (stages 2-4); always reset dqdt ------
-            # Stage 1: q is already q0; just reset dqdt to source.
-            # Stages 2-4: q = q0 + advance_coeff*dt * dqdt, then reset dqdt.
             if rk_iter == 1
                 @timeit to "rk stage" @timeit to rk_label _reset_dqdt_all!(sys)
             else
                 _rk4_advance_all!(sys, q0_bufs, rk4_advance[rk_iter] * dt, to, ps_labels, 1)
             end
 
-            # ---- 7. Update ghost kinematics --------------------------------
             for (i, ge) in enumerate(integrator.ghosts)
                 @timeit to ghost_labels[i].kin @timeit to ghost_labels[i].name update_ghost_kinematics!(ge)
             end
 
-            # ---- 8. State updates then sweeps (all updates before any sweep)
             @timeit to "sweep" @timeit to rk_label _sweep_all_stages!(
-                sys, integrator.ghosts, ints, num_stages, to, ps_labels, ghost_labels, inter_labels)
+                sys, vsys, integrator.ghosts, ints, num_stages, to, ps_labels, ghost_labels, inter_labels)
 
-            # Accumulate weighted dqdt into acc_bufs.
             _acc_dqdt_all!(sys, acc_bufs, rk4_weight[rk_iter])
         end
 
-        # ---- 9. Apply accumulated RK4 update: q = q0 + dt * acc -----------
+        # ---- 9. Apply accumulated RK4 update --------------------------------
         _apply_acc_all!(sys, q0_bufs, acc_bufs, dt, to, ps_labels, 1)
 
-        # ---- 10. XSPH velocity correction -----------------------------------
+        # ---- 10. XSPH velocity correction ------------------------------------
         _xsph_correction!(sys, ints, to, ps_labels, inter_labels)
 
-        # ---- 11. Update positions: x += dt·v --------------------------------
+        # ---- 11. Update positions --------------------------------------------
         _update_positions_all!(sys, dt, to, ps_labels, 1)
+        _update_virtual_positions!(vsys, dt)
 
         # ---- 12. Print -------------------------------------------------------
         _maybe_print!(sys, to, global_step, print_interval_step, dt)
 
         # ---- 13. Save --------------------------------------------------------
-        _maybe_save!(sys, integrator.ghosts, to, global_step, save_interval_step, output_prefix, width, dt)
+        _maybe_save!(sys, integrator.ghosts, vsys, to, global_step, save_interval_step, output_prefix, width, dt)
     end
 
     print_timer && show(to; allocations=true, compact=false)
