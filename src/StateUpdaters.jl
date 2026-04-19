@@ -202,9 +202,9 @@ end
     @assert length(eltype(ps.stress)) == 4 "ElastoPlasticStressUpdater requires NS=4 (plane-strain Voigt). Got NS=$(length(eltype(ps.stress)))."
 
     E        = T(u.E)
-    nu       = T(u.nu)
-    phi      = T(u.phi)
-    psi      = T(u.psi)
+    ν        = T(u.nu)
+    φ        = T(u.phi)
+    ψ        = T(u.psi)
     cohesion = T(u.cohesion)
     dt       = T(u.dt)
 
@@ -217,99 +217,99 @@ end
     ε̇_xx = ε̇[1];  ε̇_yy = ε̇[2];  ε̇_zz = ε̇[3];  ε̇_xy = ε̇[4]
 
     # Step 2 — Strain increment
-    d_xx = ε̇_xx * dt
-    d_yy = ε̇_yy * dt
-    d_zz = ε̇_zz * dt
-    d_xy = ε̇_xy * dt
+    dε_xx = ε̇_xx * dt
+    dε_yy = ε̇_yy * dt
+    dε_zz = ε̇_zz * dt
+    dε_xy = ε̇_xy * dt
 
     # Step 3 — Elastic stress increment (DE * deps, analytical — no matrix)
-    D0 = E / ((one(T) + nu) * (one(T) - 2*nu))
+    D0 = E / ((one(T) + ν) * (one(T) - 2*ν))
 
-    dsig_xx = D0 * ((one(T) - nu)*d_xx + nu*d_yy + nu*d_zz)
-    dsig_yy = D0 * (nu*d_xx + (one(T) - nu)*d_yy + nu*d_zz)
-    dsig_zz = D0 * (nu*d_xx + nu*d_yy + (one(T) - nu)*d_zz)
-    dsig_xy = D0 * (one(T) - 2*nu) * d_xy
+    dσ_xx = D0 * ((one(T) - ν)*dε_xx + ν*dε_yy + ν*dε_zz)
+    dσ_yy = D0 * (ν*dε_xx + (one(T) - ν)*dε_yy + ν*dε_zz)
+    dσ_zz = D0 * (ν*dε_xx + ν*dε_yy + (one(T) - ν)*dε_zz)
+    dσ_xy = D0 * (one(T) - 2*ν) * dε_xy
 
     # Step 4 — Jaumann rate correction (uses old stress σ_n, not trial)
     ω_dt     = ω * dt
-    dsig_xx -= 2*σ_xy * ω_dt
-    dsig_yy += 2*σ_xy * ω_dt
-    dsig_xy += (σ_xx - σ_yy) * ω_dt
-    # dsig_zz unchanged — no out-of-plane vorticity in 2D plane strain
+    dσ_xx -= 2*σ_xy * ω_dt
+    dσ_yy += 2*σ_xy * ω_dt
+    dσ_xy += (σ_xx - σ_yy) * ω_dt
+    # dσ_zz unchanged — no out-of-plane vorticity in 2D plane strain
 
     # Step 5 — Trial stress
-    t_xx = σ_xx + dsig_xx
-    t_yy = σ_yy + dsig_yy
-    t_zz = σ_zz + dsig_zz
-    t_xy = σ_xy + dsig_xy
+    σ_t_xx = σ_xx + dσ_xx
+    σ_t_yy = σ_yy + dσ_yy
+    σ_t_zz = σ_zz + dσ_zz
+    σ_t_xy = σ_xy + dσ_xy
 
     # Step 6 — Drucker-Prager yield function
     sqrt3 = sqrt(T(3))
-    α_φ = 2*sin(phi) / (sqrt3 * (3 - sin(phi)))
-    k_c = 6*cohesion*cos(phi) / (sqrt3 * (3 - sin(phi)))
+    α_φ = 2*sin(φ) / (sqrt3 * (3 - sin(φ)))
+    k_c = 6*cohesion*cos(φ) / (sqrt3 * (3 - sin(φ)))
 
-    I1 = t_xx + t_yy + t_zz
+    I1 = σ_t_xx + σ_t_yy + σ_t_zz
     p3 = I1 / 3
 
-    s_xx = t_xx - p3
-    s_yy = t_yy - p3
-    s_zz = t_zz - p3
-    s_xy = t_xy
+    s_xx = σ_t_xx - p3
+    s_yy = σ_t_yy - p3
+    s_zz = σ_t_zz - p3
+    s_xy = σ_t_xy
 
     J2   = T(0.5) * (s_xx^2 + s_yy^2 + s_zz^2 + 2*s_xy^2)
-    sqJ2 = sqrt(max(J2, zero(T)))
+    sqJ2 = sqrt(J2)
 
     f = α_φ * I1 + sqJ2 - k_c
 
     # Step 7 — Plastic return (only if f > 0)
-    deps_p_xx = zero(T)
-    deps_p_yy = zero(T)
-    deps_p_zz = zero(T)
-    deps_p_xy = zero(T)
+    dε_p_xx = zero(T)
+    dε_p_yy = zero(T)
+    dε_p_zz = zero(T)
+    dε_p_xy = zero(T)
 
     if f > zero(T)
-        α_ψ = 2*sin(psi) / (sqrt3 * (3 - sin(psi)))
+        α_ψ = 2*sin(ψ) / (sqrt3 * (3 - sin(ψ)))
 
         inv2sqJ2 = inv(2 * sqJ2)
 
-        df_xx = α_φ + s_xx * inv2sqJ2
-        df_yy = α_φ + s_yy * inv2sqJ2
-        df_zz = α_φ + s_zz * inv2sqJ2
-        df_xy =        s_xy * inv2sqJ2
+        dfdσ_xx = α_φ + s_xx * inv2sqJ2
+        dfdσ_yy = α_φ + s_yy * inv2sqJ2
+        dfdσ_zz = α_φ + s_zz * inv2sqJ2
+        dfdσ_xy =       s_xy * inv2sqJ2
 
-        dg_xx = α_ψ + s_xx * inv2sqJ2
-        dg_yy = α_ψ + s_yy * inv2sqJ2
-        dg_zz = α_ψ + s_zz * inv2sqJ2
-        dg_xy =        s_xy * inv2sqJ2
+        dgdσ_xx = α_ψ + s_xx * inv2sqJ2
+        dgdσ_yy = α_ψ + s_yy * inv2sqJ2
+        dgdσ_zz = α_ψ + s_zz * inv2sqJ2
+        dgdσ_xy =       s_xy * inv2sqJ2
 
         # DE * dg/dσ (analytical)
-        DEg_xx = D0 * ((one(T) - nu)*dg_xx + nu*dg_yy + nu*dg_zz)
-        DEg_yy = D0 * (nu*dg_xx + (one(T) - nu)*dg_yy + nu*dg_zz)
-        DEg_zz = D0 * (nu*dg_xx + nu*dg_yy + (one(T) - nu)*dg_zz)
-        DEg_xy = D0 * (one(T) - 2*nu) * dg_xy
+        DE_dgdσ_xx = D0 * ((one(T) - ν)*dgdσ_xx + ν*dgdσ_yy + ν*dgdσ_zz)
+        DE_dgdσ_yy = D0 * (ν*dgdσ_xx + (one(T) - ν)*dgdσ_yy + ν*dgdσ_zz)
+        DE_dgdσ_zz = D0 * (ν*dgdσ_xx + ν*dgdσ_yy + (one(T) - ν)*dgdσ_zz)
+        DE_dgdσ_xy = D0 * (one(T) - 2*ν) * dgdσ_xy
 
         # Denominator: df' * DE * D2 * dg (factor of 2 on shear = D2 Voigt convention)
-        denom = df_xx*DEg_xx + df_yy*DEg_yy + df_zz*DEg_zz + 2*df_xy*DEg_xy
+        denom = dfdσ_xx*DE_dgdσ_xx + dfdσ_yy*DE_dgdσ_yy + dfdσ_zz*DE_dgdσ_zz + 2*dfdσ_xy*DE_dgdσ_xy
 
-        dlambda = f / denom
+        dλ = f / denom
 
-        deps_p_xx = dlambda * dg_xx
-        deps_p_yy = dlambda * dg_yy
-        deps_p_zz = dlambda * dg_zz
-        deps_p_xy = dlambda * dg_xy
+        dε_p_xx = dλ * dgdσ_xx
+        dε_p_yy = dλ * dgdσ_yy
+        dε_p_zz = dλ * dgdσ_zz
+        dε_p_xy = dλ * dgdσ_xy
 
-        # Stress correction: dsig -= DE * deps_p (analytical)
-        dsig_xx -= D0 * ((one(T) - nu)*deps_p_xx + nu*deps_p_yy + nu*deps_p_zz)
-        dsig_yy -= D0 * (nu*deps_p_xx + (one(T) - nu)*deps_p_yy + nu*deps_p_zz)
-        dsig_zz -= D0 * (nu*deps_p_xx + nu*deps_p_yy + (one(T) - nu)*deps_p_zz)
-        dsig_xy -= D0 * (one(T) - 2*nu) * deps_p_xy
+        # Stress correction: dσ -= DE * deps_p (analytical)
+        dσ_xx -= D0 * ((one(T) - ν)*dε_p_xx + ν*dε_p_yy + ν*dε_p_zz)
+        dσ_yy -= D0 * (ν*dε_p_xx + (one(T) - ν)*dε_p_yy + ν*dε_p_zz)
+        dσ_zz -= D0 * (ν*dε_p_xx + ν*dε_p_yy + (one(T) - ν)*dε_p_zz)
+        dσ_xy -= D0 * (one(T) - 2*ν) * dε_p_xy
     end
 
     # Step 8 — Write back
-    ps.stress[i]   = SVector(σ_xx + dsig_xx,
-                              σ_yy + dsig_yy,
-                              σ_zz + dsig_zz,
-                              σ_xy + dsig_xy)
-    ps.strain[i]   += SVector(d_xx, d_yy, d_zz, d_xy)
-    ps.strain_p[i] += SVector(deps_p_xx, deps_p_yy, deps_p_zz, deps_p_xy)
+    ps.stress[i]   = SVector(σ_xx + dσ_xx,
+                             σ_yy + dσ_yy,
+                             σ_zz + dσ_zz,
+                             σ_xy + dσ_xy)
+    ps.strain[i]   += SVector(dε_xx, dε_yy, dε_zz, dε_xy)
+    ps.strain_p[i] += SVector(dε_p_xx, dε_p_yy, dε_p_zz, dε_p_xy)
 end
