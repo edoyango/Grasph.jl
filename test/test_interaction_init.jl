@@ -124,7 +124,7 @@ _dummy_pairwise(args...) = nothing
         ps = _make_ps()  # Float64
         k  = _make_kernel()
         pfn = FluidPfn(0.1, 0.0, 0.1)  # infers Float64
-        @test pfn isa FluidPfn{Float64}
+        @test pfn isa FluidPfn{<:Any,<:Any,<:Any,Float64}
         si = SystemInteraction(k, pfn, ps)
         @test si isa SystemInteraction
     end
@@ -133,7 +133,7 @@ _dummy_pairwise(args...) = nothing
         ps  = _make_ps()  # Float64
         k   = _make_kernel()
         pfn = FluidPfn(Float32(0.1), Float32(0.0), Float32(0.1))
-        @test pfn isa FluidPfn{Float32}
+        @test pfn isa FluidPfn{<:Any,<:Any,<:Any,Float32}
         @test_throws ArgumentError SystemInteraction(k, pfn, ps)
     end
 
