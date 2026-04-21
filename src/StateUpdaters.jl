@@ -310,6 +310,9 @@ end
                              σ_yy + dσ_yy,
                              σ_zz + dσ_zz,
                              σ_xy + dσ_xy)
+    if σ_xx + dσ_xx + σ_yy + dσ_yy + σ_zz + dσ_zz > k_c/α_φ
+        ps.stress[i] = SVector(k_c/α_φ/T(3.0), k_c/α_φ/T(3.0), k_c/α_φ/T(3.0), 0.0)
+    end
     ps.strain[i]   += SVector(dε_xx, dε_yy, dε_zz, dε_xy)
     ps.strain_p[i] += SVector(dε_p_xx, dε_p_yy, dε_p_zz, dε_p_xy)
 end

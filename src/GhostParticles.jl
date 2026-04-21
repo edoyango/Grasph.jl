@@ -17,9 +17,16 @@ abstract type AbstractGhostUpdater end
 
 """
     GhostCopier(:field1, :field2, …)
+    GhostCopier(:field1 => signs1, :field2, …)
 
 A callable ghost updater that copies the named fields from a ghost's source
 particle system into its owned `extras` arrays when called with a ghost.
+
+Each entry is either a bare `Symbol` (straight copy) or a `Symbol => SVector`
+pair whose `SVector` is applied element-wise to the copied value.  This allows
+individual stress components to be sign-flipped for free-slip walls:
+
+    GhostCopier(:stress => SVector(1.0, 1.0, -1.0, -1.0))
 
 Pass one or more `GhostCopier`s to `GhostParticleSystem` to declare which
 fields should be owned and how they should be refreshed per stage:
@@ -33,25 +40,35 @@ Calling `update_ghost!(ghost, stage)` invokes the stage-th copier.
 Density (:rho) is core kinematics and is updated every step automatically;
 you generally do not need to include it in a copier.
 """
-struct GhostCopier{fields} <: AbstractGhostUpdater end
+struct GhostCopier{fields, SIGNS} <: AbstractGhostUpdater end
 
-GhostCopier(fields::Symbol...) = GhostCopier{fields}()
+function GhostCopier(entries...)
+    flds = ntuple(i -> entries[i] isa Symbol ? entries[i] : first(entries[i]), length(entries))
+    sgns = ntuple(i -> entries[i] isa Symbol ? nothing    : last(entries[i]),  length(entries))
+    GhostCopier{flds, sgns}()
+end
 
-_updater_fields(::GhostCopier{fields}) where {fields} = fields
+_updater_fields(::GhostCopier{fields, SIGNS}) where {fields, SIGNS} = fields
 _updater_fields(::AbstractGhostUpdater) = ()   # fallback for custom updater types
 _updater_fields(::Nothing) = ()
 
-function (::GhostCopier{fields})(ghost::AbstractGhostParticleSystem) where {fields}
-    idx    = getfield(ghost, :idx_original)
-    src    = getfield(ghost, :source)
-    extras = getfield(ghost, :extras)
-    for fname in fields
-        src_arr = getproperty(src, fname)
-        arr     = getproperty(extras, fname)
-        @inbounds for k in eachindex(arr)
-            arr[k] = src_arr[idx[k]]
-        end
+@inline _apply_signs(val, ::Nothing) = val
+@inline _apply_signs(val, signs)     = val .* signs
+
+_copy_fields!(ghost, idx, ::Tuple{}, ::Tuple{}) = nothing
+@inline function _copy_fields!(ghost, idx, fields::Tuple, signs::Tuple)
+    fname   = first(fields)
+    src_arr = getproperty(getfield(ghost, :source), fname)
+    arr     = getproperty(getfield(ghost, :extras), fname)
+    sign    = first(signs)
+    @inbounds for k in eachindex(arr)
+        arr[k] = _apply_signs(src_arr[idx[k]], sign)
     end
+    _copy_fields!(ghost, idx, Base.tail(fields), Base.tail(signs))
+end
+
+function (::GhostCopier{fields, SIGNS})(ghost::AbstractGhostParticleSystem) where {fields, SIGNS}
+    _copy_fields!(ghost, getfield(ghost, :idx_original), fields, SIGNS)
 end
 
 # ---------------------------------------------------------------------------

@@ -35,6 +35,7 @@ struct LeapFrogTimeIntegrator{SYS<:Tuple, INTS<:Tuple, GHOSTS<:Tuple, VSYS<:Tupl
     virtual_systems::VSYS
     c::T
     h::T
+    Γ::T
 end
 
 """
@@ -49,7 +50,7 @@ Construct a `LeapFrogTimeIntegrator`.
 
 Raises `ArgumentError` if either collection is empty.
 """
-function LeapFrogTimeIntegrator(systems, interactions; ghosts=(), virtual_systems=())
+function LeapFrogTimeIntegrator(systems, interactions; ghosts=(), virtual_systems=(), Γ=0)
     sys  = systems         isa AbstractParticleSystem  ? (systems,)         : Tuple(systems)
     ints = interactions    isa SystemInteraction       ? (interactions,)    : Tuple(interactions)
     gsts = ghosts          isa GhostEntry              ? (ghosts,)          : Tuple(ghosts)
@@ -59,7 +60,7 @@ function LeapFrogTimeIntegrator(systems, interactions; ghosts=(), virtual_system
     T = eltype(eltype(first(sys).x))
     c = T(maximum(ps.c           for ps   in sys))
     h = T(minimum(inter.kernel.h for inter in ints))
-    LeapFrogTimeIntegrator{typeof(sys), typeof(ints), typeof(gsts), typeof(vsys), T}(sys, ints, gsts, vsys, c, h)
+    LeapFrogTimeIntegrator{typeof(sys), typeof(ints), typeof(gsts), typeof(vsys), T}(sys, ints, gsts, vsys, c, h, T(Γ))
 end
 
 """
@@ -86,9 +87,10 @@ struct RK4TimeIntegrator{SYS<:Tuple, INTS<:Tuple, GHOSTS<:Tuple, VSYS<:Tuple, T<
     virtual_systems::VSYS
     c::T
     h::T
+    Γ::T
 end
 
-function RK4TimeIntegrator(systems, interactions; ghosts=(), virtual_systems=())
+function RK4TimeIntegrator(systems, interactions; ghosts=(), virtual_systems=(), Γ=0)
     sys  = systems         isa AbstractParticleSystem  ? (systems,)         : Tuple(systems)
     ints = interactions    isa SystemInteraction       ? (interactions,)    : Tuple(interactions)
     gsts = ghosts          isa GhostEntry              ? (ghosts,)          : Tuple(ghosts)
@@ -98,7 +100,7 @@ function RK4TimeIntegrator(systems, interactions; ghosts=(), virtual_systems=())
     T = eltype(eltype(first(sys).x))
     c = T(maximum(ps.c           for ps   in sys))
     h = T(minimum(inter.kernel.h for inter in ints))
-    RK4TimeIntegrator{typeof(sys), typeof(ints), typeof(gsts), typeof(vsys), T}(sys, ints, gsts, vsys, c, h)
+    RK4TimeIntegrator{typeof(sys), typeof(ints), typeof(gsts), typeof(vsys), T}(sys, ints, gsts, vsys, c, h, T(Γ))
 end
 
 # ---------------------------------------------------------------------------
@@ -235,6 +237,29 @@ _reset_dqdt_all!(::Tuple{}) = nothing
     ps = first(sys)
     _reset_dqdt_pairs!(ps, getfield(ps, :pairs))
     _reset_dqdt_all!(Base.tail(sys))
+end
+
+# Velocity damping: dvdt[i] -= (Γ/dt) * v[i] for the (:v, :dvdt) conjugate pair.
+@inline _apply_damping_pair!(ps, ::Val{:v}, dqdt_val::Val, Γ_dt) = begin
+    v    = _getf(ps, Val{:v}())
+    dvdt = _getf(ps, dqdt_val)
+    @inbounds for i in eachindex(v)
+        dvdt[i] -= Γ_dt * v[i]
+    end
+end
+@inline _apply_damping_pair!(ps, ::Val, ::Val, ::Any) = nothing
+
+_apply_damping_pairs!(ps, ::Tuple{}, ::Any) = nothing
+@inline function _apply_damping_pairs!(ps, pairs::Tuple, Γ_dt)
+    q_val, dqdt_val = first(pairs)
+    _apply_damping_pair!(ps, q_val, dqdt_val, Γ_dt)
+    _apply_damping_pairs!(ps, Base.tail(pairs), Γ_dt)
+end
+
+_apply_damping_all!(::Tuple{}, ::Any) = nothing
+@inline function _apply_damping_all!(sys::Tuple, Γ_dt)
+    _apply_damping_pairs!(first(sys), getfield(first(sys), :pairs), Γ_dt)
+    _apply_damping_all!(Base.tail(sys), Γ_dt)
 end
 
 # ---------------------------------------------------------------------------
@@ -479,6 +504,7 @@ function time_integrate!(
     vsys  = integrator.virtual_systems
     T     = typeof(integrator.c)
     dt    = T(CFL) * integrator.h / integrator.c
+    Γ     = integrator.Γ
 
     num_stages = length(integrator.interactions[1].pfns)
     @assert all(length(inter.pfns) == num_stages for inter in integrator.interactions) "All interactions must have the same number of stages (pfns length), got: $(map(inter -> length(inter.pfns), integrator.interactions))"
@@ -550,6 +576,9 @@ function time_integrate!(
         _sweep_all_stages!(sys, vsys, integrator.ghosts, ints, num_stages, to,
                            ps_labels, ghost_labels, inter_labels)
 
+        # ---- 8b. Velocity damping: dvdt -= (Γ/dt) * v ----------------------
+        iszero(Γ) || _apply_damping_all!(sys, Γ / dt)
+
         # ---- 9. Full-step: update q = q0 + dt·dqdt -------------------------
         _fullstep_q_all!(sys, q0_bufs, dt, to, ps_labels, 1)
 
@@ -600,6 +629,7 @@ function time_integrate!(
     vsys = integrator.virtual_systems
     T    = typeof(integrator.c)
     dt   = T(CFL) * integrator.h / integrator.c
+    Γ    = integrator.Γ
 
     num_stages = length(integrator.interactions[1].pfns)
     @assert all(length(inter.pfns) == num_stages for inter in integrator.interactions) "All interactions must have the same number of stages (pfns length), got: $(map(inter -> length(inter.pfns), integrator.interactions))"
@@ -677,6 +707,8 @@ function time_integrate!(
 
             @timeit to "sweep" @timeit to rk_label _sweep_all_stages!(
                 sys, vsys, integrator.ghosts, ints, num_stages, to, ps_labels, ghost_labels, inter_labels)
+
+            iszero(Γ) || _apply_damping_all!(sys, Γ / dt)
 
             _acc_dqdt_all!(sys, acc_bufs, rk4_weight[rk_iter])
         end
