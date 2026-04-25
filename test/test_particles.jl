@@ -129,11 +129,27 @@ using StaticArrays
 
     @testset "custom state updater p = rho + c" begin
         ps = FluidParticleSystem("test", 10, 3, 1.0, 10.0;
-            state_updater = (ps, i) -> ps.p[i] = ps.rho[i] + ps.c)
+            state_updater = (ps, i, dt) -> ps.p[i] = ps.rho[i] + ps.c)
         ps.rho .= 0.0:9.0
         update_state!(ps)
         for i in 1:10
             @test ps.p[i] ≈ (i - 1) + 10.0
+        end
+    end
+
+    @testset "virtual prescribed velocity is not accumulated when v is auto-zeroed" begin
+        ps = BasicParticleSystem("source", 2, 2, 1.0, 1.0)
+        v_prescribed = SVector(0.0, -0.005)
+        vps = VirtualParticleSystem(ps, "virtual", 2, 2, 1.0, 1.0;
+            zero_fields   = (:v,),
+            prescribed_v  = v_prescribed,
+            state_updater = (nothing, (PrescribedVelocityUpdater(),)),
+        )
+
+        for _ in 1:3
+            Grasph.auto_zero_virtual!(vps)
+            update_state!(vps, 2, 0.1)
+            @test all(==(v_prescribed), ps.v)
         end
     end
 

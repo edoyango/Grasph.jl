@@ -1,6 +1,4 @@
-export AbstractTimeIntegrator, LeapFrogTimeIntegrator, RK4TimeIntegrator, time_integrate!, run_driver!
-
-using ArgParse
+export AbstractTimeIntegrator, LeapFrogTimeIntegrator, RK4TimeIntegrator, time_integrate!
 
 # ---------------------------------------------------------------------------
 # Integrator types
@@ -390,19 +388,19 @@ end
 
 # Run one full sweep pass: auto-zero virtuals, then per-stage state updates,
 # ghost updates, virtual state updates, and interaction sweeps.
-function _sweep_all_stages!(sys, virtual_sys, ghosts, ints, num_stages, to, ps_labels, ghost_labels, inter_labels)
+function _sweep_all_stages!(sys, virtual_sys, ghosts, ints, num_stages, to, ps_labels, ghost_labels, inter_labels, dt)
     _auto_zero_all_virtual!(virtual_sys)
     for stage in 1:num_stages
         for (i, ps) in enumerate(sys)
             length(ps.state_updater) == num_stages || continue
-            @timeit to ps_labels[i].upd @timeit to ps_labels[i].name update_state!(ps, stage)
+            @timeit to ps_labels[i].upd @timeit to ps_labels[i].name update_state!(ps, stage, dt)
         end
         for (i, ge) in enumerate(ghosts)
             @timeit to ghost_labels[i].stage @timeit to ghost_labels[i].name update_ghost!(ge, stage)
         end
         for vps in virtual_sys
             length(vps.state_updater) == num_stages || continue
-            update_state!(vps, stage)
+            update_state!(vps, stage, dt)
         end
         for (i, inter) in enumerate(ints)
             @timeit to inter_labels[i].sweep @timeit to inter_labels[i].name sweep!(inter, stage)
@@ -448,6 +446,7 @@ function _maybe_save!(sys, ghosts, virtual_sys, to, global_step, save_interval_s
             d    = dirname(path)
             !isempty(d) && mkpath(d)
             h5open(path, "w") do f
+                HDF5.attrs(f)["step"]     = global_step
                 HDF5.attrs(f)["sim_time"] = Float64(global_step * dt)
                 for ps in sys
                     write_h5(ps, create_group(f, ps.name))
@@ -574,7 +573,7 @@ function time_integrate!(
 
         # ---- 8. Sweep (auto-zeros virtual fields before stage loop) --------
         _sweep_all_stages!(sys, vsys, integrator.ghosts, ints, num_stages, to,
-                           ps_labels, ghost_labels, inter_labels)
+                           ps_labels, ghost_labels, inter_labels, dt)
 
         # ---- 8b. Velocity damping: dvdt -= (Γ/dt) * v ----------------------
         iszero(Γ) || _apply_damping_all!(sys, Γ / dt)
@@ -706,7 +705,7 @@ function time_integrate!(
             end
 
             @timeit to "sweep" @timeit to rk_label _sweep_all_stages!(
-                sys, vsys, integrator.ghosts, ints, num_stages, to, ps_labels, ghost_labels, inter_labels)
+                sys, vsys, integrator.ghosts, ints, num_stages, to, ps_labels, ghost_labels, inter_labels, dt)
 
             iszero(Γ) || _apply_damping_all!(sys, Γ / dt)
 
@@ -732,161 +731,4 @@ function time_integrate!(
 
     print_timer && show(to; allocations=true, compact=false)
     return to
-end
-
-# ---------------------------------------------------------------------------
-# Interactive driver helpers
-# ---------------------------------------------------------------------------
-
-function _prompt_int(label::AbstractString, default::Int)
-    print("  $label [$default]: ")
-    s = strip(readline())
-    isempty(s) && return default
-    v = tryparse(Int, s)
-    v === nothing && (println("  Invalid, keeping $default."); return default)
-    return v
-end
-
-function _prompt_float(label::AbstractString, default::Float64)
-    print("  $label [$default]: ")
-    s = strip(readline())
-    isempty(s) && return default
-    v = tryparse(Float64, s)
-    v === nothing && (println("  Invalid, keeping $default."); return default)
-    return v
-end
-
-function _prompt_prefix(default)
-    dflt_str = default === nothing ? "none" : string(default)
-    print("  Output prefix [$dflt_str] (\"none\" to disable): ")
-    s = strip(readline())
-    isempty(s) && return default
-    s == "none" && return nothing
-    return s
-end
-
-# ---------------------------------------------------------------------------
-# run_driver!
-# ---------------------------------------------------------------------------
-
-"""
-    run_driver!(integrator, num_timesteps, print_interval_step,
-                save_interval_step, CFL, output_prefix; interactive=true)
-
-High-level simulation driver wrapping any `AbstractTimeIntegrator`.
-
-## Interactive mode (`interactive=true`, default)
-
-Runs `num_timesteps` steps, prints a per-batch timing summary, then asks:
-
-    Steps to continue [0 to stop]:
-
-Enter a positive integer to keep going, or 0 (or non-integer) to stop.
-After entering a step count the driver asks whether to change settings;
-entering `y` prompts for each of `print_interval_step`, `save_interval_step`,
-`CFL`, and `output_prefix` — press Enter to keep the current value.
-
-A cumulative timing table is printed when the simulation finishes.
-
-## Non-interactive mode (`interactive=false`)
-
-Runs `num_timesteps` steps and exits. Equivalent to `time_integrate!` but
-with the same global step-counter bookkeeping (HDF5 files are numbered from
-`step_offset + 1`).
-
-## HDF5 file numbering
-
-Files are always numbered by the *global* step counter, so they are
-contiguous across multiple interactive batches.
-"""
-function run_driver!(
-    integrator::AbstractTimeIntegrator,
-    num_timesteps::Int,
-    print_interval_step::Int,
-    save_interval_step::Int,
-    CFL::Real,
-    output_prefix;
-    interactive::Bool = true,
-)
-    global_step = 0
-    to          = TimerOutput()
-    cur_n       = num_timesteps
-    cur_print   = print_interval_step
-    cur_save    = save_interval_step
-    cur_CFL     = Float64(CFL)
-    cur_prefix  = output_prefix
-    cur_interactive = interactive
-
-    # Parse CLI flags from ARGS if any.
-    # Defaults shown in the help text are the values passed to run_driver!.
-    if !isempty(ARGS)
-        ap = ArgParseSettings(; description = "Grasph SPH driver")
-        @add_arg_table! ap begin
-            "--steps", "-s"
-                help    = "number of timesteps to run"
-                arg_type = Int
-                default = cur_n
-            "--print-freq", "-p"
-                help    = "print every N steps"
-                arg_type = Int
-                default = cur_print
-            "--save-freq", "-f"
-                help    = "save every N steps"
-                arg_type = Int
-                default = cur_save
-            "--cfl", "-c"
-                help    = "CFL number"
-                arg_type = Float64
-                default = cur_CFL
-            "--non-interactive", "-n"
-                help    = "disable interactive prompt between batches"
-                action  = :store_true
-            "--output-prefix", "-o"
-                help    = "output file prefix"
-                arg_type = String
-                default = cur_prefix
-        end
-        parsed = parse_args(ARGS, ap)
-        cur_n           = parsed["steps"]
-        cur_print       = parsed["print-freq"]
-        cur_save        = parsed["save-freq"]
-        cur_CFL         = parsed["cfl"]
-        cur_prefix      = parsed["output-prefix"]
-        cur_interactive = interactive && !parsed["non-interactive"]
-    end
-
-    while true
-        time_integrate!(
-            integrator, cur_n, cur_print, cur_save, cur_CFL, cur_prefix;
-            step_offset = global_step,
-            print_timer = false,
-            to          = to,
-        )
-        global_step += cur_n
-
-        println("\n--- Batch complete (total steps: $global_step) ---")
-        show(to; allocations=true, compact=false)
-        println()
-
-        cur_interactive || break
-
-        print("\nSteps to continue [0 to stop]: ")
-        line   = strip(readline())
-        n_more = tryparse(Int, line)
-        (n_more === nothing || n_more <= 0) && break
-        cur_n = n_more
-
-        print("Change settings? [y/N]: ")
-        if strip(readline()) in ("y", "Y")
-            cur_print  = _prompt_int("Print every N steps", cur_print)
-            cur_save   = _prompt_int("Save every N steps",  cur_save)
-            cur_CFL    = _prompt_float("CFL", cur_CFL)
-            cur_prefix = _prompt_prefix(cur_prefix)
-        end
-    end
-
-    println("\n=== Accumulated timing ===")
-    show(to; allocations=true, compact=false)
-    println()
-    nothing
 end

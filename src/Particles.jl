@@ -524,33 +524,40 @@ end
 # ---------------------------------------------------------------------------
 
 """
-    update_state!(ps::AbstractParticleSystem, stage)
+    update_state!(ps::AbstractParticleSystem, stage, dt=0.0)
     update_state!(ps::AbstractParticleSystem)
 
-Call each state updater function on all particle indices for the given stage.
+Call each state updater function on all particle indices for the given stage,
+passing the current timestep `dt` to each updater. Pass `dt=0.0` (default)
+for init-time calls where no updater needs a timestep.
 """
-function update_state!(ps::AbstractParticleSystem, stage::Int)
-    _update_state_pfns!(ps, ps.state_updater, stage)
+function update_state!(ps::AbstractParticleSystem, stage::Int, dt::Real=0.0)
+    _update_state_pfns!(ps, ps.state_updater, stage, dt)
     return nothing
 end
-update_state!(ps::AbstractParticleSystem) = update_state!(ps, 1)
+update_state!(ps::AbstractParticleSystem) = update_state!(ps, 1, 0.0)
 
 # Type-stable tuple walk: peel off one updater at a time so `first(updaters)` is
 # always a concrete type, avoiding the Union{A,B} that ps.state_updater[stage::Int]
 # would produce for multi-element heterogeneous tuples.
-_update_state_pfns!(ps, ::Tuple{}, stage) = nothing
-@inline function _update_state_pfns!(ps, updaters::Tuple, stage)
+_update_state_pfns!(ps, ::Tuple{}, stage, dt) = nothing
+@inline function _update_state_pfns!(ps, updaters::Tuple, stage, dt)
     if stage == 1
-        _update_state!(ps, first(updaters))
+        _update_state!(ps, first(updaters), dt)
     else
-        _update_state_pfns!(ps, Base.tail(updaters), stage - 1)
+        _update_state_pfns!(ps, Base.tail(updaters), stage - 1, dt)
     end
 end
 
-_update_state!(ps, ::Nothing) = nothing
-function _update_state!(ps, fn::SFN) where {SFN}
+_update_state!(ps, ::Nothing, dt) = nothing
+_update_state!(ps, ::Tuple{}, dt) = nothing
+function _update_state!(ps, fns::Tuple, dt)
+    _update_state!(ps, first(fns), dt)
+    _update_state!(ps, Base.tail(fns), dt)
+end
+function _update_state!(ps, fn::SFN, dt) where {SFN}
     @inbounds @batch for i in 1:ps.n
-        fn(ps, i)
+        fn(ps, i, dt)
     end
 end
 

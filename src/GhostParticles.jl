@@ -1,5 +1,5 @@
 export AbstractGhostParticleSystem,
-       GhostParticleSystem, GhostCopier,
+       GhostParticleSystem, GhostCopier, HouseholderReflect,
        GhostBoundary, GhostEntry,
        generate_ghosts!, update_ghost!, update_ghost_kinematics!, write_h5
 
@@ -16,17 +16,27 @@ abstract type AbstractGhostParticleSystem{T<:AbstractFloat, ND} <: AbstractParti
 abstract type AbstractGhostUpdater end
 
 """
+    HouseholderReflect()
+
+Marker type selecting symmetric-tensor reflection by Householder transform
+`σ' = H σ H` with `H = I − 2 n̂ n̂ᵀ`, where `n̂` is the per-ghost inward
+normal.  Valid for Voigt stress vectors of length 3, 4, or 6; the dimensions
+of `n̂` and the Voigt length must be consistent.
+"""
+struct HouseholderReflect end
+
+"""
     GhostCopier(:field1, :field2, …)
-    GhostCopier(:field1 => signs1, :field2, …)
+    GhostCopier(:field1 => HouseholderReflect(), :field2, …)
 
 A callable ghost updater that copies the named fields from a ghost's source
 particle system into its owned `extras` arrays when called with a ghost.
 
-Each entry is either a bare `Symbol` (straight copy) or a `Symbol => SVector`
-pair whose `SVector` is applied element-wise to the copied value.  This allows
-individual stress components to be sign-flipped for free-slip walls:
+Each entry is either a bare `Symbol` (straight copy) or a
+`Symbol => HouseholderReflect()` pair which applies a full Householder
+reflection of the symmetric Voigt tensor against the ghost's cached normal:
 
-    GhostCopier(:stress => SVector(1.0, 1.0, -1.0, -1.0))
+    GhostCopier(:stress => HouseholderReflect())
 
 Pass one or more `GhostCopier`s to `GhostParticleSystem` to declare which
 fields should be owned and how they should be refreshed per stage:
@@ -40,35 +50,82 @@ Calling `update_ghost!(ghost, stage)` invokes the stage-th copier.
 Density (:rho) is core kinematics and is updated every step automatically;
 you generally do not need to include it in a copier.
 """
-struct GhostCopier{fields, SIGNS} <: AbstractGhostUpdater end
+struct GhostCopier{fields, MODES} <: AbstractGhostUpdater end
 
 function GhostCopier(entries...)
     flds = ntuple(i -> entries[i] isa Symbol ? entries[i] : first(entries[i]), length(entries))
-    sgns = ntuple(i -> entries[i] isa Symbol ? nothing    : last(entries[i]),  length(entries))
-    GhostCopier{flds, sgns}()
+    mds  = ntuple(i -> entries[i] isa Symbol ? nothing    : last(entries[i]),  length(entries))
+    GhostCopier{flds, mds}()
 end
 
-_updater_fields(::GhostCopier{fields, SIGNS}) where {fields, SIGNS} = fields
+_updater_fields(::GhostCopier{fields, MODES}) where {fields, MODES} = fields
 _updater_fields(::AbstractGhostUpdater) = ()   # fallback for custom updater types
 _updater_fields(::Nothing) = ()
 
-@inline _apply_signs(val, ::Nothing) = val
-@inline _apply_signs(val, signs)     = val .* signs
+# Straight copy — mode nothing leaves the value untouched.
+@inline _apply_mode(val, ::Nothing, n̂) = val
 
-_copy_fields!(ghost, idx, ::Tuple{}, ::Tuple{}) = nothing
-@inline function _copy_fields!(ghost, idx, fields::Tuple, signs::Tuple)
+# 2D Voigt [σ_xx, σ_yy, σ_xy] with 2D normal.
+@inline function _apply_mode(σ::SVector{3,T}, ::HouseholderReflect, n̂::SVector{2,T}) where {T}
+    nx, ny = n̂
+    tx = σ[1]*nx + σ[3]*ny
+    ty = σ[3]*nx + σ[2]*ny
+    s  = tx*nx + ty*ny
+    SVector{3,T}(
+        σ[1] - 4*tx*nx + 4*s*nx*nx,
+        σ[2] - 4*ty*ny + 4*s*ny*ny,
+        σ[3] - 2*(tx*ny + nx*ty) + 4*s*nx*ny,
+    )
+end
+
+# 2D Voigt [σ_xx, σ_yy, σ_zz, σ_xy] with 2D normal — σ_zz is invariant.
+@inline function _apply_mode(σ::SVector{4,T}, ::HouseholderReflect, n̂::SVector{2,T}) where {T}
+    nx, ny = n̂
+    tx = σ[1]*nx + σ[4]*ny
+    ty = σ[4]*nx + σ[2]*ny
+    s  = tx*nx + ty*ny
+    SVector{4,T}(
+        σ[1] - 4*tx*nx + 4*s*nx*nx,
+        σ[2] - 4*ty*ny + 4*s*ny*ny,
+        σ[3],
+        σ[4] - 2*(tx*ny + nx*ty) + 4*s*nx*ny,
+    )
+end
+
+# 3D Voigt [σ_xx, σ_yy, σ_zz, σ_xy, σ_xz, σ_yz] with 3D normal.
+@inline function _apply_mode(σ::SVector{6,T}, ::HouseholderReflect, n̂::SVector{3,T}) where {T}
+    nx, ny, nz = n̂
+    tx = σ[1]*nx + σ[4]*ny + σ[5]*nz
+    ty = σ[4]*nx + σ[2]*ny + σ[6]*nz
+    tz = σ[5]*nx + σ[6]*ny + σ[3]*nz
+    s  = tx*nx + ty*ny + tz*nz
+    SVector{6,T}(
+        σ[1] - 4*tx*nx + 4*s*nx*nx,
+        σ[2] - 4*ty*ny + 4*s*ny*ny,
+        σ[3] - 4*tz*nz + 4*s*nz*nz,
+        σ[4] - 2*(tx*ny + nx*ty) + 4*s*nx*ny,
+        σ[5] - 2*(tx*nz + nx*tz) + 4*s*nx*nz,
+        σ[6] - 2*(ty*nz + ny*tz) + 4*s*ny*nz,
+    )
+end
+
+_copy_fields!(ghost, idx, normals, ::Tuple{}, ::Tuple{}) = nothing
+@inline function _copy_fields!(ghost, idx, normals, fields::Tuple, modes::Tuple)
     fname   = first(fields)
     src_arr = getproperty(getfield(ghost, :source), fname)
     arr     = getproperty(getfield(ghost, :extras), fname)
-    sign    = first(signs)
+    mode    = first(modes)
     @inbounds for k in eachindex(arr)
-        arr[k] = _apply_signs(src_arr[idx[k]], sign)
+        arr[k] = _apply_mode(src_arr[idx[k]], mode, normals[k])
     end
-    _copy_fields!(ghost, idx, Base.tail(fields), Base.tail(signs))
+    _copy_fields!(ghost, idx, normals, Base.tail(fields), Base.tail(modes))
 end
 
-function (::GhostCopier{fields, SIGNS})(ghost::AbstractGhostParticleSystem) where {fields, SIGNS}
-    _copy_fields!(ghost, getfield(ghost, :idx_original), fields, SIGNS)
+function (::GhostCopier{fields, MODES})(ghost::AbstractGhostParticleSystem) where {fields, MODES}
+    _copy_fields!(ghost,
+                  getfield(ghost, :idx_original),
+                  getfield(ghost, :normals),
+                  fields, MODES)
 end
 
 # ---------------------------------------------------------------------------
@@ -111,17 +168,20 @@ every step. Scalar source fields (`mass`, `c`, …) are forwarded directly.
 `idx_original[k]` maps ghost particle k to its source particle index.
 `idx_boundary[k]` maps ghost particle k to the boundary that generated it,
 indexing into the `boundaries` tuple of the associated `GhostEntry`.
+`normals[k]` caches the inward-pointing unit normal of that boundary for
+fast per-ghost reflection operations.
 """
 struct GhostParticleSystem{T<:AbstractFloat, ND, PS<:AbstractParticleSystem{T,ND}, ET<:NamedTuple, UPD<:Tuple} <: AbstractGhostParticleSystem{T, ND}
     name::String
-    x::Vector{SVector{ND,T}}    # reflected positions — owned
-    v::Vector{SVector{ND,T}}    # reflected velocities — owned
-    rho::Vector{T}              # mirrored density — owned
-    idx_original::Vector{Int}   # ghost k → source particle index
-    idx_boundary::Vector{Int}   # ghost k → boundary index in GhostEntry
+    x::Vector{SVector{ND,T}}          # reflected positions — owned
+    v::Vector{SVector{ND,T}}          # reflected velocities — owned
+    rho::Vector{T}                    # mirrored density — owned
+    idx_original::Vector{Int}         # ghost k → source particle index
+    idx_boundary::Vector{Int}         # ghost k → boundary index in GhostEntry
+    normals::Vector{SVector{ND,T}}    # ghost k → inward unit normal (cached)
     source::PS
-    extras::ET                  # owned copies: (p=…, stress=…, …)
-    updaters::UPD               # per-stage GhostCopier or nothing instances
+    extras::ET                        # owned copies: (p=…, stress=…, …)
+    updaters::UPD                     # per-stage GhostCopier or nothing instances
     function GhostParticleSystem{T, ND, PS, ET, UPD}(args...) where {T, ND, PS, ET, UPD}
         ND isa Int || throw(ArgumentError("ND must be an Int, got $(typeof(ND))"))
         new{T, ND, PS, ET, UPD}(args...)
@@ -150,8 +210,9 @@ function GhostParticleSystem(
         Vector{SVector{ND,T}}(undef, n),
         Vector{SVector{ND,T}}(undef, n),
         Vector{T}(undef, n),
-        Vector{Int}(undef, n),   # idx_original
-        Vector{Int}(undef, n),   # idx_boundary
+        Vector{Int}(undef, n),              # idx_original
+        Vector{Int}(undef, n),               # idx_boundary
+        Vector{SVector{ND,T}}(undef, n),     # normals
         ps,
         extras,
         updaters,
@@ -165,7 +226,7 @@ end
 @inline function Base.getproperty(g::GhostParticleSystem{T,ND,PS,ET,UPD}, s::Symbol) where {T,ND,PS,ET,UPD}
     s === :ndims && return ND
     s === :n     && return length(getfield(g, :x))
-    s in (:name, :x, :v, :rho, :idx_original, :idx_boundary, :source, :extras, :updaters) && return getfield(g, s)
+    s in (:name, :x, :v, :rho, :idx_original, :idx_boundary, :normals, :source, :extras, :updaters) && return getfield(g, s)
 
     # Owned copies (p, stress, …) — contiguous, cache-friendly
     s in fieldnames(ET) && return getproperty(getfield(g, :extras), s)
@@ -303,14 +364,16 @@ function generate_ghosts!(ge::GhostEntry{GPS,ND,T,NB}) where {GPS,ND,T,NB}
     resize!(getfield(ghost, :rho),          total)
     resize!(getfield(ghost, :idx_original), total)
     resize!(getfield(ghost, :idx_boundary), total)
+    resize!(getfield(ghost, :normals),      total)
     for arr in getfield(ghost, :extras)
         resize!(arr, total)
     end
 
-    # Second pass: populate positions and index mappings
+    # Second pass: populate positions, index mappings, and cached normals
     x        = getfield(ghost, :x)
     idx_orig = getfield(ghost, :idx_original)
     idx_bnd  = getfield(ghost, :idx_boundary)
+    normals  = getfield(ghost, :normals)
     cursor   = 0
     for (b_idx, b) in enumerate(boundaries)
         @inbounds for i in 1:ps.n
@@ -320,6 +383,7 @@ function generate_ghosts!(ge::GhostEntry{GPS,ND,T,NB}) where {GPS,ND,T,NB}
                 x[cursor]        = ps.x[i] - (2 * da) * b.normal
                 idx_orig[cursor] = i
                 idx_bnd[cursor]  = b_idx
+                normals[cursor]  = b.normal
             end
         end
     end
@@ -339,18 +403,17 @@ using each ghost's `idx_boundary` to select the correct boundary normal.
 """
 function update_ghost_kinematics!(ge::GhostEntry{GPS,ND,T,NB}) where {GPS,ND,T,NB}
     ghost      = ge.ghost
-    boundaries = ge.boundaries
     ps         = getfield(ghost, :source)
     n          = ghost.n
     idx_orig   = getfield(ghost, :idx_original)
-    idx_bnd    = getfield(ghost, :idx_boundary)
+    normals    = getfield(ghost, :normals)
     v_ghost    = getfield(ghost, :v)
     rho_ghost  = getfield(ghost, :rho)
     v_real     = ps.v
     rho_real   = ps.rho
 
     @inbounds for k in 1:n
-        normal       = boundaries[idx_bnd[k]].normal
+        normal       = normals[k]
         v_r          = v_real[idx_orig[k]]
         v_ghost[k]   = v_r - 2 * dot(v_r, normal) * normal
         rho_ghost[k] = rho_real[idx_orig[k]]

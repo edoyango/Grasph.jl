@@ -1,5 +1,6 @@
 export EOSUpdater, TaitEOSUpdater, LinearEOSUpdater, ViscoPlasticMCStressUpdater,
-       ZeroFieldUpdater, ElastoPlasticStressUpdater, VirtualNormUpdater
+       ZeroFieldUpdater, ElastoPlasticStressUpdater, VirtualNormUpdater,
+       PrescribedVelocityUpdater, HookeLawStressUpdater
 
 # ---------------------------------------------------------------------------
 # EOS state updater functors
@@ -30,7 +31,7 @@ struct ZeroFieldUpdater{Syms} <: StateUpdater end
 
 ZeroFieldUpdater(fields::Symbol...) = ZeroFieldUpdater{fields}()
 
-@inline @Base.propagate_inbounds (u::ZeroFieldUpdater{Syms})(ps, i::Int) where {Syms} =
+@inline @Base.propagate_inbounds (u::ZeroFieldUpdater{Syms})(ps, i::Int, dt=nothing) where {Syms} =
     _zero_fields!(ps, i, Syms)
 
 @inline _zero_fields!(ps, i, ::Tuple{}) = nothing
@@ -61,7 +62,7 @@ end
 VirtualNormUpdater(v_mult::SVector{ND,T}, fields::Symbol...) where {ND,T<:AbstractFloat} =
     VirtualNormUpdater{fields, ND, T}(v_mult)
 
-@inline @Base.propagate_inbounds function (u::VirtualNormUpdater{Syms,ND,T})(ps, i::Int) where {Syms,ND,T}
+@inline @Base.propagate_inbounds function (u::VirtualNormUpdater{Syms,ND,T})(ps, i::Int, dt=nothing) where {Syms,ND,T}
     _normalize_fields!(ps, i, ps.w_sum[i], u.v_mult, getfield(ps, :prescribed_v), Syms)
 end
 
@@ -71,6 +72,24 @@ end
     val = iszero(w) ? zero(eltype(arr)) : arr[i] / w
     arr[i] = first(syms) === :v ? val .* v_mult .+ prescribed_v : val
     _normalize_fields!(ps, i, w, v_mult, prescribed_v, Base.tail(syms))
+end
+
+"""
+    PrescribedVelocityUpdater()
+
+State updater for `VirtualParticleSystem` that adds the system's `prescribed_v`
+to each particle's velocity: `v[i] += prescribed_v`.
+
+Use this at the stage just before the sweep that should see the prescribed
+velocity. When no velocity interpolation is performed (`:v` is absent from the
+`VirtualNormUpdater` fields), include this updater and ensure `:v` appears in
+the system's `zero_fields` so accumulator state from the previous timestep does
+not bleed in.
+"""
+struct PrescribedVelocityUpdater <: StateUpdater end
+
+@inline @Base.propagate_inbounds function (::PrescribedVelocityUpdater)(ps, i::Int, dt=nothing)
+    ps.v[i] = ps.v[i] + getfield(ps, :prescribed_v)
 end
 
 abstract type EOSUpdater <: StateUpdater end
@@ -92,7 +111,7 @@ struct TaitEOSUpdater{T} <: EOSUpdater
 end
 TaitEOSUpdater(rho0::T; gamma::T = T(7)) where {T<:AbstractFloat} = TaitEOSUpdater{T}(rho0, gamma)
 
-@inline @Base.propagate_inbounds function (u::TaitEOSUpdater{T})(ps::AbstractParticleSystem{T}, i::Int) where {T}
+@inline @Base.propagate_inbounds function (u::TaitEOSUpdater{T})(ps::AbstractParticleSystem{T}, i::Int, dt=nothing) where {T}
     p = ps.p ; rho = ps.rho
     rho0 = T(u.rho0) ; c = ps.c ; gamma = u.gamma
     p[i] = rho0 * c * c / gamma * ((rho[i] / rho0)^gamma - one(T))
@@ -114,7 +133,7 @@ struct LinearEOSUpdater{T} <: EOSUpdater
 end
 LinearEOSUpdater(rho0::T) where {T<:AbstractFloat} = LinearEOSUpdater{T}(rho0)
 
-@inline @Base.propagate_inbounds function (u::LinearEOSUpdater)(ps::AbstractParticleSystem{T}, i::Int) where {T}
+@inline @Base.propagate_inbounds function (u::LinearEOSUpdater)(ps::AbstractParticleSystem{T}, i::Int, dt=nothing) where {T}
     p = ps.p ; rho = ps.rho
     rho0 = T(u.rho0) ; c = ps.c
     p[i] = c * c * (rho[i] - rho0)
@@ -133,8 +152,8 @@ function ViscoPlasticMCStressUpdater(eos, friction_angle::Real, cohesion::Real)
     ViscoPlasticMCStressUpdater{T, typeof(eos)}(eos, T(friction_angle), T(cohesion))
 end
 
-@inline @Base.propagate_inbounds function (u::ViscoPlasticMCStressUpdater)(ps::AbstractParticleSystem{T}, i::Int) where {T}
-    u.eos(ps, i)
+@inline @Base.propagate_inbounds function (u::ViscoPlasticMCStressUpdater)(ps::AbstractParticleSystem{T}, i::Int, dt=nothing) where {T}
+    u.eos(ps, i, dt)
     stress = ps.stress ; p = ps.p ; strain_rate = ps.strain_rate
     friction_angle = T(u.friction_angle) ; cohesion = T(u.cohesion)
     nelem = length(eltype(stress))
@@ -178,7 +197,7 @@ non-associative plastic flow (dilation angle ψ ≠ friction angle φ).
 Implements a Jaumann-corrected elastic predictor / plastic corrector scheme
 in Voigt notation with NS=4 components (plane-strain: xx, yy, zz, xy).
 
-    upd = ElastoPlasticStressUpdater(E, nu, phi, psi, cohesion, dt)
+    upd = ElastoPlasticStressUpdater(E, nu, phi, psi, cohesion)
 """
 struct ElastoPlasticStressUpdater{T} <: StressUpdater
     E::T
@@ -186,18 +205,16 @@ struct ElastoPlasticStressUpdater{T} <: StressUpdater
     phi::T
     psi::T
     cohesion::T
-    dt::T
 end
 
-function ElastoPlasticStressUpdater(E::Real, nu::Real, phi::Real, psi::Real,
-                                    cohesion::Real, dt::Real)
+function ElastoPlasticStressUpdater(E::Real, nu::Real, phi::Real, psi::Real, cohesion::Real)
     T = float(promote_type(typeof(E), typeof(nu), typeof(phi),
-                           typeof(psi), typeof(cohesion), typeof(dt)))
-    ElastoPlasticStressUpdater{T}(T(E), T(nu), T(phi), T(psi), T(cohesion), T(dt))
+                           typeof(psi), typeof(cohesion)))
+    ElastoPlasticStressUpdater{T}(T(E), T(nu), T(phi), T(psi), T(cohesion))
 end
 
 @inline @Base.propagate_inbounds function (u::ElastoPlasticStressUpdater)(
-        ps::AbstractParticleSystem{T}, i::Int) where {T}
+        ps::AbstractParticleSystem{T}, i::Int, dt::Real) where {T}
 
     @assert length(eltype(ps.stress)) == 4 "ElastoPlasticStressUpdater requires NS=4 (plane-strain Voigt). Got NS=$(length(eltype(ps.stress)))."
 
@@ -206,7 +223,7 @@ end
     φ        = T(u.phi)
     ψ        = T(u.psi)
     cohesion = T(u.cohesion)
-    dt       = T(u.dt)
+    dt       = T(dt)
 
     # Step 1 — Read current state
     σ  = ps.stress[i]       # SVector{4,T}: [xx, yy, zz, xy]
@@ -315,4 +332,74 @@ end
     end
     ps.strain[i]   += SVector(dε_xx, dε_yy, dε_zz, dε_xy)
     ps.strain_p[i] += SVector(dε_p_xx, dε_p_yy, dε_p_zz, dε_p_xy)
+end
+
+"""
+    HookeLawStressUpdater(E, nu, dt)
+
+Pure linear-elastic (Hooke's law) stress updater for plane-strain SPH solids.
+Operates on `ElastoPlasticParticleSystem` with NS=4 (Voigt order: xx, yy, zz, xy).
+
+At each call the elastic stress increment is:
+
+    Δσ = D_e : Δε,   Δε = ε̇ · dt
+
+followed by the Jaumann objective rate correction (uses current vorticity ω):
+
+    Δσ_xx -= 2 σ_xy ω dt
+    Δσ_yy += 2 σ_xy ω dt
+    Δσ_xy += (σ_xx - σ_yy) ω dt
+
+The mean normal stress is stored in `ps.p[i]` as the isotropic pressure
+(positive compressive convention: p = −tr(σ)/3).
+"""
+struct HookeLawStressUpdater{T} <: StressUpdater
+    E::T
+    nu::T
+end
+
+function HookeLawStressUpdater(E::Real, nu::Real)
+    T = float(promote_type(typeof(E), typeof(nu)))
+    HookeLawStressUpdater{T}(T(E), T(nu))
+end
+
+@inline @Base.propagate_inbounds function (u::HookeLawStressUpdater{T})(
+        ps::AbstractParticleSystem{T}, i::Int, dt::Real) where {T}
+
+    @assert length(eltype(ps.stress)) == 4 "HookeLawStressUpdater requires NS=4 (plane-strain Voigt). Got NS=$(length(eltype(ps.stress)))."
+
+    E  = T(u.E)
+    ν  = T(u.nu)
+    dt = T(dt)
+
+    σ  = ps.stress[i]       # SVector{4,T}: [xx, yy, zz, xy]
+    ε̇  = ps.strain_rate[i]  # SVector{4,T}
+    ω  = ps.vorticity[i]    # T (scalar, 2D: ω_xy component)
+
+    σ_xx = σ[1];  σ_yy = σ[2];  σ_zz = σ[3];  σ_xy = σ[4]
+
+    dε_xx = ε̇[1] * dt
+    dε_yy = ε̇[2] * dt
+    dε_zz = ε̇[3] * dt
+    dε_xy = ε̇[4] * dt
+
+    D0 = E / ((one(T) + ν) * (one(T) - 2*ν))
+    dσ_xx = D0 * ((one(T) - ν)*dε_xx + ν*dε_yy + ν*dε_zz)
+    dσ_yy = D0 * (ν*dε_xx + (one(T) - ν)*dε_yy + ν*dε_zz)
+    dσ_zz = D0 * (ν*dε_xx + ν*dε_yy + (one(T) - ν)*dε_zz)
+    dσ_xy = D0 * (one(T) - 2*ν) * dε_xy
+
+    # Jaumann rate correction
+    ω_dt  = ω * dt
+    dσ_xx -= 2*σ_xy * ω_dt
+    dσ_yy += 2*σ_xy * ω_dt
+    dσ_xy += (σ_xx - σ_yy) * ω_dt
+
+    new_xx = σ_xx + dσ_xx
+    new_yy = σ_yy + dσ_yy
+    new_zz = σ_zz + dσ_zz
+    new_xy = σ_xy + dσ_xy
+
+    ps.stress[i] = SVector{4,T}(new_xx, new_yy, new_zz, new_xy)
+    ps.p[i]      = -(new_xx + new_yy + new_zz) / T(3)
 end

@@ -13,7 +13,7 @@ using StaticArrays
     dt       = 0.001
 
     # Setup updater
-    upd = ElastoPlasticStressUpdater(E, nu, phi, psi, cohesion, dt)
+    upd = ElastoPlasticStressUpdater(E, nu, phi, psi, cohesion)
 
     @testset "Elastic increment (Plane Strain 4-elem)" begin
         ps = ElastoPlasticParticleSystem("test", 1, 2, 4, 1.0, 100.0)
@@ -22,7 +22,7 @@ using StaticArrays
         ps.vorticity[1]   = 0.0
         ps.stress[1]      = zero(SVector{4, Float64})
         
-        upd(ps, 1)
+        upd(ps, 1, dt)
         
         D0 = E / ((1 + nu) * (1 - 2*nu))
         deps_xx = 0.1 * dt
@@ -47,7 +47,7 @@ using StaticArrays
         ps.strain_rate[1] = zero(SVector{4, Float64})
         ps.vorticity[1]   = 10.0 
         
-        upd(ps, 1)
+        upd(ps, 1, dt)
         
         # Expected rotation:
         # Δσ_xy = (σ_xx - σ_yy) * ω_xy * dt
@@ -58,14 +58,14 @@ using StaticArrays
 
     @testset "Plastic Return Mapping (Drucker-Prager)" begin
         # Set cohesion very low to ensure yielding
-        upd_plastic = ElastoPlasticStressUpdater(E, nu, phi, psi, 10.0, dt)
+        upd_plastic = ElastoPlasticStressUpdater(E, nu, phi, psi, 10.0)
         ps = ElastoPlasticParticleSystem("test", 1, 2, 4, 1.0, 100.0)
         
         # Pure shear loading
         ps.strain_rate[1] = SVector(0.0, 0.0, 0.0, 100.0) 
         ps.stress[1]      = zero(SVector{4, Float64})
         
-        upd_plastic(ps, 1)
+        upd_plastic(ps, 1, dt)
         
         alpha_phi = 2 * sin(phi) / (sqrt(3) * (3 - sin(phi)))
         k_c       = 6 * 10.0 * cos(phi) / (sqrt(3) * (3 - sin(phi)))

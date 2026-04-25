@@ -42,7 +42,6 @@ const psi      = 19.0 * π / 180.0
 const cohesion = 0.0
 
 const c_sound = sqrt(E * (1 - nu) / (rho0 * (1 + nu) * (1 - 2*nu)))
-const dt_ep   = 0.1 * h_sph / c_sound
 
 const nx       = 264   # soil columns (13.2 m)
 const ny       = 100   # soil rows    ( 5.0 m)
@@ -66,7 +65,7 @@ soil = ElastoPlasticParticleSystem(
     state_updater = (
         nothing,
         ZeroFieldUpdater(:strain_rate, :vorticity),
-        ElastoPlasticStressUpdater(E, nu, phi, psi, cohesion, dt_ep),
+        ElastoPlasticStressUpdater(E, nu, phi, psi, cohesion),
         nothing,
     ),
 )
@@ -112,14 +111,14 @@ fill!(bottom_source.v, zero(SVector{2,Float64}))
 
 _trapdoor_updater = (
     nothing,
-    VirtualNormUpdater(SVector(0.0, 0.0), :rho),
+    (VirtualNormUpdater(SVector(0.0, 0.0), :rho), PrescribedVelocityUpdater()),
     nothing,
     VirtualNormUpdater(SVector(0.0, 0.0), :stress),
 )
 
 bottom_virt = VirtualParticleSystem(
     bottom_source, "bottom_virt", n_bottom, 2, soil_mass, c_sound;
-    zero_fields   = (:rho, :stress),
+    zero_fields   = (:v, :rho, :stress),
     state_updater = _trapdoor_updater,
 )
 
@@ -148,13 +147,13 @@ fill!(trapdoor_source.v, zero(SVector{2,Float64}))
 
 trapdoor_static_virt = VirtualParticleSystem(
     trapdoor_source, "trapdoor_static_virt", n_trapdoor, 2, soil_mass, c_sound;
-    zero_fields   = (:rho, :stress),
+    zero_fields   = (:v, :rho, :stress),
     state_updater = _trapdoor_updater,
 )
 
 trapdoor_moving_virt = VirtualParticleSystem(
     trapdoor_source, "trapdoor_moving_virt", n_trapdoor, 2, soil_mass, c_sound;
-    zero_fields   = (:rho, :stress),
+    zero_fields   = (:v, :rho, :stress),
     prescribed_v  = SVector(0.0, trapdoor_vel),
     state_updater = _trapdoor_updater,
 )
@@ -166,7 +165,7 @@ trapdoor_moving_virt = VirtualParticleSystem(
 walls_ghost = GhostParticleSystem(soil,
     nothing,
     nothing,
-    GhostCopier(:stress => SVector(1.0, 1.0, 1.0, -1.0)),   # stage 3: copy updated stress ready for virtual stress accum and kin sweep
+    GhostCopier(:stress => HouseholderReflect()),   # stage 3: copy updated stress ready for virtual stress accum and kin sweep
     nothing,
 )
 
@@ -217,12 +216,7 @@ integrator_moving = LeapFrogTimeIntegrator(
 # ---------------------------------------------------------------------------
 
 println("n_soil=$n_soil  n_bottom=$n_bottom  n_trapdoor=$n_trapdoor")
-println("c_sound=$(round(c_sound; digits=2)) m/s  dt_ep=$(round(dt_ep; sigdigits=4)) s")
-
-# The "moving" stage starts from whatever state "damping" leaves behind
-# (or from the restart file, if --restart is passed). The prescribed trapdoor
-# velocity is only active in the moving stage, so set it before run_driver!.
-fill!(trapdoor_source.v, SVector{2,Float64}(0.0, trapdoor_vel))
+println("c_sound=$(round(c_sound; digits=2)) m/s")
 
 stages = [
     Stage(integrator_static, 20000,  0.1, "damping"),

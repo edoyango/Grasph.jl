@@ -26,35 +26,33 @@ _floor_entry(ghost; cutoff=0.15) =
 
 @testset "GhostCopier construction — type parameters" begin
 
-    @testset "bare symbol produces nothing sign" begin
+    @testset "bare symbol produces nothing mode" begin
         gc = GhostCopier(:stress)
-        fields, signs = typeof(gc).parameters
+        fields, modes = typeof(gc).parameters
         @test fields == (:stress,)
-        @test signs  == (nothing,)
+        @test modes  == (nothing,)
     end
 
-    @testset "symbol => SVector stores SVector in type parameter" begin
-        sv = SVector(1.0, 1.0, -1.0, -1.0)
-        gc = GhostCopier(:stress => sv)
-        fields, signs = typeof(gc).parameters
+    @testset "symbol => HouseholderReflect stores marker in type parameter" begin
+        gc = GhostCopier(:stress => HouseholderReflect())
+        fields, modes = typeof(gc).parameters
         @test fields   == (:stress,)
-        @test signs[1] == sv
+        @test modes[1] === HouseholderReflect()
     end
 
-    @testset "multiple bare symbols — all signs are nothing" begin
+    @testset "multiple bare symbols — all modes are nothing" begin
         gc = GhostCopier(:rho, :stress)
-        fields, signs = typeof(gc).parameters
+        fields, modes = typeof(gc).parameters
         @test fields == (:rho, :stress)
-        @test all(s -> s === nothing, signs)
+        @test all(m -> m === nothing, modes)
     end
 
-    @testset "mixed entries — field order and sign pairing preserved" begin
-        sv = SVector(1.0, -1.0, 1.0, -1.0)
-        gc = GhostCopier(:rho, :stress => sv)
-        fields, signs = typeof(gc).parameters
+    @testset "mixed entries — field order and mode pairing preserved" begin
+        gc = GhostCopier(:rho, :stress => HouseholderReflect())
+        fields, modes = typeof(gc).parameters
         @test fields   == (:rho, :stress)
-        @test signs[1] === nothing
-        @test signs[2] == sv
+        @test modes[1] === nothing
+        @test modes[2] === HouseholderReflect()
     end
 
     @testset "single bare symbol is a GhostCopier subtype" begin
@@ -182,37 +180,36 @@ end
 end
 
 # ---------------------------------------------------------------------------
-# Sign application
+# Householder reflection
 # ---------------------------------------------------------------------------
 
-@testset "GhostCopier sign application" begin
+@testset "GhostCopier Householder reflection" begin
 
-    @testset "negate last component of stress" begin
+    @testset "4-comp Voigt on floor normal (0,1) flips only σ_xy" begin
         ps = _stress_src(n=2)
         ps.x[1] = SVector(0.1, 0.04)
         ps.x[2] = SVector(0.2, 0.06)
-        signs = SVector(1.0, 1.0, 1.0, -1.0)
         ps.stress[1] = SVector(10.0, 20.0, 30.0,  5.0)
         ps.stress[2] = SVector(-5.0, -5.0,  0.0, -3.0)
 
-        g     = GhostParticleSystem(ps, GhostCopier(:stress => signs))
+        g     = GhostParticleSystem(ps, GhostCopier(:stress => HouseholderReflect()))
         entry = _floor_entry(g)
         generate_ghosts!(entry)
         update_ghost!(g, 1)
 
+        expected = SVector(1.0, 1.0, 1.0, -1.0)
         for k in 1:g.n
             src = ps.stress[g.idx_original[k]]
-            @test g.stress[k] ≈ src .* signs
+            @test g.stress[k] ≈ src .* expected
         end
     end
 
     @testset "free-slip wall pattern — normal stresses preserved, shear negated" begin
         ps = _stress_src(n=1)
         ps.x[1] = SVector(0.1, 0.04)
-        signs = SVector(1.0, 1.0, 1.0, -1.0)
         ps.stress[1] = SVector(-100.0, -50.0, 10.0, 7.0)
 
-        g     = GhostParticleSystem(ps, GhostCopier(:stress => signs))
+        g     = GhostParticleSystem(ps, GhostCopier(:stress => HouseholderReflect()))
         entry = _floor_entry(g)
         generate_ghosts!(entry)
         update_ghost!(g, 1)
@@ -223,55 +220,78 @@ end
         @test g.stress[1][4] ≈ -ps.stress[1][4]
     end
 
-    @testset "negate all components" begin
+    @testset "3-comp Voigt on floor normal (0,1) flips only σ_xy" begin
         ps = _stress_src(n=1, nstress=3)
         ps.x[1] = SVector(0.1, 0.04)
-        signs = SVector(-1.0, -1.0, -1.0)
         ps.stress[1] = SVector(10.0, -5.0, 3.0)
 
-        g     = GhostParticleSystem(ps, GhostCopier(:stress => signs))
+        g     = GhostParticleSystem(ps, GhostCopier(:stress => HouseholderReflect()))
         entry = _floor_entry(g)
         generate_ghosts!(entry)
         update_ghost!(g, 1)
 
-        @test g.stress[1] ≈ SVector(-10.0, 5.0, -3.0)
+        @test g.stress[1] ≈ SVector(10.0, -5.0, -3.0)
     end
 
-    @testset "identity signs produces same result as bare symbol copy" begin
+    @testset "4-comp reflection with 45° normal swaps σ_xx ↔ σ_yy, leaves σ_zz and σ_xy" begin
         ps = _stress_src(n=1)
-        ps.x[1] = SVector(0.1, 0.04)
-        signs = SVector(1.0, 1.0, 1.0, 1.0)
-        ps.stress[1] = SVector(7.0, 8.0, 9.0, 10.0)
+        ps.x[1] = SVector(0.05, 0.05)
+        ps.stress[1] = SVector(10.0, 20.0, 30.0, 7.0)
 
-        g     = GhostParticleSystem(ps, GhostCopier(:stress => signs))
-        entry = _floor_entry(g)
+        g      = GhostParticleSystem(ps, GhostCopier(:stress => HouseholderReflect()))
+        n̂      = SVector(1.0/√2, 1.0/√2)
+        entry  = GhostEntry(g, 0.2, (n̂, SVector(0.0, 0.0)))
         generate_ghosts!(entry)
         update_ghost!(g, 1)
 
-        @test g.stress[1] == ps.stress[1]
+        @test g.stress[1] ≈ SVector(20.0, 10.0, 30.0, 7.0)
     end
 
-    @testset "alternating signs (+1,-1,+1,-1) apply per component" begin
-        ps = _stress_src(n=1)
-        ps.x[1] = SVector(0.1, 0.04)
-        signs = SVector(1.0, -1.0, 1.0, -1.0)
-        ps.stress[1] = SVector(2.0, 4.0, 6.0, 8.0)
+    @testset "6-comp Voigt 3D floor normal (0,0,1) flips σ_xz and σ_yz only" begin
+        ps = StressParticleSystem("src3d", 1, 3, 6, 1.0, 20.0)
+        ps.rho[1]    = 1.0
+        ps.v[1]      = zero(SVector{3,Float64})
+        ps.x[1]      = SVector(0.05, 0.05, 0.05)
+        ps.stress[1] = SVector(1.0, 2.0, 3.0, 4.0, 5.0, 6.0)
 
-        g     = GhostParticleSystem(ps, GhostCopier(:stress => signs))
-        entry = _floor_entry(g)
+        g     = GhostParticleSystem(ps, GhostCopier(:stress => HouseholderReflect()))
+        entry = GhostEntry(g, 0.2, (SVector(0.0, 0.0, 1.0), SVector(0.0, 0.0, 0.0)))
         generate_ghosts!(entry)
         update_ghost!(g, 1)
 
-        @test g.stress[1] ≈ SVector(2.0, -4.0, 6.0, -8.0)
+        @test g.stress[1] ≈ SVector(1.0, 2.0, 3.0, 4.0, -5.0, -6.0)
     end
 
-    @testset "sign application recomputed on each update_ghost! call" begin
+    @testset "per-ghost normals come from idx_boundary (multi-boundary entry)" begin
+        # Two boundaries: a floor (0,1) and a left wall (1,0). Place two particles
+        # so that exactly one ghost is generated from each. The shear flip direction
+        # should match whichever normal generated the ghost.
+        ps = _stress_src(n=2)
+        ps.x[1] = SVector(0.04, 0.20)   # qualifies for left wall (x=0)
+        ps.x[2] = SVector(0.20, 0.04)   # qualifies for floor    (y=0)
+        ps.stress[1] = SVector(1.0, 2.0, 3.0, 4.0)
+        ps.stress[2] = SVector(5.0, 6.0, 7.0, 8.0)
+
+        g     = GhostParticleSystem(ps, GhostCopier(:stress => HouseholderReflect()))
+        entry = GhostEntry(g, 0.15,
+                           (SVector(1.0, 0.0), SVector(0.0, 0.0)),   # left wall: normal (1,0) flips σ_xy
+                           (SVector(0.0, 1.0), SVector(0.0, 0.0)))   # floor:     normal (0,1) flips σ_xy
+        generate_ghosts!(entry)
+        update_ghost!(g, 1)
+
+        @test g.n == 2
+        for k in 1:g.n
+            src = ps.stress[g.idx_original[k]]
+            @test g.stress[k] ≈ SVector(src[1], src[2], src[3], -src[4])
+        end
+    end
+
+    @testset "reflection recomputed on each update_ghost! call" begin
         ps = _stress_src(n=1)
         ps.x[1] = SVector(0.1, 0.04)
-        signs = SVector(1.0, 1.0, 1.0, -1.0)
         ps.stress[1] = SVector(1.0, 2.0, 3.0, 4.0)
 
-        g     = GhostParticleSystem(ps, GhostCopier(:stress => signs))
+        g     = GhostParticleSystem(ps, GhostCopier(:stress => HouseholderReflect()))
         entry = _floor_entry(g)
         generate_ghosts!(entry)
         update_ghost!(g, 1)
@@ -340,14 +360,13 @@ end
         @test g.stress[1] == zero(SVector{4,Float64})
     end
 
-    @testset "stage-1 plain copy then stage-2 sign-flipped copy are independent" begin
+    @testset "stage-1 plain copy then stage-2 Householder reflect are independent" begin
         ps = _stress_src(n=1)
         ps.x[1] = SVector(0.1, 0.04)
-        signs = SVector(1.0, 1.0, -1.0, -1.0)
 
         g = GhostParticleSystem(ps,
-            GhostCopier(:stress),              # stage 1: plain
-            GhostCopier(:stress => signs),     # stage 2: sign-flipped
+            GhostCopier(:stress),                            # stage 1: plain
+            GhostCopier(:stress => HouseholderReflect()),    # stage 2: reflect
         )
         entry = _floor_entry(g)
         generate_ghosts!(entry)
@@ -358,22 +377,22 @@ end
         @test g.stress[1] == ps.stress[1]
 
         update_ghost!(g, 2)
-        @test g.stress[1] ≈ ps.stress[1] .* signs
+        # Floor normal (0,1): only σ_xy flips.
+        @test g.stress[1] ≈ SVector(10.0, 20.0, 5.0, 3.0)
     end
 
     @testset "four-stage layout mirrors Trapdoor pattern" begin
-        # Stage 1: copy stress with shear sign-flip
+        # Stage 1: reflect stress
         # Stage 2: nothing
-        # Stage 3: copy stress with shear sign-flip (after EP update)
+        # Stage 3: reflect stress (after EP update)
         # Stage 4: nothing
-        signs = SVector(1.0, 1.0, 1.0, -1.0)
         ps = _stress_src(n=1)
         ps.x[1] = SVector(0.1, 0.04)
 
         g = GhostParticleSystem(ps,
-            GhostCopier(:stress => signs),
+            GhostCopier(:stress => HouseholderReflect()),
             nothing,
-            GhostCopier(:stress => signs),
+            GhostCopier(:stress => HouseholderReflect()),
             nothing,
         )
         entry = _floor_entry(g)
@@ -381,7 +400,7 @@ end
 
         ps.stress[1] = SVector(1.0, 2.0, 3.0, 4.0)
         update_ghost!(g, 1)
-        @test g.stress[1] ≈ ps.stress[1] .* signs
+        @test g.stress[1] ≈ SVector(1.0, 2.0, 3.0, -4.0)
 
         # Stage 2 + 4 are nothing — do not update
         ps.stress[1] = SVector(9.0, 9.0, 9.0, 9.0)
@@ -393,7 +412,7 @@ end
 
         # Stage 3 fires with new source values
         update_ghost!(g, 3)
-        @test g.stress[1] ≈ ps.stress[1] .* signs
+        @test g.stress[1] ≈ SVector(9.0, 9.0, 9.0, -9.0)
     end
 
 end

@@ -205,7 +205,7 @@ end
     @testset "update_state! called once per system per step" begin
         call_count = Ref(0)
         ps = FluidParticleSystem("fluid", 1, 2, 1.0, 10.0;
-            state_updater = (ps, i) -> (call_count[] += 1; ps.p[i] = 0.0)
+            state_updater = (ps, i, dt) -> (call_count[] += 1; ps.p[i] = 0.0)
         )
         fill!(ps.x, SVector(0.5, 0.5))
         fill!(ps.v, zero(SVector{2,Float64}))
@@ -267,8 +267,8 @@ end
         counts = [Ref(0), Ref(0)]
         ps = BasicParticleSystem("fluid", 1, 2, 1.0, 10.0;
             state_updater = (
-                (ps, i) -> counts[1][] += 1,
-                (ps, i) -> counts[2][] += 1,
+                (ps, i, dt) -> counts[1][] += 1,
+                (ps, i, dt) -> counts[2][] += 1,
             )
         )
         fill!(ps.x, SVector(0.3, 0.3))
@@ -366,89 +366,191 @@ end
 # run_driver! — CLI overrides
 # ---------------------------------------------------------------------------
 
-@testset "run_driver! CLI overrides" begin
-    
-    @testset "Non-interactive and steps override (-n, -s)" begin
+function _with_args(f, argv::Vector{String})
+    orig = copy(ARGS)
+    empty!(ARGS)
+    append!(ARGS, argv)
+    try
+        f()
+    finally
+        empty!(ARGS)
+        append!(ARGS, orig)
+    end
+end
+
+@testset "run_driver! CLI overrides (per-stage flags)" begin
+
+    @testset "Per-stage --<label>-steps overrides stage length" begin
         lf, ps, _ = _make_lf()
         fill!(ps.x, zero(SVector{2,Float64}))
         fill!(ps.v, SVector(1.0, 0.0))
-        
-        orig_args = copy(ARGS)
-        empty!(ARGS)
-        append!(ARGS, ["-n", "-s", "3"])
-        
-        try
-            # Call with num_timesteps = 10, but CLI should override to 3
+
+        _with_args(["-n", "--main-steps", "3"]) do
             dt = 0.5 * 0.1 / 10.0
-            run_driver!(lf, 10, 100, 100, 0.5, nothing)
-            
-            # Verify only 3 steps were taken
+            run_driver!([Stage(lf, 10, 0.5, "main")], 100, 100, nothing)
             @test ps.x[1][1] ≈ 3 * dt atol=1e-10
             @test ps.x[1][2] ≈ 0.0    atol=1e-10
-        finally
-            empty!(ARGS)
-            append!(ARGS, orig_args)
         end
     end
 
-    @testset "Save frequency override (-f / --save-freq)" begin
+    @testset "Per-stage --<label>-cfl overrides CFL" begin
+        lf, ps, _ = _make_lf()
+        fill!(ps.x, zero(SVector{2,Float64}))
+        fill!(ps.v, SVector(1.0, 0.0))
+
+        _with_args(["-n", "--main-steps", "1", "--main-cfl", "0.25"]) do
+            dt = 0.25 * 0.1 / 10.0
+            run_driver!([Stage(lf, 10, 0.5, "main")], 100, 100, nothing)
+            @test ps.x[1][1] ≈ dt atol=1e-10
+        end
+    end
+
+    @testset "--save-freq / --print-freq remain global" begin
         lf, ps, _ = _make_lf()
         mktempdir() do tmpdir
             prefix = joinpath(tmpdir, "out")
-            
-            orig_args = copy(ARGS)
-            empty!(ARGS)
-            append!(ARGS, ["--non-interactive", "--steps", "4", "--save-freq", "2"])
-            
-            try
-                # Call with save_interval_step = 100, but CLI should override to 2
-                run_driver!(lf, 10, 100, 100, 0.5, prefix)
-                
+            _with_args(["--non-interactive", "--main-steps", "4", "--save-freq", "2", "--print-freq", "1"]) do
+                run_driver!([Stage(lf, 10, 0.5, "main")], 100, 100, prefix)
                 @test  isfile("$(prefix)_2.h5")
                 @test  isfile("$(prefix)_4.h5")
                 @test !isfile("$(prefix)_1.h5")
                 @test !isfile("$(prefix)_3.h5")
-            finally
-                empty!(ARGS)
-                append!(ARGS, orig_args)
             end
         end
     end
 
-    @testset "CFL override (-c / --cfl)" begin
+    @testset "--output-prefix=none disables saving" begin
+        lf, _, _ = _make_lf()
+        mktempdir() do tmpdir
+            prefix = joinpath(tmpdir, "out")
+            _with_args(["-n", "--main-steps", "2", "--output-prefix", "none"]) do
+                run_driver!([Stage(lf, 2, 0.5, "main")], 1, 1, prefix)
+                @test isempty(readdir(tmpdir))
+            end
+        end
+    end
+end
+
+@testset "run_driver! multi-stage behaviour" begin
+
+    @testset "Two stages run sequentially with shared step counter" begin
         lf, ps, _ = _make_lf()
         fill!(ps.x, zero(SVector{2,Float64}))
         fill!(ps.v, SVector(1.0, 0.0))
-        
-        orig_args = copy(ARGS)
-        empty!(ARGS)
-        append!(ARGS, ["-n", "-s", "1", "-c", "0.25"])
-        
-        try
-            # Call with CFL = 0.5, CLI should override to 0.25
-            dt = 0.25 * 0.1 / 10.0
-            run_driver!(lf, 10, 100, 100, 0.5, nothing)
-            
-            @test ps.x[1][1] ≈ dt atol=1e-10
-        finally
-            empty!(ARGS)
-            append!(ARGS, orig_args)
+        dt = 0.5 * 0.1 / 10.0
+        run_driver!(
+            [Stage(lf, 2, 0.5, "damping"), Stage(lf, 3, 0.5, "run")],
+            100, 100, nothing; interactive=false,
+        )
+        @test ps.x[1][1] ≈ 5 * dt atol=1e-10
+    end
+
+    @testset "nothing entries are skipped (no integrator required)" begin
+        lf, ps, _ = _make_lf()
+        fill!(ps.x, zero(SVector{2,Float64}))
+        fill!(ps.v, SVector(1.0, 0.0))
+        dt = 0.5 * 0.1 / 10.0
+        run_driver!([nothing, Stage(lf, 4, 0.5, "run")], 100, 100, nothing; interactive=false)
+        @test ps.x[1][1] ≈ 4 * dt atol=1e-10
+    end
+
+    @testset "--<label>-steps 0 skips that stage" begin
+        lf, ps, _ = _make_lf()
+        fill!(ps.x, zero(SVector{2,Float64}))
+        fill!(ps.v, SVector(1.0, 0.0))
+        dt = 0.5 * 0.1 / 10.0
+        _with_args(["-n", "--damping-steps", "0"]) do
+            run_driver!(
+                [Stage(lf, 5, 0.5, "damping"), Stage(lf, 2, 0.5, "run")],
+                100, 100, nothing,
+            )
+            @test ps.x[1][1] ≈ 2 * dt atol=1e-10
         end
     end
 
-    @testset "Print frequency override (-p / --print-freq)" begin
+    @testset "Duplicate stage labels are rejected" begin
+        lf, _, _ = _make_lf()
+        @test_throws ArgumentError run_driver!(
+            [Stage(lf, 1, 0.5, "main"), Stage(lf, 1, 0.5, "main")],
+            100, 100, nothing; interactive=false,
+        )
+    end
+
+    @testset "All-nothing stages raises ArgumentError" begin
+        @test_throws ArgumentError run_driver!([nothing], 100, 100, nothing; interactive=false)
+    end
+end
+
+@testset "run_driver! HDF5 step attr + restart" begin
+
+    @testset "HDF5 output has step attribute" begin
+        lf, _, _ = _make_lf()
+        mktempdir() do tmpdir
+            prefix = joinpath(tmpdir, "out")
+            run_driver!(
+                [Stage(lf, 3, 0.5, "main")], 3, 3, prefix; interactive=false,
+            )
+            path = "$(prefix)_3.h5"
+            @test isfile(path)
+            h5open(path, "r") do f
+                @test Int(HDF5.attrs(f)["step"][]) == 3
+                @test HDF5.attrs(f)["sim_time"][] isa Float64
+            end
+        end
+    end
+
+    @testset "Restart resumes from checkpointed step and particle state" begin
         lf, ps, _ = _make_lf()
-        orig_args = copy(ARGS)
-        empty!(ARGS)
-        append!(ARGS, ["-n", "-s", "2", "-p", "1"])
-        
-        try
-            # Run 2 steps, print every 1 step (to ensure no crash)
-            run_driver!(lf, 10, 100, 100, 0.5, nothing)
-            @test true
-        finally
-            empty!(ARGS)
-            append!(ARGS, orig_args)
+        fill!(ps.x, zero(SVector{2,Float64}))
+        fill!(ps.v, SVector(1.0, 0.0))
+        dt = 0.5 * 0.1 / 10.0
+
+        mktempdir() do tmpdir
+            prefix = joinpath(tmpdir, "out")
+
+            # First run: 2-step "damping" stage writes a checkpoint at step 2.
+            run_driver!([Stage(lf, 2, 0.5, "damping"), Stage(lf, 0, 0.5, "run")],
+                        2, 2, prefix; interactive=false)
+            ckpt = "$(prefix)_2.h5"
+            @test isfile(ckpt)
+            x_after_damping = ps.x[1][1]
+            @test x_after_damping ≈ 2 * dt atol=1e-10
+
+            # Reset state; fresh driver should restore from checkpoint and only run "run".
+            lf2, ps2, _ = _make_lf()
+            fill!(ps2.x, zero(SVector{2,Float64}))
+            fill!(ps2.v, SVector(1.0, 0.0))
+
+            run_driver!(
+                [Stage(lf2, 2, 0.5, "damping"), Stage(lf2, 3, 0.5, "run")],
+                100, 100, nothing;
+                interactive = false,
+                restart     = ckpt,
+            )
+            # damping (2 steps) is skipped because checkpoint is at step 2; run adds 3 more.
+            @test ps2.x[1][1] ≈ x_after_damping + 3 * dt atol=1e-10
+        end
+    end
+
+    @testset "--restart CLI flag is honoured" begin
+        lf, ps, _ = _make_lf()
+        fill!(ps.x, zero(SVector{2,Float64}))
+        fill!(ps.v, SVector(1.0, 0.0))
+        dt = 0.5 * 0.1 / 10.0
+
+        mktempdir() do tmpdir
+            prefix = joinpath(tmpdir, "out")
+            run_driver!([Stage(lf, 2, 0.5, "main")], 2, 2, prefix; interactive=false)
+            ckpt = "$(prefix)_2.h5"
+
+            lf2, ps2, _ = _make_lf()
+            fill!(ps2.x, zero(SVector{2,Float64}))
+            fill!(ps2.v, SVector(1.0, 0.0))
+            _with_args(["-n", "--restart", ckpt]) do
+                run_driver!([Stage(lf2, 5, 0.5, "main")], 100, 100, nothing)
+            end
+            # main is 5 steps cumulative; checkpoint at step 2 ⇒ 3 more steps run.
+            @test ps2.x[1][1] ≈ 2 * dt + 3 * dt atol=1e-10
         end
     end
 end
