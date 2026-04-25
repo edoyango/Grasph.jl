@@ -23,7 +23,6 @@ const nu       = 0.3                     # Poisson's ratio
 const psi      = 0.0                     # Dilation angle
 const cohesion = 0.0                     # Cohesion
 const c_sound  = sqrt(E*(1-nu)/(rho0*(1+nu)*(1-2*nu))) # speed of sound in solid
-const dt       = 0.1*h_sph/c_sound       # Fixed timestep for stress update
 
 const nfx = Int(floor(0.2 / dx_spacing)) # no. of soil particles in the x direction (= 100)
 const nfy = Int(floor(0.1 / dx_spacing)) # "                          " y direction (= 50)
@@ -48,7 +47,7 @@ fluid = ElastoPlasticParticleSystem(
     source_v = [0.0, -9.81], # gravity
     state_updater = (
         ZeroFieldUpdater(:strain_rate, :vorticity),
-        ElastoPlasticStressUpdater(E, nu, soil_friction_angle, psi, cohesion, dt),
+        ElastoPlasticStressUpdater(E, nu, soil_friction_angle, psi, cohesion),
     )
 )
 
@@ -136,10 +135,8 @@ integrator = LeapFrogTimeIntegrator(
 println("n_fluid = $n_fluid  |  mass = $fluid_mass")
 
 run_driver!(
-    integrator,
-    50000,                # number of timesteps to run for
-    500,                  # frequency to print summary stats to terminal
-    500,                  # frequency to save particle data to disk
-    0.1,                  # the CFL coefficient
-    "ep-gcc-output/sph"   # the output path prefix
+    [Stage(integrator, 50000, 0.1, "run")],
+    500,
+    500,
+    "ep-gcc-output/sph",
 )

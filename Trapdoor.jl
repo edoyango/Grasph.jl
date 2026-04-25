@@ -219,36 +219,20 @@ integrator_moving = LeapFrogTimeIntegrator(
 println("n_soil=$n_soil  n_bottom=$n_bottom  n_trapdoor=$n_trapdoor")
 println("c_sound=$(round(c_sound; digits=2)) m/s  dt_ep=$(round(dt_ep; sigdigits=4)) s")
 
-const _settling_checkpoint = "trapdoor-output/static/sph_20000.h5"
-
-if isfile(_settling_checkpoint)
-    println("\nLoading settled state from $_settling_checkpoint (skipping static phase) ...")
-    h5open(_settling_checkpoint, "r") do f
-        read_h5!(soil, f["soil"])
-    end
-else
-    println("\n=== Phase 1: gravity settling (static trapdoor) ===")
-    run_driver!(
-        integrator_static,
-        20000,
-        1000,
-        1000,
-        0.1,
-        "trapdoor-output/static/sph";
-        interactive = false,
-    )
-end
-
-# set the trapdoor boundary velocity to 0.005
+# The "moving" stage starts from whatever state "damping" leaves behind
+# (or from the restart file, if --restart is passed). The prescribed trapdoor
+# velocity is only active in the moving stage, so set it before run_driver!.
 fill!(trapdoor_source.v, SVector{2,Float64}(0.0, trapdoor_vel))
 
-println("\n=== Phase 2: trapdoor motion ===")
+stages = [
+    Stage(integrator_static, 20000,  0.1, "damping"),
+    Stage(integrator_moving, 500000, 0.1, "moving"),
+]
+
 run_driver!(
-    integrator_moving,
-    500000,
-    2000,
-    2000,
-    0.1,
-    "trapdoor-output/moving/sph";
+    stages,
+    2000,  # print_interval_step
+    2000,  # save_interval_step
+    "trapdoor-output/sph";
     interactive = false,
 )

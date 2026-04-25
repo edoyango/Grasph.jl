@@ -192,10 +192,8 @@ integrator = RK4TimeIntegrator(
 # ---------------------------------------------------------------------------
 
 run_driver!(
-    integrator, 
-    20000,                # run to just before bubble hits boundary.
-    100,                  # frequency to print summary stats to terminal
-    100,                  # frequency to save particle data to disk
-    1.5,                 # the CFL coefficient
-    "bubble2-output/sph"  # the output path prefix
+    [Stage(integrator, 20000, 1.5, "run")],
+    100,
+    100,
+    "bubble2-output/sph",
 )

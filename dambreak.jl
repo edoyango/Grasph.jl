@@ -139,10 +139,8 @@ integrator = LeapFrogTimeIntegrator(
 println("n_fluid = $n_fluid  |  n_boundary = $n_boundary  |  mass = $fluid_mass")
 
 run_driver!(
-    integrator, 
-    100000,                # number of timesteps to run for
-    1000,                  # frequency to print summary stats to terminal
-    1000,                  # frequency to save particle data to disk
-    0.05,                  # the CFL coefficient
-    "dambreak-output/sph"  # the output path prefix
+    [Stage(integrator, 100000, 0.05, "run")],
+    1000,
+    1000,
+    "dambreak-output/sph",
 )

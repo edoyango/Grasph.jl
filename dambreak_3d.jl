@@ -149,10 +149,8 @@ integrator = LeapFrogTimeIntegrator(
 @printf("n_fluid = %d  |  n_boundary = %d  |  mass = %.4g\n", n_fluid, n_boundary, fluid_mass)
 
 run_driver!(
-    integrator, 
-    1000,                # number of timesteps
-    1000,                  # print frequency
-    1000,                  # save frequency
-    0.05,                  # CFL
-    "dambreak-3d-output/sph"
+    [Stage(integrator, 1000, 0.05, "run")],
+    1000,
+    1000,
+    "dambreak-3d-output/sph",
 )

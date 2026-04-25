@@ -98,10 +98,8 @@ integrator = LeapFrogTimeIntegrator(particles, si)
 println("n_particles = $n_particles  |  mass = $(particle_mass)")
 
 run_driver!(
-    integrator, 
-    5000,                # number of timesteps to run for
-    10,                  # frequency to print summary stats to terminal
-    10,                  # frequency to save particle data to disk
-    0.05,                # the CFL coefficient
-    "ellipse-output/sph" # the output path prefix
+    [Stage(integrator, 5000, 0.05, "run")],
+    10,
+    10,
+    "ellipse-output/sph",
 )

@@ -33,7 +33,6 @@ const nu       = 0.3
 const psi      = 0.0
 const cohesion = 0.0
 const c_sound  = sqrt(E * (1 - nu) / (rho0 * (1 + nu) * (1 - 2nu)))
-const dt_ep    = 0.1 * h_sph / c_sound
 
 const nfx = Int(floor(0.2 / dx_spacing))
 const nfy = Int(floor(0.1 / dx_spacing))
@@ -52,7 +51,7 @@ fluid = ElastoPlasticParticleSystem(
     state_updater = (
         nothing,                                                         # stage 1: no update
         ZeroFieldUpdater(:strain_rate, :vorticity),                      # stage 2: zero before strain sweep
-        ElastoPlasticStressUpdater(E, nu, soil_friction_angle, psi, cohesion, dt_ep),  # stage 3: update stress
+        ElastoPlasticStressUpdater(E, nu, soil_friction_angle, psi, cohesion),
         nothing,                                                         # stage 4: no update
     ),
 )
@@ -166,10 +165,8 @@ integrator = LeapFrogTimeIntegrator(
 println("n_fluid = $n_fluid  |  mass = $fluid_mass")
 
 run_driver!(
-    integrator,
-    50000,
+    [Stage(integrator, 50000, 0.1, "run")],
     500,
     500,
-    0.1,
-    "ep-gcc-output2/sph"
+    "ep-gcc-output2/sph",
 )
