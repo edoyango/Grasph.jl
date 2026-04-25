@@ -1,4 +1,4 @@
-export FluidPfn, MultiPhaseFluidPfn, StrainRatePfn, StrainRateVorticityPfn, CauchyFluidPfn, XSPHPfn, InterpolateFieldFn
+export FluidPfn, MultiPhaseFluidPfn, StrainRatePfn, StrainRateVorticityPfn, CauchyFluidPfn, XSPHPfn, InterpolateFieldFn, FluidSolidPfn
 
 # ---------------------------------------------------------------------------
 # Premade pairwise interaction functors
@@ -407,22 +407,84 @@ struct InterpolateFieldFn{fields, ACC_WSUM}
         new{fields, accumulate_wsum}()
 end
 
+_interp_fields_ab!(::Tuple{}, ps_a, ps_b, i, j, kw) = nothing
+@inline @Base.propagate_inbounds function _interp_fields_ab!(fields::Tuple, ps_a, ps_b, i, j, kw)
+    fname = first(fields)
+    getproperty(ps_b, fname)[j] += kw * getproperty(ps_a, fname)[i]
+    _interp_fields_ab!(Base.tail(fields), ps_a, ps_b, i, j, kw)
+end
+
+_interp_fields_ba!(::Tuple{}, ps_a, ps_b, i, j, kw) = nothing
+@inline @Base.propagate_inbounds function _interp_fields_ba!(fields::Tuple, ps_a, ps_b, i, j, kw)
+    fname = first(fields)
+    getproperty(ps_a, fname)[i] += kw * getproperty(ps_b, fname)[j]
+    _interp_fields_ba!(Base.tail(fields), ps_a, ps_b, i, j, kw)
+end
+
 @inline @Base.propagate_inbounds function (::InterpolateFieldFn{fields, ACC_WSUM})(ps_a::AbstractParticleSystem{T,ND}, ps_b::VirtualParticleSystem{T,ND}, i::Int, j::Int, dx::SVector{ND,T}, gx::SVector{ND,T}, w::T) where {fields, ACC_WSUM, ND, T<:AbstractFloat}
-    rho_i  = ps_a.rho[i]
-    mass_i = ps_a.mass
-    kernel_weight = w * (mass_i / rho_i)
-    for fname in fields
-        getproperty(ps_b, fname)[j] += kernel_weight * getproperty(ps_a, fname)[i]
-    end
-    ACC_WSUM && (ps_b.w_sum[j] += kernel_weight)
+    kw = w * (ps_a.mass / ps_a.rho[i])
+    _interp_fields_ab!(fields, ps_a, ps_b, i, j, kw)
+    ACC_WSUM && (ps_b.w_sum[j] += kw)
 end
 
 @inline @Base.propagate_inbounds function (::InterpolateFieldFn{fields, ACC_WSUM})(ps_a::VirtualParticleSystem{T,ND}, ps_b::AbstractParticleSystem{T,ND}, i::Int, j::Int, dx::SVector{ND,T}, gx::SVector{ND,T}, w::T) where {fields, ACC_WSUM, ND, T<:AbstractFloat}
-    rho_j  = ps_b.rho[j]
-    mass_j = ps_b.mass
-    kernel_weight = w * (mass_j / rho_j)
-    for fname in fields
-        getproperty(ps_a, fname)[i] += kernel_weight * getproperty(ps_b, fname)[j]
-    end
-    ACC_WSUM && (ps_a.w_sum[i] += kernel_weight)
+    kw = w * (ps_b.mass / ps_b.rho[j])
+    _interp_fields_ba!(fields, ps_a, ps_b, i, j, kw)
+    ACC_WSUM && (ps_a.w_sum[i] += kw)
+end
+
+"""
+    FluidSolidPfn{S, D, T}
+
+Coupled pairwise functor for weakly-compressible fluid interacting with a
+linear-elastic solid.
+
+Identical to `FluidPfn` except that the fluid pressure `p_i` is used for
+**both** sides of the pressure force, ensuring a continuous pressure field
+across the fluid-solid interface:
+
+    dvdt contribution ∝ (p_i/ρ_i² + p_i/ρ_j²) ∇W
+
+Artificial viscosity and the continuity equation use each particle's own
+density and sound speed.  Only the two-sided
+`(ps_a::AbstractParticleSystem, ps_b::AbstractParticleSystem)` dispatch is
+provided; `ps_a` should be the fluid and `ps_b` the solid.
+"""
+struct FluidSolidPfn{S, D, T<:AbstractFloat}
+    art_visc_alpha::T
+    art_visc_beta::T
+    h::T
+    delta::D
+end
+
+function FluidSolidPfn(alpha, beta, h; sigma=2, delta=nothing)
+    a, b, c = promote(float(alpha), float(beta), float(h))
+    T = typeof(a)
+    d = delta === nothing ? nothing : T(delta)
+    FluidSolidPfn{sigma, typeof(d), T}(a, b, c, d)
+end
+
+@inline @Base.propagate_inbounds function (f::FluidSolidPfn{S,D,T})(
+    ps_a::AbstractParticleSystem{T,ND},
+    ps_b::AbstractParticleSystem{T,ND},
+    i::Int, j::Int,
+    dx::SVector{ND,T}, gx::SVector{ND,T}, w::T,
+) where {S,D,ND,T<:AbstractFloat}
+    vi, vj         = ps_a.v[i], ps_b.v[j]
+    rho_i, rho_j   = ps_a.rho[i], ps_b.rho[j]
+    p_i            = ps_a.p[i]       # fluid pressure used for both sides
+    mass_i, mass_j = ps_a.mass, ps_b.mass
+    dv             = vi - vj
+
+    piv    = artificial_viscosity(dx, dv, f.h, rho_i, rho_j, f.art_visc_alpha, f.art_visc_beta, ps_a.c, ps_b.c)
+    dh     = pressure_force_coeff(p_i, p_i, rho_i, rho_j, Val(S))
+    dv_tmp = (dh - piv) * gx
+
+    ps_a.dvdt[i] += mass_j * dv_tmp
+    ps_b.dvdt[j] -= mass_i * dv_tmp
+
+    dr  = continuity_rate(dv, gx)
+    psi = diffusion_density(dx, rho_i, rho_j, ps_a.c, ps_b.c, f.h, f.h, gx, f.delta)
+    ps_a.drhodt[i] += mass_j * (dr * continuity_density_coeff(rho_i, rho_j, Val(S)) + psi / rho_j)
+    ps_b.drhodt[j] += mass_i * (dr * continuity_density_coeff(rho_j, rho_i, Val(S)) - psi / rho_i)
 end
