@@ -228,6 +228,13 @@ function run_driver!(
 
     to = TimerOutput()
 
+    # Compute a single padding width for all planned stages so filenames align
+    # across stage boundaries. sum(all_stage_steps) == final global_step for
+    # both fresh runs and restarts (skipped stages still count toward the total).
+    # ndigits(0) == 1 if all stages are skipped — harmless since no files are written.
+    planned_final_step = sum(max(0, n) for n in parsed.steps)
+    output_width = ndigits(planned_final_step)
+
     cumulative = 0
     for (i, st) in enumerate(stages_eff)
         n_steps   = parsed.steps[i]
@@ -251,9 +258,10 @@ function run_driver!(
 
         time_integrate!(
             st.integrator, remaining, cur_print, cur_save, cfl, cur_prefix;
-            step_offset = global_step,
-            print_timer = false,
-            to          = to,
+            step_offset  = global_step,
+            output_width = output_width,
+            print_timer  = false,
+            to           = to,
         )
         global_step += remaining
         cumulative   = stage_end
@@ -282,11 +290,15 @@ function run_driver!(
             end
 
             println("\n=== Extending stage \"$(last_stage.label)\" ($n_more steps, CFL=$cur_CFL) ===")
+            # Extensions occur after all planned stages, so global_step >= planned_final_step
+            # and extension_width >= output_width — extension files are never narrower.
+            extension_width = ndigits(global_step + n_more)
             time_integrate!(
                 last_stage.integrator, n_more, cur_print, cur_save, cur_CFL, cur_prefix;
-                step_offset = global_step,
-                print_timer = false,
-                to          = to,
+                step_offset  = global_step,
+                output_width = extension_width,
+                print_timer  = false,
+                to           = to,
             )
             global_step += n_more
 

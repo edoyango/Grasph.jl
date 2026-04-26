@@ -317,6 +317,17 @@ end
         end
     end
 
+    @testset "output_width overrides per-call width" begin
+        lf, _, _ = _make_lf()
+        mktempdir() do tmpdir
+            prefix = joinpath(tmpdir, "out")
+            # num_timesteps=5, step_offset=0 → default width=1; override to 3.
+            time_integrate!(lf, 5, 100, 5, 0.5, prefix; output_width=3)
+            @test  isfile("$(prefix)_005.h5")
+            @test !isfile("$(prefix)_5.h5")
+        end
+    end
+
     @testset "HDF5 file contains one group per system" begin
         ps1 = BasicParticleSystem("fluid",    2, 2, 1.0, 10.0)
         ps2 = BasicParticleSystem("boundary", 2, 2, 1.0,  5.0)
@@ -478,6 +489,68 @@ end
 
     @testset "All-nothing stages raises ArgumentError" begin
         @test_throws ArgumentError run_driver!([nothing], 100, 100, nothing; interactive=false)
+    end
+end
+
+@testset "run_driver! multi-stage filename padding" begin
+
+    @testset "Padding uses planned final step width across stages (digit-boundary crossing)" begin
+        # Stage 1: 9 steps, Stage 2: 2 steps → planned_final=11 → width=2.
+        # Without the fix, Stage 1 would write 1-digit names ("_1".."_9")
+        # because ndigits(0+9)=1, while Stage 2 would write 2-digit names.
+        lf, _, _ = _make_lf()
+        mktempdir() do tmpdir
+            prefix = joinpath(tmpdir, "out")
+            run_driver!(
+                [Stage(lf, 9, 0.5, "first"), Stage(lf, 2, 0.5, "second")],
+                100, 1, prefix; interactive=false,
+            )
+            @test  isfile("$(prefix)_09.h5")   # last file of Stage 1
+            @test  isfile("$(prefix)_11.h5")   # last file of Stage 2
+            @test !isfile("$(prefix)_9.h5")    # 1-digit name must be absent
+        end
+    end
+
+    @testset "Restart produces same padding width as fresh run" begin
+        lf, ps, _ = _make_lf()
+        fill!(ps.x, zero(SVector{2,Float64}))
+        fill!(ps.v, SVector(1.0, 0.0))
+
+        mktempdir() do tmpdir
+            prefix = joinpath(tmpdir, "out")
+
+            # Fresh run: write step-5 checkpoint (end of Stage 1).
+            run_driver!(
+                [Stage(lf, 9, 0.5, "first"), Stage(lf, 2, 0.5, "second")],
+                100, 1, prefix; interactive=false,
+            )
+            ckpt = "$(prefix)_09.h5"
+            @test isfile(ckpt)
+
+            # Restart from step 5 with the same config; planned_final still 11.
+            lf2, _, _ = _make_lf()
+            prefix2 = joinpath(tmpdir, "out2")
+            # First run Stage 1 only to get a mid-run checkpoint.
+            run_driver!(
+                [Stage(lf2, 5, 0.5, "first"), Stage(lf2, 6, 0.5, "second")],
+                100, 1, prefix2; interactive=false,
+            )
+            ckpt2 = "$(prefix2)_05.h5"
+            @test isfile(ckpt2)
+
+            lf3, _, _ = _make_lf()
+            prefix3 = joinpath(tmpdir, "out3")
+            run_driver!(
+                [Stage(lf3, 5, 0.5, "first"), Stage(lf3, 6, 0.5, "second")],
+                100, 1, prefix3;
+                interactive = false,
+                restart     = ckpt2,
+            )
+            # Steps 6-11 should all use width=2 (ndigits(11)=2).
+            @test  isfile("$(prefix3)_06.h5")
+            @test  isfile("$(prefix3)_11.h5")
+            @test !isfile("$(prefix3)_6.h5")
+        end
     end
 end
 
