@@ -555,7 +555,7 @@ end
 """
     time_integrate!(integrator, num_timesteps, print_interval_step,
                     save_interval_step, CFL, output_prefix;
-                    step_offset=0, print_timer=true, to=TimerOutput())
+                    step_offset=0, output_width=nothing, print_timer=true, to=TimerOutput())
 
 Run the leapfrog loop for `num_timesteps` steps.
 
@@ -567,6 +567,10 @@ Run the leapfrog loop for `num_timesteps` steps.
   Pass `nothing` to disable saving.
 - `step_offset`: global step number before this batch starts (for continuous
   file numbering and interval checks across multiple calls). Default `0`.
+- `output_width`: minimum zero-padding width for step numbers in filenames.
+  `nothing` (default) derives the width from `ndigits(step_offset + num_timesteps)`,
+  preserving single-call behaviour. Pass an explicit value (e.g. from `run_driver!`)
+  to keep padding consistent across stages.
 - `print_timer`: print a timing breakdown to `stdout` on completion. Default `true`.
   Pass `false` when calling from `run_driver!`, which handles printing itself.
 - `to`: a `TimerOutput` object to record timings into. If not provided, a new one is created.
@@ -580,9 +584,10 @@ function time_integrate!(
     save_interval_step::Int,
     CFL::Real,
     output_prefix;
-    step_offset::Int  = 0,
-    print_timer::Bool = true,
-    to::TimerOutput   = TimerOutput(),
+    step_offset::Int             = 0,
+    output_width::Union{Nothing,Int} = nothing,
+    print_timer::Bool            = true,
+    to::TimerOutput              = TimerOutput(),
 )
     sys   = integrator.systems
     ints  = integrator.interactions
@@ -635,7 +640,7 @@ function time_integrate!(
                      kin="ghost kinematics",
                      stage="ghost stage") for ge in integrator.ghosts]
 
-    width = ndigits(step_offset + num_timesteps)
+    width = output_width === nothing ? ndigits(step_offset + num_timesteps) : output_width
 
     for itimestep in 1:num_timesteps
         global_step = step_offset + itimestep
@@ -698,7 +703,7 @@ end
 """
     time_integrate!(integrator::RK4TimeIntegrator, ...)
 
-RK4 variant.  Signature identical to the LeapFrog version.
+RK4 variant.  Signature identical to the LeapFrog version (including `output_width`).
 
 The neighbour grid is built once per timestep (frozen Lagrangian).
 The four RK stages share the same grid; intermediate states are formed by
@@ -711,9 +716,10 @@ function time_integrate!(
     save_interval_step::Int,
     CFL::Real,
     output_prefix;
-    step_offset::Int  = 0,
-    print_timer::Bool = true,
-    to::TimerOutput   = TimerOutput(),
+    step_offset::Int             = 0,
+    output_width::Union{Nothing,Int} = nothing,
+    print_timer::Bool            = true,
+    to::TimerOutput              = TimerOutput(),
 )
     sys   = integrator.systems
     ints  = integrator.interactions
@@ -769,7 +775,7 @@ function time_integrate!(
                      kin="ghost kinematics",
                      stage="ghost stage") for ge in integrator.ghosts]
 
-    width = ndigits(step_offset + num_timesteps)
+    width = output_width === nothing ? ndigits(step_offset + num_timesteps) : output_width
 
     for itimestep in 1:num_timesteps
         global_step = step_offset + itimestep
