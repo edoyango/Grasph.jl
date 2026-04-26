@@ -17,4 +17,5 @@ using Grasph
     include("test_elasto_plastic.jl")
     include("test_ep_updater.jl")
     include("test_vorticity.jl")
+    include("test_probe_particles.jl")
 end

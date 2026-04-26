@@ -26,11 +26,13 @@ Conjugate pairs `(q, dqdt)` are driven by `ps.pairs`. At each step:
 4. **Full-step**: `q = q₀ + dt * dqdt`.
 5. **Update positions**: `x += dt * v`.
 """
-struct LeapFrogTimeIntegrator{SYS<:Tuple, INTS<:Tuple, GHOSTS<:Tuple, VSYS<:Tuple, T<:AbstractFloat} <: AbstractTimeIntegrator
+struct LeapFrogTimeIntegrator{SYS<:Tuple, INTS<:Tuple, GHOSTS<:Tuple, VSYS<:Tuple, PRBS<:Tuple, PINTS<:Tuple, T<:AbstractFloat} <: AbstractTimeIntegrator
     systems::SYS
     interactions::INTS
     ghosts::GHOSTS
     virtual_systems::VSYS
+    probes::PRBS
+    probe_interactions::PINTS
     c::T
     h::T
     Γ::T
@@ -48,17 +50,20 @@ Construct a `LeapFrogTimeIntegrator`.
 
 Raises `ArgumentError` if either collection is empty.
 """
-function LeapFrogTimeIntegrator(systems, interactions; ghosts=(), virtual_systems=(), Γ=0)
-    sys  = systems         isa AbstractParticleSystem  ? (systems,)         : Tuple(systems)
-    ints = interactions    isa SystemInteraction       ? (interactions,)    : Tuple(interactions)
-    gsts = ghosts          isa GhostEntry              ? (ghosts,)          : Tuple(ghosts)
-    vsys = virtual_systems isa VirtualParticleSystem   ? (virtual_systems,) : Tuple(virtual_systems)
+function LeapFrogTimeIntegrator(systems, interactions; ghosts=(), virtual_systems=(), probes=(), probe_interactions=(), Γ=0)
+    sys   = systems            isa AbstractParticleSystem  ? (systems,)            : Tuple(systems)
+    ints  = interactions       isa SystemInteraction       ? (interactions,)       : Tuple(interactions)
+    gsts  = ghosts             isa GhostEntry              ? (ghosts,)             : Tuple(ghosts)
+    vsys  = virtual_systems    isa VirtualParticleSystem   ? (virtual_systems,)    : Tuple(virtual_systems)
+    prbs  = probes             isa ProbeParticleSystem     ? (probes,)             : Tuple(probes)
+    pints = probe_interactions isa SystemInteraction       ? (probe_interactions,) : Tuple(probe_interactions)
     isempty(sys)  && throw(ArgumentError("systems must not be empty"))
     isempty(ints) && throw(ArgumentError("interactions must not be empty"))
     T = eltype(eltype(first(sys).x))
     c = T(maximum(ps.c           for ps   in sys))
     h = T(minimum(inter.kernel.h for inter in ints))
-    LeapFrogTimeIntegrator{typeof(sys), typeof(ints), typeof(gsts), typeof(vsys), T}(sys, ints, gsts, vsys, c, h, T(Γ))
+    LeapFrogTimeIntegrator{typeof(sys), typeof(ints), typeof(gsts), typeof(vsys), typeof(prbs), typeof(pints), T}(
+        sys, ints, gsts, vsys, prbs, pints, c, h, T(Γ))
 end
 
 """
@@ -78,27 +83,32 @@ Each timestep evaluates the RHS four times with intermediate states:
 
 Positions are updated once at the end: `x += dt · v`.
 """
-struct RK4TimeIntegrator{SYS<:Tuple, INTS<:Tuple, GHOSTS<:Tuple, VSYS<:Tuple, T<:AbstractFloat} <: AbstractTimeIntegrator
+struct RK4TimeIntegrator{SYS<:Tuple, INTS<:Tuple, GHOSTS<:Tuple, VSYS<:Tuple, PRBS<:Tuple, PINTS<:Tuple, T<:AbstractFloat} <: AbstractTimeIntegrator
     systems::SYS
     interactions::INTS
     ghosts::GHOSTS
     virtual_systems::VSYS
+    probes::PRBS
+    probe_interactions::PINTS
     c::T
     h::T
     Γ::T
 end
 
-function RK4TimeIntegrator(systems, interactions; ghosts=(), virtual_systems=(), Γ=0)
-    sys  = systems         isa AbstractParticleSystem  ? (systems,)         : Tuple(systems)
-    ints = interactions    isa SystemInteraction       ? (interactions,)    : Tuple(interactions)
-    gsts = ghosts          isa GhostEntry              ? (ghosts,)          : Tuple(ghosts)
-    vsys = virtual_systems isa VirtualParticleSystem   ? (virtual_systems,) : Tuple(virtual_systems)
+function RK4TimeIntegrator(systems, interactions; ghosts=(), virtual_systems=(), probes=(), probe_interactions=(), Γ=0)
+    sys   = systems            isa AbstractParticleSystem  ? (systems,)            : Tuple(systems)
+    ints  = interactions       isa SystemInteraction       ? (interactions,)       : Tuple(interactions)
+    gsts  = ghosts             isa GhostEntry              ? (ghosts,)             : Tuple(ghosts)
+    vsys  = virtual_systems    isa VirtualParticleSystem   ? (virtual_systems,)    : Tuple(virtual_systems)
+    prbs  = probes             isa ProbeParticleSystem     ? (probes,)             : Tuple(probes)
+    pints = probe_interactions isa SystemInteraction       ? (probe_interactions,) : Tuple(probe_interactions)
     isempty(sys)  && throw(ArgumentError("systems must not be empty"))
     isempty(ints) && throw(ArgumentError("interactions must not be empty"))
     T = eltype(eltype(first(sys).x))
     c = T(maximum(ps.c           for ps   in sys))
     h = T(minimum(inter.kernel.h for inter in ints))
-    RK4TimeIntegrator{typeof(sys), typeof(ints), typeof(gsts), typeof(vsys), T}(sys, ints, gsts, vsys, c, h, T(Γ))
+    RK4TimeIntegrator{typeof(sys), typeof(ints), typeof(gsts), typeof(vsys), typeof(prbs), typeof(pints), T}(
+        sys, ints, gsts, vsys, prbs, pints, c, h, T(Γ))
 end
 
 # ---------------------------------------------------------------------------
@@ -425,6 +435,72 @@ function _xsph_correction!(sys, ints, to, ps_labels, inter_labels)
     end
 end
 
+# Advance probe positions by prescribed_v·dt each timestep.
+_advance_probe_positions!(::Tuple{}, dt) = nothing
+@inline function _advance_probe_positions!(probes::Tuple, dt)
+    probe = first(probes)
+    pv = getfield(probe, :prescribed_v)
+    if !iszero(pv)
+        x = getfield(probe, :x)
+        @inbounds for i in 1:probe.n
+            x[i] += pv * dt
+        end
+    end
+    _advance_probe_positions!(Base.tail(probes), dt)
+end
+
+# Measure all probes: mirror → sort-by-cell → grids → zero → sweep → update → sort-by-id.
+# Called only at save cadence, so the per-step cost is zero.
+function _measure_probes!(probes, probe_ints, sort_cutoff, perm_buf, key_buf, probe_scratches)
+    # Re-sort each unique source system that appears in probe interactions.
+    # Source positions advanced since the step-start sort; create_grid! requires
+    # pre-sorted inputs, so we re-sort here (save-cadence allocation is acceptable).
+    sorted_sources = IdDict{Any,Bool}()
+    for pint in probe_ints
+        src = pint.system_a
+        haskey(sorted_sources, src) && continue
+        sorted_sources[src] = true
+        sort_particles!(src, sort_cutoff, perm_buf, key_buf, _make_sort_scratch(src))
+    end
+    # Mirror probe positions from source.  probe.id == 1:n is invariant at entry
+    # (maintained by _sort_probe_by_id! at end of previous measurement), so
+    # probe.x[source.id[i]] = source.x[i] correctly maps each source particle to
+    # the probe slot that tracks its original identity.
+    for probe in probes
+        mt = getfield(probe, :mirror_target)
+        if mt !== nothing
+            src_id = getfield(mt, :id)
+            src_x  = getfield(mt, :x)
+            x = getfield(probe, :x)
+            @inbounds for i in 1:probe.n
+                x[src_id[i]] = src_x[i]
+            end
+        end
+    end
+    # Sort probes by cell so create_grid! can build a CSR grid
+    for (i, probe) in enumerate(probes)
+        sort_particles!(probe, sort_cutoff, perm_buf, key_buf, probe_scratches[i])
+    end
+    # Build interaction grids for probe interactions
+    for pint in probe_ints
+        create_grid!(pint)
+    end
+    # Zero accumulators, sweep, then run state updaters
+    for probe in probes
+        auto_zero_probe!(probe)
+    end
+    for pint in probe_ints
+        sweep!(pint, 1)
+    end
+    for probe in probes
+        update_state!(probe)
+    end
+    # Sort by id so HDF5 row k always maps to original probe k
+    for (i, probe) in enumerate(probes)
+        _sort_probe_by_id!(probe, perm_buf, probe_scratches[i])
+    end
+end
+
 # Print a per-system summary at the requested interval.
 function _maybe_print!(sys, to, global_step, print_interval_step, dt)
     if global_step % print_interval_step == 0
@@ -439,9 +515,16 @@ function _maybe_print!(sys, to, global_step, print_interval_step, dt)
 end
 
 # Write an HDF5 snapshot at the requested interval.
-function _maybe_save!(sys, ghosts, virtual_sys, to, global_step, save_interval_step, output_prefix, width, dt)
+# Probe measurement (mirror → sort-by-cell → sweep → sort-by-id) happens here,
+# inside the save guard, so there is zero per-step cost when no save occurs.
+function _maybe_save!(sys, ghosts, virtual_sys, probes, probe_ints, probe_scratches,
+                      sort_cutoff, perm_buf, key_buf,
+                      to, global_step, save_interval_step, output_prefix, width, dt)
     if output_prefix !== nothing && global_step % save_interval_step == 0
         @timeit to "save h5" begin
+            isempty(probes) ||
+                _measure_probes!(probes, probe_ints, sort_cutoff, perm_buf, key_buf, probe_scratches)
+
             path = "$(output_prefix)_$(lpad(global_step, width, '0')).h5"
             d    = dirname(path)
             !isempty(d) && mkpath(d)
@@ -456,6 +539,9 @@ function _maybe_save!(sys, ghosts, virtual_sys, to, global_step, save_interval_s
                 end
                 for vps in virtual_sys
                     write_h5(vps, create_group(f, vps.name))
+                end
+                for probe in probes
+                    write_h5(probe, create_group(f, probe.name))
                 end
             end
         end
@@ -501,6 +587,8 @@ function time_integrate!(
     sys   = integrator.systems
     ints  = integrator.interactions
     vsys  = integrator.virtual_systems
+    prbs  = integrator.probes
+    pints = integrator.probe_interactions
     T     = typeof(integrator.c)
     dt    = T(CFL) * integrator.h / integrator.c
     Γ     = integrator.Γ
@@ -516,14 +604,15 @@ function time_integrate!(
 
     q0_bufs = map(_make_q0_bufs, sys)
 
-    sort_cutoff      = T(2) * integrator.h
-    sort_nd          = first(sys).ndims
-    sort_max_n       = maximum(ps.n for ps in sys)
-    sort_perm_buf    = Vector{Int}(undef, sort_max_n)
-    sort_key_buf     = Vector{SVector{sort_nd,Int}}(undef, sort_max_n)
-    sys_scratches    = map(_make_sort_scratch, sys)
-    ghost_scratches  = [_make_empty_sort_scratch(ge.ghost) for ge in integrator.ghosts]
+    sort_cutoff       = T(2) * integrator.h
+    sort_nd           = first(sys).ndims
+    sort_max_n        = maximum(ps.n for ps in sys)
+    sort_perm_buf     = Vector{Int}(undef, sort_max_n)
+    sort_key_buf      = Vector{SVector{sort_nd,Int}}(undef, sort_max_n)
+    sys_scratches     = map(_make_sort_scratch, sys)
+    ghost_scratches   = [_make_empty_sort_scratch(ge.ghost) for ge in integrator.ghosts]
     virtual_scratches = [_make_sort_scratch(vps) for vps in vsys]
+    probe_scratches   = [_make_sort_scratch(probe) for probe in prbs]
 
     ps_labels = [(name=ps.name,
                   sort="sort",
@@ -587,12 +676,15 @@ function time_integrate!(
         # ---- 11. Update positions -------------------------------------------
         _update_positions_all!(sys, dt, to, ps_labels, 1)
         _update_virtual_positions!(vsys, dt)
+        _advance_probe_positions!(prbs, dt)
 
         # ---- 12. Print ------------------------------------------------------
         _maybe_print!(sys, to, global_step, print_interval_step, dt)
 
         # ---- 13. Save -------------------------------------------------------
-        _maybe_save!(sys, integrator.ghosts, vsys, to, global_step, save_interval_step, output_prefix, width, dt)
+        _maybe_save!(sys, integrator.ghosts, vsys, prbs, pints, probe_scratches,
+                     sort_cutoff, sort_perm_buf, sort_key_buf,
+                     to, global_step, save_interval_step, output_prefix, width, dt)
     end
 
     print_timer && show(to; allocations=true, compact=false)
@@ -623,12 +715,14 @@ function time_integrate!(
     print_timer::Bool = true,
     to::TimerOutput   = TimerOutput(),
 )
-    sys  = integrator.systems
-    ints = integrator.interactions
-    vsys = integrator.virtual_systems
-    T    = typeof(integrator.c)
-    dt   = T(CFL) * integrator.h / integrator.c
-    Γ    = integrator.Γ
+    sys   = integrator.systems
+    ints  = integrator.interactions
+    vsys  = integrator.virtual_systems
+    prbs  = integrator.probes
+    pints = integrator.probe_interactions
+    T     = typeof(integrator.c)
+    dt    = T(CFL) * integrator.h / integrator.c
+    Γ     = integrator.Γ
 
     num_stages = length(integrator.interactions[1].pfns)
     @assert all(length(inter.pfns) == num_stages for inter in integrator.interactions) "All interactions must have the same number of stages (pfns length), got: $(map(inter -> length(inter.pfns), integrator.interactions))"
@@ -652,6 +746,7 @@ function time_integrate!(
     sys_scratches     = map(_make_sort_scratch, sys)
     ghost_scratches   = [_make_empty_sort_scratch(ge.ghost) for ge in integrator.ghosts]
     virtual_scratches = [_make_sort_scratch(vps) for vps in vsys]
+    probe_scratches   = [_make_sort_scratch(probe) for probe in prbs]
 
     ps_labels = [(name=ps.name,
                   sort="sort",
@@ -721,12 +816,15 @@ function time_integrate!(
         # ---- 11. Update positions --------------------------------------------
         _update_positions_all!(sys, dt, to, ps_labels, 1)
         _update_virtual_positions!(vsys, dt)
+        _advance_probe_positions!(prbs, dt)
 
         # ---- 12. Print -------------------------------------------------------
         _maybe_print!(sys, to, global_step, print_interval_step, dt)
 
         # ---- 13. Save --------------------------------------------------------
-        _maybe_save!(sys, integrator.ghosts, vsys, to, global_step, save_interval_step, output_prefix, width, dt)
+        _maybe_save!(sys, integrator.ghosts, vsys, prbs, pints, probe_scratches,
+                     sort_cutoff, sort_perm_buf, sort_key_buf,
+                     to, global_step, save_interval_step, output_prefix, width, dt)
     end
 
     print_timer && show(to; allocations=true, compact=false)

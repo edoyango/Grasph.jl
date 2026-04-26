@@ -193,22 +193,56 @@ soil_trapdoor_moving = SystemInteraction(kernel, (interp_rho, sr_pfn,  interp_st
 soil_walls           = SystemInteraction(kernel, (nothing,    sr_pfn,  nothing,    kin_pfn), soil, walls_ghost)
 
 # ---------------------------------------------------------------------------
+# Stress probes: 5 points across the top surface of the trapdoor (y = 0.5*dx)
+# ---------------------------------------------------------------------------
+
+const n_td_probes = 5
+td_probe_positions = [
+    SVector(nleft_x * dx + (i-1) * (ntd_x * dx / (n_td_probes - 1)), 0.0)
+    for i in 1:n_td_probes
+]
+td_probe_extras = (stress = [zero(SVector{4,Float64}) for _ in 1:n_td_probes],)
+td_probe_updater = VirtualNormUpdater(SVector(1.0, 1.0), :stress)
+
+# Static phase: probes remain fixed (prescribed_v = 0 by default)
+td_probe_static = ProbeParticleSystem(
+    "td_probe_static", td_probe_positions;
+    extras        = td_probe_extras,
+    state_updater = td_probe_updater,
+)
+
+# Moving phase: probes descend with the trapdoor
+td_probe_moving = ProbeParticleSystem(
+    "td_probe_moving", td_probe_positions;
+    extras        = (stress = [zero(SVector{4,Float64}) for _ in 1:n_td_probes],),
+    state_updater = td_probe_updater,
+    prescribed_v  = SVector(0.0, trapdoor_vel),
+)
+
+probe_static_int = SystemInteraction(kernel, InterpolateFieldFn(:stress), soil, td_probe_static)
+probe_moving_int = SystemInteraction(kernel, InterpolateFieldFn(:stress), soil, td_probe_moving)
+
+# ---------------------------------------------------------------------------
 # Integrators
 # ---------------------------------------------------------------------------
 
 integrator_static = LeapFrogTimeIntegrator(
     [soil],
     [soil_self, soil_bottom, ghost_bottom, soil_trapdoor_static, soil_walls];
-    ghosts          = (walls_entry,),
-    virtual_systems = (bottom_virt, trapdoor_static_virt),
-    Γ               = 0.002,
+    ghosts             = (walls_entry,),
+    virtual_systems    = (bottom_virt, trapdoor_static_virt),
+    probes             = (td_probe_static,),
+    probe_interactions = (probe_static_int,),
+    Γ                  = 0.002,
 )
 
 integrator_moving = LeapFrogTimeIntegrator(
     [soil],
     [soil_self, soil_bottom, ghost_bottom, soil_trapdoor_moving, soil_walls];
-    ghosts          = (walls_entry,),
-    virtual_systems = (bottom_virt, trapdoor_moving_virt),
+    ghosts             = (walls_entry,),
+    virtual_systems    = (bottom_virt, trapdoor_moving_virt),
+    probes             = (td_probe_moving,),
+    probe_interactions = (probe_moving_int,),
 )
 
 # ---------------------------------------------------------------------------

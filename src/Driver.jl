@@ -53,6 +53,7 @@ function _prompt_prefix(default)
 end
 
 # Unique particle systems across all effective stages, preserving first-seen order.
+# Includes both regular systems and probes so restart can reload all state.
 function _unique_systems(stages_eff)
     seen = IdDict{Any,Bool}()
     out  = Any[]
@@ -61,6 +62,12 @@ function _unique_systems(stages_eff)
             if !haskey(seen, ps)
                 seen[ps] = true
                 push!(out, ps)
+            end
+        end
+        for probe in st.integrator.probes
+            if !haskey(seen, probe)
+                seen[probe] = true
+                push!(out, probe)
             end
         end
     end

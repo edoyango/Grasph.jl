@@ -1,4 +1,4 @@
-export FluidPfn, MultiPhaseFluidPfn, StrainRatePfn, StrainRateVorticityPfn, CauchyFluidPfn, XSPHPfn, InterpolateFieldFn, FluidSolidPfn
+export FluidPfn, MultiPhaseFluidPfn, StrainRatePfn, StrainRateVorticityPfn, CauchyFluidPfn, XSPHPfn, InterpolateFieldFn, FluidSolidPfn, NeighborCountFn
 
 # ---------------------------------------------------------------------------
 # Premade pairwise interaction functors
@@ -431,6 +431,32 @@ end
     kw = w * (ps_b.mass / ps_b.rho[j])
     _interp_fields_ba!(fields, ps_a, ps_b, i, j, kw)
     ACC_WSUM && (ps_a.w_sum[i] += kw)
+end
+
+@inline @Base.propagate_inbounds function (::InterpolateFieldFn{fields, ACC_WSUM})(ps_a::AbstractParticleSystem{T,ND}, ps_b::ProbeParticleSystem{T,ND}, i::Int, j::Int, dx::SVector{ND,T}, gx::SVector{ND,T}, w::T) where {fields, ACC_WSUM, ND, T<:AbstractFloat}
+    kw = w * (ps_a.mass / ps_a.rho[i])
+    _interp_fields_ab!(fields, ps_a, ps_b, i, j, kw)
+    ACC_WSUM && (ps_b.w_sum[j] += kw)
+end
+
+"""
+    NeighborCountFn(field::Symbol)
+
+Pairwise functor that increments `probe.field[j]` by 1 for every source
+particle `i` that falls within the kernel support of probe particle `j`.
+
+Use with a coupled interaction where `system_a` is the real (source) system
+and `system_b` is a `ProbeParticleSystem`.  Zero the target array before the
+sweep (handled automatically by `auto_zero_probe!` in the driver).
+"""
+struct NeighborCountFn{field} end
+NeighborCountFn(field::Symbol) = NeighborCountFn{field}()
+
+@inline @Base.propagate_inbounds function (::NeighborCountFn{field})(
+    ps_a::AbstractParticleSystem, probe::ProbeParticleSystem,
+    i::Int, j::Int, dx, gx, w,
+) where {field}
+    getproperty(probe, field)[j] += 1
 end
 
 """
