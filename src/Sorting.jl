@@ -13,16 +13,16 @@ export sort_particles!
 # ---------------------------------------------------------------------------
 
 _particle_arrays(ps::BasicParticleSystem) =
-    (ps.x, ps.v, ps.v_adjustment, ps.rho, ps.dvdt, ps.drhodt)
+    (ps.x, ps.id, ps.v, ps.v_adjustment, ps.rho, ps.dvdt, ps.drhodt)
 
 _particle_arrays(ps::FluidParticleSystem) =
-    (ps.x, ps.v, ps.v_adjustment, ps.rho, ps.dvdt, ps.drhodt, ps.p)
+    (ps.x, ps.id, ps.v, ps.v_adjustment, ps.rho, ps.dvdt, ps.drhodt, ps.p)
 
 _particle_arrays(ps::StressParticleSystem) =
-    (ps.x, ps.v, ps.v_adjustment, ps.rho, ps.dvdt, ps.drhodt, ps.p, ps.stress, ps.strain_rate)
+    (ps.x, ps.id, ps.v, ps.v_adjustment, ps.rho, ps.dvdt, ps.drhodt, ps.p, ps.stress, ps.strain_rate)
 
 _particle_arrays(ps::ElastoPlasticParticleSystem) =
-    (ps.x, ps.v, ps.v_adjustment, ps.rho, ps.dvdt, ps.drhodt, ps.p,
+    (ps.x, ps.id, ps.v, ps.v_adjustment, ps.rho, ps.dvdt, ps.drhodt, ps.p,
      ps.stress, ps.strain_rate, ps.vorticity, ps.strain, ps.strain_p)
 
 # Virtual: delegate to source — w_sum is auto-zeroed before each sweep so order doesn't matter.

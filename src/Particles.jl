@@ -38,6 +38,7 @@ No pressure field.
 struct BasicParticleSystem{T<:AbstractFloat, ND, PAIRS<:Tuple, UPD<:Tuple} <: AbstractParticleSystem{T, ND}
     name::String
     n::Int
+    id::Vector{Int}
     x::Vector{SVector{ND,T}}
     v::Vector{SVector{ND,T}}
     v_adjustment::Vector{SVector{ND,T}}
@@ -88,6 +89,7 @@ function BasicParticleSystem(
 
     BasicParticleSystem{T, ndims, typeof(_DEFAULT_PAIRS), typeof(state_updaters)}(
         String(name), n,
+        collect(1:n),
         x, v, v_adjustment, rho, dvdt, drhodt,
         T(mass), T(c),
         SVector{ndims,T}(source_v),
@@ -147,6 +149,7 @@ A particle system with all BasicParticleSystem fields plus pressure `p`.
 struct FluidParticleSystem{T<:AbstractFloat, ND, PAIRS<:Tuple, UPD<:Tuple} <: AbstractParticleSystem{T, ND}
     name::String
     n::Int
+    id::Vector{Int}
     x::Vector{SVector{ND,T}}
     v::Vector{SVector{ND,T}}
     v_adjustment::Vector{SVector{ND,T}}
@@ -199,6 +202,7 @@ function FluidParticleSystem(
 
     FluidParticleSystem{T, ndims, typeof(_DEFAULT_PAIRS), typeof(state_updaters)}(
         String(name), n,
+        collect(1:n),
         x, v, v_adjustment, rho, dvdt, drhodt, p,
         T(mass), T(c),
         SVector{ndims,T}(source_v),
@@ -241,6 +245,7 @@ A particle system with all FluidParticleSystem fields plus `stress` and
 struct StressParticleSystem{T<:AbstractFloat, ND, NS, PAIRS<:Tuple, UPD<:Tuple} <: AbstractParticleSystem{T, ND}
     name::String
     n::Int
+    id::Vector{Int}
     x::Vector{SVector{ND,T}}
     v::Vector{SVector{ND,T}}
     v_adjustment::Vector{SVector{ND,T}}
@@ -300,6 +305,7 @@ function StressParticleSystem(
 
     StressParticleSystem{T, ndims, ns, typeof(_DEFAULT_PAIRS), typeof(state_updaters)}(
         String(name), n,
+        collect(1:n),
         x, v, v_adjustment, rho, dvdt, drhodt, p, stress, strain_rate,
         T(mass), T(c),
         SVector{ndims,T}(source_v),
@@ -345,6 +351,7 @@ fields plus `vorticity`, `strain`, and `strain_p`.
 struct ElastoPlasticParticleSystem{T<:AbstractFloat, ND, NS, VT, PAIRS<:Tuple, UPD<:Tuple} <: AbstractParticleSystem{T, ND}
     name::String
     n::Int
+    id::Vector{Int}
     x::Vector{SVector{ND,T}}
     v::Vector{SVector{ND,T}}
     v_adjustment::Vector{SVector{ND,T}}
@@ -411,6 +418,7 @@ function ElastoPlasticParticleSystem(
 
     ElastoPlasticParticleSystem{T, ndims, ns, VT, typeof(_DEFAULT_PAIRS), typeof(state_updaters)}(
         String(name), n,
+        collect(1:n),
         x, v, v_adjustment, rho, dvdt, drhodt, p, stress, strain_rate, vorticity, strain, strain_p,
         T(mass), T(c),
         SVector{ndims,T}(source_v),
@@ -688,10 +696,10 @@ end
 # HDF5 I/O
 # ---------------------------------------------------------------------------
 
-_sim_field_names(::BasicParticleSystem)  = (:v, :rho, :dvdt, :drhodt)
-_sim_field_names(::FluidParticleSystem)  = (:v, :rho, :dvdt, :drhodt, :p)
-_sim_field_names(::StressParticleSystem) = (:v, :rho, :dvdt, :drhodt, :p, :stress, :strain_rate)
-_sim_field_names(::ElastoPlasticParticleSystem) = (:v, :rho, :dvdt, :drhodt, :p, :stress, :strain_rate, :vorticity, :strain, :strain_p)
+_sim_field_names(::BasicParticleSystem)  = (:id, :v, :rho, :dvdt, :drhodt)
+_sim_field_names(::FluidParticleSystem)  = (:id, :v, :rho, :dvdt, :drhodt, :p)
+_sim_field_names(::StressParticleSystem) = (:id, :v, :rho, :dvdt, :drhodt, :p, :stress, :strain_rate)
+_sim_field_names(::ElastoPlasticParticleSystem) = (:id, :v, :rho, :dvdt, :drhodt, :p, :stress, :strain_rate, :vorticity, :strain, :strain_p)
 _sim_field_names(vps::VirtualParticleSystem) = _sim_field_names(getfield(vps, :source))
 
 """
