@@ -28,7 +28,7 @@ _particle_arrays(ps::ElastoPlasticParticleSystem) =
 # Virtual: delegate to source — w_sum is auto-zeroed before each sweep so order doesn't matter.
 _particle_arrays(vps::VirtualParticleSystem) = _particle_arrays(getfield(vps, :source))
 
-# Ghost: first-class fields + idx_original (must move with the ghost) + extras.
+# Ghost: first-class fields + boundary metadata (must move with the ghost) + extras.
 # x is still first so sort_particles! can read it as the sort key.
 function _particle_arrays(ps::GhostParticleSystem)
     (getfield(ps, :x),
@@ -36,6 +36,7 @@ function _particle_arrays(ps::GhostParticleSystem)
      getfield(ps, :rho),
      getfield(ps, :idx_original),
      getfield(ps, :idx_boundary),
+     getfield(ps, :normals),
      values(getfield(ps, :extras))...)
 end
 

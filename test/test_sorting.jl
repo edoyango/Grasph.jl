@@ -1,5 +1,6 @@
 using Test
 using Grasph
+using LinearAlgebra: dot
 using StaticArrays
 
 _make_ps(; n=8, ndims=2) = BasicParticleSystem("test", n, ndims, 1.0, 1.0)
@@ -287,10 +288,10 @@ end
         @test Set(pre_sort_pairs) == post_sort_pairs
     end
 
-    @testset "idx_boundary moves with ghost positions after sort" begin
-        # Regression test: idx_boundary must be permuted alongside x during
-        # sort_particles! so each ghost's reported boundary still matches its
-        # reflected position.
+    @testset "boundary metadata moves with ghost positions after sort" begin
+        # Regression test: idx_boundary and cached normals must be permuted
+        # alongside x during sort_particles! so each ghost's reported boundary
+        # still matches its reflected position and reflection normal.
         #
         # Setup: two boundaries generate ghosts in spatially distinct regions.
         # After generation the ghost array is [boundary-1 ghosts, boundary-2 ghosts].
@@ -329,6 +330,7 @@ end
             da     = dot(src_x - b.point, b.normal)
             expected_x = src_x - 2 * da * b.normal
             @test ghost.x[k] ≈ expected_x
+            @test ghost.normals[k] ≈ b.normal
         end
     end
 end
