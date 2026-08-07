@@ -84,3 +84,19 @@ function DynamicBoundarySystem(inner::AbstractParticleSystem{T,ND}, normal, poin
         T(beta),
     )
 end
+
+# ---------------------------------------------------------------------------
+# Adapt.jl support — both wrappers own no per-particle arrays themselves, so
+# adapting just means adapting `inner` and rebuilding the wrapper around it.
+# ---------------------------------------------------------------------------
+
+function Adapt.adapt_structure(to, bs::StaticBoundarySystem)
+    StaticBoundarySystem(Adapt.adapt(to, getfield(bs, :inner)), getfield(bs, :lj_cutoff))
+end
+
+function Adapt.adapt_structure(to, bs::DynamicBoundarySystem)
+    DynamicBoundarySystem(
+        Adapt.adapt(to, getfield(bs, :inner)),
+        getfield(bs, :boundary_normal), getfield(bs, :boundary_point), getfield(bs, :boundary_beta),
+    )
+end

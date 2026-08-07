@@ -4,6 +4,7 @@ version = "0.1.0"
 authors = []
 
 [deps]
+Adapt = "79e6a3ab-5dfb-504d-930d-738a2a938a0e"
 ArgParse = "c7e460c6-2fb9-53a9-8c5b-16f535851c63"
 Atomix = "a9b6321e-bd34-4604-b9c9-b65b8de01458"
 HDF5 = "f67ccb44-e63f-5c2f-98bd-6dc0ccc4ba2f"
@@ -18,6 +19,7 @@ Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
 TimerOutputs = "a759f4b9-e2f1-59dc-863e-4aeb61b1ea8f"
 
 [compat]
+Adapt = "4.7.0"
 ArgParse = "1.2.0"
 Atomix = "1.1.3"
 HDF5 = "0.17"

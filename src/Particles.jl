@@ -34,17 +34,24 @@ const _DEFAULT_PAIRS = ((Val(:v), Val(:dvdt)), (Val(:rho), Val(:drhodt)))
 
 A particle system with position, velocity, density, and their derivatives.
 No pressure field.
+
+The per-particle array fields are generic over container type (`VA` for
+`SVector`-valued fields, `SA` for scalar fields, `IA` for `id`), defaulting to
+`Vector`/`Vector`/`Vector{Int}` via the keyword constructor below so existing
+call sites are unaffected. This is what lets `Adapt.adapt(CuArray, ps)`
+(defined below) produce a device-resident system with the same struct shape.
 """
-struct BasicParticleSystem{T<:AbstractFloat, ND, PAIRS<:Tuple, UPD<:Tuple} <: AbstractParticleSystem{T, ND}
+struct BasicParticleSystem{T<:AbstractFloat, ND, PAIRS<:Tuple, UPD<:Tuple,
+                            VA<:AbstractVector{SVector{ND,T}}, SA<:AbstractVector{T}, IA<:AbstractVector{Int}} <: AbstractParticleSystem{T, ND}
     name::String
     n::Int
-    id::Vector{Int}
-    x::Vector{SVector{ND,T}}
-    v::Vector{SVector{ND,T}}
-    v_adjustment::Vector{SVector{ND,T}}
-    rho::Vector{T}
-    dvdt::Vector{SVector{ND,T}}
-    drhodt::Vector{T}
+    id::IA
+    x::VA
+    v::VA
+    v_adjustment::VA
+    rho::SA
+    dvdt::VA
+    drhodt::SA
     mass::T
     c::T
     source_v::SVector{ND,T}
@@ -52,10 +59,25 @@ struct BasicParticleSystem{T<:AbstractFloat, ND, PAIRS<:Tuple, UPD<:Tuple} <: Ab
     _print_fields::Vector{Symbol}
     state_updater::UPD
     pairs::PAIRS
-    function BasicParticleSystem{T, ND, PAIRS, UPD}(args...) where {T, ND, PAIRS, UPD}
+    function BasicParticleSystem{T, ND, PAIRS, UPD, VA, SA, IA}(args...) where {T, ND, PAIRS, UPD, VA, SA, IA}
         ND isa Int || throw(ArgumentError("ND must be an Int, got $(typeof(ND))"))
-        new{T, ND, PAIRS, UPD}(args...)
+        new{T, ND, PAIRS, UPD, VA, SA, IA}(args...)
     end
+end
+
+# Generic positional constructor: infers T, ND, PAIRS, UPD, VA, SA, IA from the
+# arguments' own concrete types. Used directly by `Adapt.adapt_structure` (below)
+# to rebuild the struct from adapted (e.g. device) arrays; the keyword
+# constructor further below is the normal user-facing entry point.
+function BasicParticleSystem(
+    name::AbstractString, n::Integer, id::IA, x::VA, v::VA, v_adjustment::VA,
+    rho::SA, dvdt::VA, drhodt::SA, mass::T, c::T, source_v::SVector{ND,T},
+    source_rho::T, print_fields::Vector{Symbol}, state_updater::UPD, pairs::PAIRS,
+) where {T<:AbstractFloat, ND, PAIRS<:Tuple, UPD<:Tuple,
+         VA<:AbstractVector{SVector{ND,T}}, SA<:AbstractVector{T}, IA<:AbstractVector{Int}}
+    BasicParticleSystem{T, ND, PAIRS, UPD, VA, SA, IA}(
+        String(name), Int(n), id, x, v, v_adjustment, rho, dvdt, drhodt,
+        mass, c, source_v, source_rho, print_fields, state_updater, pairs)
 end
 
 function BasicParticleSystem(
@@ -87,7 +109,7 @@ function BasicParticleSystem(
     state_updaters = state_updater isa Tuple ? state_updater : (state_updater,)
     _check_functors_eltype(state_updaters, T, "state updater")
 
-    BasicParticleSystem{T, ndims, typeof(_DEFAULT_PAIRS), typeof(state_updaters)}(
+    BasicParticleSystem(
         String(name), n,
         collect(1:n),
         x, v, v_adjustment, rho, dvdt, drhodt,
@@ -145,18 +167,21 @@ end
     FluidParticleSystem{T, ND, PAIRS<:Tuple} <: AbstractParticleSystem{T, ND}
 
 A particle system with all BasicParticleSystem fields plus pressure `p`.
+
+See `BasicParticleSystem` for the array-type-genericity convention (`VA`/`SA`/`IA`).
 """
-struct FluidParticleSystem{T<:AbstractFloat, ND, PAIRS<:Tuple, UPD<:Tuple} <: AbstractParticleSystem{T, ND}
+struct FluidParticleSystem{T<:AbstractFloat, ND, PAIRS<:Tuple, UPD<:Tuple,
+                            VA<:AbstractVector{SVector{ND,T}}, SA<:AbstractVector{T}, IA<:AbstractVector{Int}} <: AbstractParticleSystem{T, ND}
     name::String
     n::Int
-    id::Vector{Int}
-    x::Vector{SVector{ND,T}}
-    v::Vector{SVector{ND,T}}
-    v_adjustment::Vector{SVector{ND,T}}
-    rho::Vector{T}
-    dvdt::Vector{SVector{ND,T}}
-    drhodt::Vector{T}
-    p::Vector{T}
+    id::IA
+    x::VA
+    v::VA
+    v_adjustment::VA
+    rho::SA
+    dvdt::VA
+    drhodt::SA
+    p::SA
     mass::T
     c::T
     source_v::SVector{ND,T}
@@ -164,10 +189,21 @@ struct FluidParticleSystem{T<:AbstractFloat, ND, PAIRS<:Tuple, UPD<:Tuple} <: Ab
     _print_fields::Vector{Symbol}
     state_updater::UPD
     pairs::PAIRS
-    function FluidParticleSystem{T, ND, PAIRS, UPD}(args...) where {T, ND, PAIRS, UPD}
+    function FluidParticleSystem{T, ND, PAIRS, UPD, VA, SA, IA}(args...) where {T, ND, PAIRS, UPD, VA, SA, IA}
         ND isa Int || throw(ArgumentError("ND must be an Int, got $(typeof(ND))"))
-        new{T, ND, PAIRS, UPD}(args...)
+        new{T, ND, PAIRS, UPD, VA, SA, IA}(args...)
     end
+end
+
+function FluidParticleSystem(
+    name::AbstractString, n::Integer, id::IA, x::VA, v::VA, v_adjustment::VA,
+    rho::SA, dvdt::VA, drhodt::SA, p::SA, mass::T, c::T, source_v::SVector{ND,T},
+    source_rho::T, print_fields::Vector{Symbol}, state_updater::UPD, pairs::PAIRS,
+) where {T<:AbstractFloat, ND, PAIRS<:Tuple, UPD<:Tuple,
+         VA<:AbstractVector{SVector{ND,T}}, SA<:AbstractVector{T}, IA<:AbstractVector{Int}}
+    FluidParticleSystem{T, ND, PAIRS, UPD, VA, SA, IA}(
+        String(name), Int(n), id, x, v, v_adjustment, rho, dvdt, drhodt, p,
+        mass, c, source_v, source_rho, print_fields, state_updater, pairs)
 end
 
 function FluidParticleSystem(
@@ -200,7 +236,7 @@ function FluidParticleSystem(
     state_updaters = state_updater isa Tuple ? state_updater : (state_updater,)
     _check_functors_eltype(state_updaters, T, "state updater")
 
-    FluidParticleSystem{T, ndims, typeof(_DEFAULT_PAIRS), typeof(state_updaters)}(
+    FluidParticleSystem(
         String(name), n,
         collect(1:n),
         x, v, v_adjustment, rho, dvdt, drhodt, p,
@@ -242,19 +278,21 @@ end
 A particle system with all FluidParticleSystem fields plus `stress` and
 `strain_rate` in Voigt notation (NS components, typically 3, 4, or 6).
 """
-struct StressParticleSystem{T<:AbstractFloat, ND, NS, PAIRS<:Tuple, UPD<:Tuple} <: AbstractParticleSystem{T, ND}
+struct StressParticleSystem{T<:AbstractFloat, ND, NS, PAIRS<:Tuple, UPD<:Tuple,
+                             VA<:AbstractVector{SVector{ND,T}}, SA<:AbstractVector{T},
+                             IA<:AbstractVector{Int}, NSA<:AbstractVector{SVector{NS,T}}} <: AbstractParticleSystem{T, ND}
     name::String
     n::Int
-    id::Vector{Int}
-    x::Vector{SVector{ND,T}}
-    v::Vector{SVector{ND,T}}
-    v_adjustment::Vector{SVector{ND,T}}
-    rho::Vector{T}
-    dvdt::Vector{SVector{ND,T}}
-    drhodt::Vector{T}
-    p::Vector{T}
-    stress::Vector{SVector{NS,T}}
-    strain_rate::Vector{SVector{NS,T}}
+    id::IA
+    x::VA
+    v::VA
+    v_adjustment::VA
+    rho::SA
+    dvdt::VA
+    drhodt::SA
+    p::SA
+    stress::NSA
+    strain_rate::NSA
     mass::T
     c::T
     source_v::SVector{ND,T}
@@ -262,11 +300,24 @@ struct StressParticleSystem{T<:AbstractFloat, ND, NS, PAIRS<:Tuple, UPD<:Tuple} 
     _print_fields::Vector{Symbol}
     state_updater::UPD
     pairs::PAIRS
-    function StressParticleSystem{T, ND, NS, PAIRS, UPD}(args...) where {T, ND, NS, PAIRS, UPD}
+    function StressParticleSystem{T, ND, NS, PAIRS, UPD, VA, SA, IA, NSA}(args...) where {T, ND, NS, PAIRS, UPD, VA, SA, IA, NSA}
         ND isa Int || throw(ArgumentError("ND must be an Int, got $(typeof(ND))"))
         NS isa Int || throw(ArgumentError("NS must be an Int, got $(typeof(NS))"))
-        new{T, ND, NS, PAIRS, UPD}(args...)
+        new{T, ND, NS, PAIRS, UPD, VA, SA, IA, NSA}(args...)
     end
+end
+
+function StressParticleSystem(
+    name::AbstractString, n::Integer, id::IA, x::VA, v::VA, v_adjustment::VA,
+    rho::SA, dvdt::VA, drhodt::SA, p::SA, stress::NSA, strain_rate::NSA,
+    mass::T, c::T, source_v::SVector{ND,T}, source_rho::T,
+    print_fields::Vector{Symbol}, state_updater::UPD, pairs::PAIRS,
+) where {T<:AbstractFloat, ND, NS, PAIRS<:Tuple, UPD<:Tuple,
+         VA<:AbstractVector{SVector{ND,T}}, SA<:AbstractVector{T},
+         IA<:AbstractVector{Int}, NSA<:AbstractVector{SVector{NS,T}}}
+    StressParticleSystem{T, ND, NS, PAIRS, UPD, VA, SA, IA, NSA}(
+        String(name), Int(n), id, x, v, v_adjustment, rho, dvdt, drhodt, p, stress, strain_rate,
+        mass, c, source_v, source_rho, print_fields, state_updater, pairs)
 end
 
 function StressParticleSystem(
@@ -303,7 +354,7 @@ function StressParticleSystem(
     state_updaters = state_updater isa Tuple ? state_updater : (state_updater,)
     _check_functors_eltype(state_updaters, T, "state updater")
 
-    StressParticleSystem{T, ndims, ns, typeof(_DEFAULT_PAIRS), typeof(state_updaters)}(
+    StressParticleSystem(
         String(name), n,
         collect(1:n),
         x, v, v_adjustment, rho, dvdt, drhodt, p, stress, strain_rate,
@@ -348,22 +399,25 @@ end
 A particle system for elasto-plastic materials. Includes all StressParticleSystem
 fields plus `vorticity`, `strain`, and `strain_p`.
 """
-struct ElastoPlasticParticleSystem{T<:AbstractFloat, ND, NS, VT, PAIRS<:Tuple, UPD<:Tuple} <: AbstractParticleSystem{T, ND}
+struct ElastoPlasticParticleSystem{T<:AbstractFloat, ND, NS, VT, PAIRS<:Tuple, UPD<:Tuple,
+                                    VA<:AbstractVector{SVector{ND,T}}, SA<:AbstractVector{T},
+                                    IA<:AbstractVector{Int}, NSA<:AbstractVector{SVector{NS,T}},
+                                    VTA<:AbstractVector{VT}} <: AbstractParticleSystem{T, ND}
     name::String
     n::Int
-    id::Vector{Int}
-    x::Vector{SVector{ND,T}}
-    v::Vector{SVector{ND,T}}
-    v_adjustment::Vector{SVector{ND,T}}
-    rho::Vector{T}
-    dvdt::Vector{SVector{ND,T}}
-    drhodt::Vector{T}
-    p::Vector{T}
-    stress::Vector{SVector{NS,T}}
-    strain_rate::Vector{SVector{NS,T}}
-    vorticity::Vector{VT}
-    strain::Vector{SVector{NS,T}}
-    strain_p::Vector{SVector{NS,T}}
+    id::IA
+    x::VA
+    v::VA
+    v_adjustment::VA
+    rho::SA
+    dvdt::VA
+    drhodt::SA
+    p::SA
+    stress::NSA
+    strain_rate::NSA
+    vorticity::VTA
+    strain::NSA
+    strain_p::NSA
     mass::T
     c::T
     source_v::SVector{ND,T}
@@ -371,11 +425,26 @@ struct ElastoPlasticParticleSystem{T<:AbstractFloat, ND, NS, VT, PAIRS<:Tuple, U
     _print_fields::Vector{Symbol}
     state_updater::UPD
     pairs::PAIRS
-    function ElastoPlasticParticleSystem{T, ND, NS, VT, PAIRS, UPD}(args...) where {T, ND, NS, VT, PAIRS, UPD}
+    function ElastoPlasticParticleSystem{T, ND, NS, VT, PAIRS, UPD, VA, SA, IA, NSA, VTA}(args...) where {T, ND, NS, VT, PAIRS, UPD, VA, SA, IA, NSA, VTA}
         ND isa Int || throw(ArgumentError("ND must be an Int, got $(typeof(ND))"))
         NS isa Int || throw(ArgumentError("NS must be an Int, got $(typeof(NS))"))
-        new{T, ND, NS, VT, PAIRS, UPD}(args...)
+        new{T, ND, NS, VT, PAIRS, UPD, VA, SA, IA, NSA, VTA}(args...)
     end
+end
+
+function ElastoPlasticParticleSystem(
+    name::AbstractString, n::Integer, id::IA, x::VA, v::VA, v_adjustment::VA,
+    rho::SA, dvdt::VA, drhodt::SA, p::SA, stress::NSA, strain_rate::NSA,
+    vorticity::VTA, strain::NSA, strain_p::NSA,
+    mass::T, c::T, source_v::SVector{ND,T}, source_rho::T,
+    print_fields::Vector{Symbol}, state_updater::UPD, pairs::PAIRS,
+) where {T<:AbstractFloat, ND, NS, VT, PAIRS<:Tuple, UPD<:Tuple,
+         VA<:AbstractVector{SVector{ND,T}}, SA<:AbstractVector{T},
+         IA<:AbstractVector{Int}, NSA<:AbstractVector{SVector{NS,T}}, VTA<:AbstractVector{VT}}
+    ElastoPlasticParticleSystem{T, ND, NS, VT, PAIRS, UPD, VA, SA, IA, NSA, VTA}(
+        String(name), Int(n), id, x, v, v_adjustment, rho, dvdt, drhodt, p,
+        stress, strain_rate, vorticity, strain, strain_p,
+        mass, c, source_v, source_rho, print_fields, state_updater, pairs)
 end
 
 function ElastoPlasticParticleSystem(
@@ -416,7 +485,7 @@ function ElastoPlasticParticleSystem(
     state_updaters = state_updater isa Tuple ? state_updater : (state_updater,)
     _check_functors_eltype(state_updaters, T, "state updater")
 
-    ElastoPlasticParticleSystem{T, ndims, ns, VT, typeof(_DEFAULT_PAIRS), typeof(state_updaters)}(
+    ElastoPlasticParticleSystem(
         String(name), n,
         collect(1:n),
         x, v, v_adjustment, rho, dvdt, drhodt, p, stress, strain_rate, vorticity, strain, strain_p,
@@ -473,15 +542,16 @@ zeroing accumulated arrays before a sweep or normalising by `w_sum` after one.
 
 `n`, `ndims`, `mass`, and `c` are validated against the source system.
 """
-struct VirtualParticleSystem{T<:AbstractFloat, ND, PS<:AbstractParticleSystem{T,ND}, UPD<:Tuple, ZF} <: AbstractParticleSystem{T, ND}
+struct VirtualParticleSystem{T<:AbstractFloat, ND, PS<:AbstractParticleSystem{T,ND}, UPD<:Tuple, ZF,
+                              SA<:AbstractVector{T}} <: AbstractParticleSystem{T, ND}
     name::String
     source::PS
-    w_sum::Vector{T}
+    w_sum::SA
     state_updater::UPD
     prescribed_v::SVector{ND,T}
-    function VirtualParticleSystem{T,ND,PS,UPD,ZF}(args...) where {T,ND,PS,UPD,ZF}
+    function VirtualParticleSystem{T,ND,PS,UPD,ZF,SA}(args...) where {T,ND,PS,UPD,ZF,SA}
         ND isa Int || throw(ArgumentError("ND must be an Int, got $(typeof(ND))"))
-        new{T,ND,PS,UPD,ZF}(args...)
+        new{T,ND,PS,UPD,ZF,SA}(args...)
     end
 end
 
@@ -502,9 +572,10 @@ function VirtualParticleSystem(
     n    == ps.n || throw(ArgumentError("n=$n does not match source n=$(ps.n)"))
     state_updaters = state_updater isa Tuple ? state_updater : (state_updater,)
     _check_functors_eltype(state_updaters, T, "state updater")
+    w_sum = zeros(T, n)
     pv = prescribed_v === nothing ? zero(SVector{ND,T}) : SVector{ND,T}(prescribed_v)
-    VirtualParticleSystem{T, ND, typeof(ps), typeof(state_updaters), zero_fields}(
-        String(name), ps, zeros(T, n), state_updaters, pv,
+    VirtualParticleSystem{T, ND, typeof(ps), typeof(state_updaters), zero_fields, typeof(w_sum)}(
+        String(name), ps, w_sum, state_updaters, pv,
     )
 end
 
@@ -525,6 +596,72 @@ end
 @inline function auto_zero_virtual!(vps::VirtualParticleSystem{T,ND,PS,UPD,ZF}) where {T,ND,PS,UPD,ZF}
     fill!(getfield(vps, :w_sum), zero(T))
     _auto_zero_virtual!(ZF, vps)
+end
+
+# ---------------------------------------------------------------------------
+# Adapt.jl support
+#
+# Lets `Adapt.adapt(CuArray, ps)` (or `adapt(CuVector, ps)`) rebuild any of the
+# particle-system structs above with device-resident arrays in place of the
+# default `Vector`s, via the array-type-generic constructors defined next to
+# each struct. `_print_fields`, `state_updater`, and `pairs` are host-only
+# bookkeeping/functor metadata and are carried over unadapted.
+# ---------------------------------------------------------------------------
+
+function Adapt.adapt_structure(to, ps::BasicParticleSystem)
+    BasicParticleSystem(
+        ps.name, ps.n,
+        Adapt.adapt(to, getfield(ps, :id)),
+        Adapt.adapt(to, ps.x), Adapt.adapt(to, ps.v), Adapt.adapt(to, ps.v_adjustment),
+        Adapt.adapt(to, ps.rho), Adapt.adapt(to, ps.dvdt), Adapt.adapt(to, ps.drhodt),
+        ps.mass, ps.c, ps.source_v, ps.source_rho,
+        getfield(ps, :_print_fields), getfield(ps, :state_updater), getfield(ps, :pairs),
+    )
+end
+
+function Adapt.adapt_structure(to, ps::FluidParticleSystem)
+    FluidParticleSystem(
+        ps.name, ps.n,
+        Adapt.adapt(to, getfield(ps, :id)),
+        Adapt.adapt(to, ps.x), Adapt.adapt(to, ps.v), Adapt.adapt(to, ps.v_adjustment),
+        Adapt.adapt(to, ps.rho), Adapt.adapt(to, ps.dvdt), Adapt.adapt(to, ps.drhodt), Adapt.adapt(to, ps.p),
+        ps.mass, ps.c, ps.source_v, ps.source_rho,
+        getfield(ps, :_print_fields), getfield(ps, :state_updater), getfield(ps, :pairs),
+    )
+end
+
+function Adapt.adapt_structure(to, ps::StressParticleSystem)
+    StressParticleSystem(
+        ps.name, ps.n,
+        Adapt.adapt(to, getfield(ps, :id)),
+        Adapt.adapt(to, ps.x), Adapt.adapt(to, ps.v), Adapt.adapt(to, ps.v_adjustment),
+        Adapt.adapt(to, ps.rho), Adapt.adapt(to, ps.dvdt), Adapt.adapt(to, ps.drhodt), Adapt.adapt(to, ps.p),
+        Adapt.adapt(to, ps.stress), Adapt.adapt(to, ps.strain_rate),
+        ps.mass, ps.c, ps.source_v, ps.source_rho,
+        getfield(ps, :_print_fields), getfield(ps, :state_updater), getfield(ps, :pairs),
+    )
+end
+
+function Adapt.adapt_structure(to, ps::ElastoPlasticParticleSystem)
+    ElastoPlasticParticleSystem(
+        ps.name, ps.n,
+        Adapt.adapt(to, getfield(ps, :id)),
+        Adapt.adapt(to, ps.x), Adapt.adapt(to, ps.v), Adapt.adapt(to, ps.v_adjustment),
+        Adapt.adapt(to, ps.rho), Adapt.adapt(to, ps.dvdt), Adapt.adapt(to, ps.drhodt), Adapt.adapt(to, ps.p),
+        Adapt.adapt(to, ps.stress), Adapt.adapt(to, ps.strain_rate),
+        Adapt.adapt(to, ps.vorticity), Adapt.adapt(to, ps.strain), Adapt.adapt(to, ps.strain_p),
+        ps.mass, ps.c, ps.source_v, ps.source_rho,
+        getfield(ps, :_print_fields), getfield(ps, :state_updater), getfield(ps, :pairs),
+    )
+end
+
+function Adapt.adapt_structure(to, vps::VirtualParticleSystem{T,ND,PS,UPD,ZF}) where {T,ND,PS,UPD,ZF}
+    new_source = Adapt.adapt(to, getfield(vps, :source))
+    new_w_sum  = Adapt.adapt(to, getfield(vps, :w_sum))
+    VirtualParticleSystem{T, ND, typeof(new_source), UPD, ZF, typeof(new_w_sum)}(
+        getfield(vps, :name), new_source, new_w_sum,
+        getfield(vps, :state_updater), getfield(vps, :prescribed_v),
+    )
 end
 
 # ---------------------------------------------------------------------------

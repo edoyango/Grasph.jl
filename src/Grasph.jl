@@ -9,6 +9,7 @@ using StaticArrays
 using TimerOutputs
 using Polyester
 using Atomix
+using Adapt
 
 include("Particles.jl")
 include("Utils.jl")
