@@ -10,36 +10,64 @@ _noop(args...) = nothing
 # Allocate the shared work buffers that time_integrate! would normally manage.
 function _make_sort_bufs(ps::Grasph.AbstractParticleSystem{T,ND}) where {T,ND}
     perm_buf    = Vector{Int}(undef, ps.n)
-    key_buf     = Vector{SVector{ND,Int}}(undef, ps.n)
+    key_buf     = Vector{UInt64}(undef, ps.n)
     scratch     = Grasph._make_sort_scratch(ps)
     return perm_buf, key_buf, scratch
 end
 
 function _make_sort_bufs_empty(ps::Grasph.AbstractParticleSystem{T,ND}) where {T,ND}
     perm_buf    = Vector{Int}(undef, 0)
-    key_buf     = Vector{SVector{ND,Int}}(undef, 0)
+    key_buf     = Vector{UInt64}(undef, 0)
     scratch     = Grasph._make_empty_sort_scratch(ps)
     return perm_buf, key_buf, scratch
 end
 
+# Recompute the packed key straight from a position, for post-sort assertions.
+_key_of(x, cutoff) = Grasph._pos_to_key(x, cutoff)
+
 # ---------------------------------------------------------------------------
-# _lt_key
+# _pos_to_key — packed UInt64 cell key
+#
+# Replaces the old SVector+_lt_key representation. `_pos_to_key` packs each
+# dimension's cell coordinate into a fixed-width bitfield (most significant
+# dimension first), so plain `<` on the packed UInt64 reproduces exactly the
+# same lexicographic ordering (first dim slowest, last dim fastest) the old
+# `_lt_key` comparator gave — this is checked directly below by cross-checking
+# against manually lexicographically-ordered coordinate tuples.
 # ---------------------------------------------------------------------------
 
-@testset "_lt_key lexicographic comparison" begin
-    @test  Grasph._lt_key(SVector(1),    SVector(2))
-    @test !Grasph._lt_key(SVector(2),    SVector(1))
-    @test !Grasph._lt_key(SVector(1),    SVector(1))
+@testset "_pos_to_key packed ordering" begin
+    c = 1.0   # cutoff — cell coordinate equals the raw coordinate here
 
-    @test  Grasph._lt_key(SVector(1, 0), SVector(2, 0))
-    @test  Grasph._lt_key(SVector(1, 5), SVector(2, 0))   # first coord wins
-    @test  Grasph._lt_key(SVector(1, 0), SVector(1, 1))   # tie-break on second
-    @test !Grasph._lt_key(SVector(1, 1), SVector(1, 0))
-    @test !Grasph._lt_key(SVector(1, 1), SVector(1, 1))
+    @testset "1D matches numeric order" begin
+        @test Grasph._pos_to_key(SVector(1.0), c) < Grasph._pos_to_key(SVector(2.0), c)
+        @test Grasph._pos_to_key(SVector(2.0), c) > Grasph._pos_to_key(SVector(1.0), c)
+        @test Grasph._pos_to_key(SVector(1.0), c) == Grasph._pos_to_key(SVector(1.0), c)
+    end
 
-    @test  Grasph._lt_key(SVector(0, 0, 1), SVector(0, 1, 0))
-    @test  Grasph._lt_key(SVector(0, 0, 0), SVector(0, 0, 1))
-    @test !Grasph._lt_key(SVector(0, 1, 0), SVector(0, 0, 1))
+    @testset "2D is lexicographic (first dim slowest)" begin
+        @test Grasph._pos_to_key(SVector(1.0, 0.0), c) < Grasph._pos_to_key(SVector(2.0, 0.0), c)
+        @test Grasph._pos_to_key(SVector(1.0, 5.0), c) < Grasph._pos_to_key(SVector(2.0, 0.0), c)   # first coord wins
+        @test Grasph._pos_to_key(SVector(1.0, 0.0), c) < Grasph._pos_to_key(SVector(1.0, 1.0), c)   # tie-break on second
+        @test Grasph._pos_to_key(SVector(1.0, 1.0), c) > Grasph._pos_to_key(SVector(1.0, 0.0), c)
+        @test Grasph._pos_to_key(SVector(1.0, 1.0), c) == Grasph._pos_to_key(SVector(1.0, 1.0), c)
+    end
+
+    @testset "3D is lexicographic (first dim slowest, last fastest)" begin
+        @test Grasph._pos_to_key(SVector(0.0, 0.0, 1.0), c) < Grasph._pos_to_key(SVector(0.0, 1.0, 0.0), c)
+        @test Grasph._pos_to_key(SVector(0.0, 0.0, 0.0), c) < Grasph._pos_to_key(SVector(0.0, 0.0, 1.0), c)
+        @test Grasph._pos_to_key(SVector(0.0, 1.0, 0.0), c) > Grasph._pos_to_key(SVector(0.0, 0.0, 1.0), c)
+    end
+
+    @testset "negative cell coordinates round-trip through the bias" begin
+        @test Grasph._pos_to_key(SVector(-1.0, 0.0), c) < Grasph._pos_to_key(SVector(0.0, 0.0), c)
+        @test Grasph._pos_to_key(SVector(-2.0, 0.0), c) < Grasph._pos_to_key(SVector(-1.0, 0.0), c)
+    end
+
+    @testset "out-of-range cell coordinate throws instead of wrapping" begin
+        huge = Float64(Grasph._KEY_BIAS) + 10.0
+        @test_throws ArgumentError Grasph._pos_to_key(SVector(huge, 0.0), c)
+    end
 end
 
 # ---------------------------------------------------------------------------
@@ -67,9 +95,7 @@ end
 
         # Keys must be non-decreasing after sort.
         for i in 1:n-1
-            ki = map(v -> floor(Int, v / cutoff), ps.x[i])
-            kj = map(v -> floor(Int, v / cutoff), ps.x[i+1])
-            @test !Grasph._lt_key(kj, ki)
+            @test _key_of(ps.x[i], cutoff) <= _key_of(ps.x[i+1], cutoff)
         end
         # rho must have moved with the same permutation as x.
         for i in 1:n
@@ -94,9 +120,7 @@ end
 
         # After sort: key[i] ≤ key[i+1]
         for i in 1:n-1
-            ki = map(v -> floor(Int, v / cutoff), ps.x[i])
-            kj = map(v -> floor(Int, v / cutoff), ps.x[i+1])
-            @test !Grasph._lt_key(kj, ki)
+            @test _key_of(ps.x[i], cutoff) <= _key_of(ps.x[i+1], cutoff)
         end
         # x and rho must correspond to the same original particle.
         for i in 1:n
@@ -177,9 +201,7 @@ end
         sort_particles!(ps, cutoff, perm_buf, key_buf, scratch)
 
         for i in 1:n-1
-            ki = map(v -> floor(Int, v / cutoff), ps.x[i])
-            kj = map(v -> floor(Int, v / cutoff), ps.x[i+1])
-            @test !Grasph._lt_key(kj, ki)
+            @test _key_of(ps.x[i], cutoff) <= _key_of(ps.x[i+1], cutoff)
         end
     end
 end
@@ -202,7 +224,7 @@ end
         for i in 1:n; ps.rho[i] = Float64(i); end
 
         perm_buf = Vector{Int}(undef, n)
-        key_buf  = Vector{SVector{3,Int}}(undef, n)
+        key_buf  = Vector{UInt64}(undef, n)
         scratch  = Grasph._make_sort_scratch(ps)
         sort_particles!(ps, cutoff, perm_buf, key_buf, scratch)
 
@@ -256,9 +278,7 @@ end
 
         # Result is sorted
         for i in 1:n_ghost-1
-            ki = map(v -> floor(Int, v / cutoff), ghost.x[i])
-            kj = map(v -> floor(Int, v / cutoff), ghost.x[i+1])
-            @test !Grasph._lt_key(kj, ki)
+            @test _key_of(ghost.x[i], cutoff) <= _key_of(ghost.x[i+1], cutoff)
         end
     end
 

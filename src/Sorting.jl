@@ -65,20 +65,43 @@ _make_empty_sort_scratch(ps::AbstractParticleSystem) =
     map(arr -> similar(arr, 0), _particle_arrays(ps))
 
 # ---------------------------------------------------------------------------
-# Lexicographic key comparison  (ND = 1, 2, 3)
+# Packed 64-bit cell key  (ND = 1, 2, 3)
 #
-# SVector does not implement isless by default, so we define explicit
-# short-circuit comparisons for each dimensionality.  These are inlined into
-# sortperm! via the lt= keyword, giving branch-free performance.
+# Each dimension's integer cell coordinate is bias-shifted to a non-negative
+# value and packed into a fixed-width bitfield of a single UInt64, most
+# significant dimension first. Comparing two packed keys with plain `<` is
+# then bit-for-bit equivalent to the lexicographic (first dim slowest, last
+# dim fastest) ordering the old SVector+custom-comparator key produced —
+# this is a representation change only, with zero effect on sort output.
+#
+# The point of packing into a native integer (rather than an SVector) is
+# that UInt64 is exactly what GPU radix/bucket sorts operate on; an SVector
+# key with a custom `lt=` comparator is CPU-only. `_KEY_BITS_PER_DIM = 21`
+# gives each dimension a representable cell-coordinate range of
+# [-2^20, 2^20 - 1] (about ±1.05M cells from the origin) — enormous headroom
+# for any domain/cutoff combination this code targets — while 3 × 21 = 63
+# bits fits in a UInt64 with one bit to spare.
 # ---------------------------------------------------------------------------
 
-@inline _lt_key(a::SVector{1,Int}, b::SVector{1,Int}) = a[1] < b[1]
+const _KEY_BITS_PER_DIM = 21
+const _KEY_BIAS          = Int(1) << (_KEY_BITS_PER_DIM - 1)          # 2^20
+const _KEY_FIELD_MASK    = (UInt64(1) << _KEY_BITS_PER_DIM) - one(UInt64)
 
-@inline _lt_key(a::SVector{2,Int}, b::SVector{2,Int}) =
-    a[1] != b[1] ? a[1] < b[1] : a[2] < b[2]
+# Bias-shift a single integer cell coordinate into a packable UInt64 field.
+# Throws if the coordinate falls outside the representable range rather than
+# silently wrapping/truncating.
+@inline function _cellcoord_to_field(c::Int)
+    biased = c + _KEY_BIAS
+    (biased < 0 || biased > Int(_KEY_FIELD_MASK)) && _key_range_error(c)
+    return biased % UInt64
+end
 
-@inline _lt_key(a::SVector{3,Int}, b::SVector{3,Int}) =
-    a[1] != b[1] ? a[1] < b[1] : (a[2] != b[2] ? a[2] < b[2] : a[3] < b[3])
+@noinline function _key_range_error(c::Int)
+    throw(ArgumentError(
+        "cell coordinate $c is out of the packed sort key's representable " *
+        "range [$(-_KEY_BIAS), $(_KEY_BIAS - 1)]; the domain is too large " *
+        "(or the cutoff too small) for a 64-bit packed key"))
+end
 
 # ---------------------------------------------------------------------------
 # In-place permutation
@@ -117,18 +140,34 @@ end
 # Public API
 # ---------------------------------------------------------------------------
 
-# Allocation-free position → integer cell-key conversion.
-# Using a named @inline function instead of a `map(v -> ..., xi)` closure
-# ensures the captured `cutoff` is never heap-boxed.
-@inline function _pos_to_key(xi::SVector{ND,T}, cutoff::T) where {ND,T}
-    SVector(ntuple(d -> floor(Int, xi[d] / cutoff), Val(ND)))
+# Allocation-free position → packed UInt64 cell-key conversion. One explicit
+# method per ND (matching the old _lt_key's per-ND dispatch) rather than a
+# generic `for d in 1:ND` loop, so the bit-packing is fully unrolled with no
+# risk of the compiler boxing a mutated loop-carried accumulator.
+@inline function _pos_to_key(xi::SVector{1,T}, cutoff::T) where {T}
+    _cellcoord_to_field(floor(Int, xi[1] / cutoff))
 end
 
-@inline _sortperm_by_key!(::AbstractParticleSystem, perm_view, key_view) = 
-    sortperm!(perm_view, key_view; lt=_lt_key, alg=InsertionSort)
+@inline function _pos_to_key(xi::SVector{2,T}, cutoff::T) where {T}
+    cx = _cellcoord_to_field(floor(Int, xi[1] / cutoff))
+    cy = _cellcoord_to_field(floor(Int, xi[2] / cutoff))
+    (cx << _KEY_BITS_PER_DIM) | cy
+end
+
+@inline function _pos_to_key(xi::SVector{3,T}, cutoff::T) where {T}
+    cx = _cellcoord_to_field(floor(Int, xi[1] / cutoff))
+    cy = _cellcoord_to_field(floor(Int, xi[2] / cutoff))
+    cz = _cellcoord_to_field(floor(Int, xi[3] / cutoff))
+    (cx << (2 * _KEY_BITS_PER_DIM)) | (cy << _KEY_BITS_PER_DIM) | cz
+end
+
+# UInt64 has native `<`, so no custom comparator is needed any more — this is
+# what makes the key GPU-radix-sortable, unlike the old SVector+lt= key.
+@inline _sortperm_by_key!(::AbstractParticleSystem, perm_view, key_view) =
+    sortperm!(perm_view, key_view; alg=InsertionSort)
 
 @inline _sortperm_by_key!(::AbstractGhostParticleSystem, perm_view, key_view) =
-    sortperm!(perm_view, key_view; lt=_lt_key)
+    sortperm!(perm_view, key_view)
 
 """
     sort_particles!(ps, cutoff, perm_buf, key_buf, scratch_arrays)
@@ -157,7 +196,7 @@ reused across all calls within a timestep (real and ghost systems).
 """
 function sort_particles!(ps::AbstractParticleSystem{T,ND}, cutoff::T,
                           perm_buf::Vector{Int},
-                          key_buf::Vector{SVector{ND,Int}},
+                          key_buf::Vector{UInt64},
                           scratch_arrays::Tuple) where {T,ND}
     n = ps.n
     n <= 1 && return
@@ -167,7 +206,7 @@ function sort_particles!(ps::AbstractParticleSystem{T,ND}, cutoff::T,
     length(key_buf)  < n && resize!(key_buf,  n)
     _resize_scratches!(scratch_arrays, n)
 
-    # Compute integer cell-coordinate keys from particle positions.
+    # Compute packed cell-coordinate keys from particle positions.
     arrs = _particle_arrays(ps)
     x    = first(arrs)       # x is always the first array
     @inbounds for i in 1:n
@@ -179,7 +218,7 @@ function sort_particles!(ps::AbstractParticleSystem{T,ND}, cutoff::T,
     # crossed cell boundaries — common after the first few timesteps.
     already_sorted = true
     @inbounds for i in 1:n-1
-        if _lt_key(key_buf[i+1], key_buf[i])
+        if key_buf[i+1] < key_buf[i]
             already_sorted = false
             break
         end
@@ -189,7 +228,7 @@ function sort_particles!(ps::AbstractParticleSystem{T,ND}, cutoff::T,
     # Compute the sorting permutation in-place (no allocation).
     perm_view = view(perm_buf, 1:n)
     key_view  = view(key_buf,  1:n)
-    _sortperm_by_key!(ps, perm_view, key_view) #sortperm!(perm_view, key_view; lt=_lt_key, alg=InsertionSort)
+    _sortperm_by_key!(ps, perm_view, key_view)
 
     # Apply permutation to every per-particle array.
     _apply_perms!(arrs, scratch_arrays, perm_view, n)
