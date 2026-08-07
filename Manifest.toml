@@ -1,8 +1,8 @@
 # This file is machine-generated - editing it directly is not advised
 
-julia_version = "1.12.5"
+julia_version = "1.12.6"
 manifest_format = "2.0"
-project_hash = "4684f06b5eacb203cdd78570d62cf667faadd534"
+project_hash = "36af0b6c62ff6b4152f4a487574a2f5b25616b93"
 
 [[deps.Adapt]]
 deps = ["LinearAlgebra", "Requires"]
@@ -179,7 +179,7 @@ uuid = "7b1f6079-737a-58dc-b8bc-7a2ca5c1b5ee"
 version = "1.11.0"
 
 [[deps.Grasph]]
-deps = ["Atomix", "HDF5", "LinearAlgebra", "MPI", "Polyester", "PrettyTables", "Printf", "StaticArrays", "Test", "TimerOutputs"]
+deps = ["ArgParse", "Atomix", "HDF5", "LinearAlgebra", "MPI", "Polyester", "PrettyTables", "Printf", "Random", "StaticArrays", "Test", "TimerOutputs"]
 path = "."
 uuid = "a8f2b3c4-5d6e-4f80-91a2-b3c4d5e6f708"
 version = "0.1.0"

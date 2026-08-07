@@ -9,6 +9,7 @@ using Grasph
     include("test_interaction_grid.jl")
     include("test_interaction_sweep.jl")
     include("test_interaction_sweep_3d.jl")
+    include("test_onesided_sweep.jl")
     include("test_time_integration.jl")
     include("test_ghost_particles.jl")
     include("test_ghost_updates.jl")

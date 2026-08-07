@@ -218,6 +218,73 @@ end
     ps_a.dvdt[i] += -mass_j * piv * gx + rf * dx
 end
 
+# ---------------------------------------------------------------------------
+# One-sided `pfn_contribution` methods (see Interaction.jl for the protocol
+# and the `onesided=true` sweep that calls these).
+#
+# Each method below returns "the contribution to i from j" as a NamedTuple,
+# instead of mutating ps.dvdt[i]/ps.dvdt[j] in place. It is line-for-line the
+# same arithmetic as the corresponding two-sided method above, restricted to
+# the i-side terms — no new physics. Newton's third law is recovered by the
+# sweep itself calling this same function with (i,j) swapped; see the
+# swap-antisymmetry argument in Interaction.jl's "One-sided, particle-parallel
+# sweep" section.
+#
+# Only the two dambreak.jl/dambreak_3d.jl paths are covered so far: fluid
+# self-interaction, and the fluid<->StaticBoundarySystem coupling (which was
+# already one-sided in its two-sided form above, since a static boundary has
+# no dynamics to update). Other pfns do not yet implement this protocol.
+# ---------------------------------------------------------------------------
+
+@inline @Base.propagate_inbounds function pfn_contribution(f::FluidPfn{S,D,E,T}, ps::AbstractParticleSystem{T,ND}, i::Int, j::Int, dx::SVector{ND,T}, gx::SVector{ND,T}, w::T) where {S,D,E,ND,T}
+    vi, vj       = ps.v[i], ps.v[j]
+    rho_i, rho_j = ps.rho[i], ps.rho[j]
+    p_i, p_j     = ps.p[i], ps.p[j]
+    mass         = ps.mass
+    dv           = vi - vj
+
+    piv    = artificial_viscosity(dx, dv, f.h, rho_i, rho_j, f.art_visc_alpha, f.art_visc_beta, ps.c, ps.c)
+    dh     = pressure_force_coeff(p_i, p_j, rho_i, rho_j, Val(S))
+    dv_tmp = mass * (dh - piv) * gx
+
+    dr  = continuity_rate(dv, gx)
+    psi = diffusion_density(dx, rho_i, rho_j, ps.c, ps.c, f.h, f.h, gx, f.delta)
+    drho = mass * (dr * continuity_density_coeff(rho_i, rho_j, Val(S)) + psi / rho_j)
+
+    return (dvdt = dv_tmp, drhodt = drho)
+end
+
+@inline _onesided_zero_self(::FluidPfn{S,D,E,T}, ::AbstractParticleSystem{T,ND}, i) where {S,D,E,ND,T} =
+    (dvdt = zero(SVector{ND,T}), drhodt = zero(T))
+
+@inline @Base.propagate_inbounds function _onesided_writeback_self!(::FluidPfn, ps, i, acc)
+    ps.dvdt[i]   += acc.dvdt
+    ps.drhodt[i] += acc.drhodt
+    return nothing
+end
+
+# Coupled static boundary — already one-sided in its two-sided form (a static
+# boundary has no dynamics), so this is a direct transcription: return instead
+# of mutate.
+@inline @Base.propagate_inbounds function pfn_contribution(f::FluidPfn{S,D,E,T}, ps_a::AbstractParticleSystem{T,ND}, ps_b::StaticBoundarySystem{T,ND}, i::Int, j::Int, dx::SVector{ND,T}, gx::SVector{ND,T}, w::T) where {S,D,E,ND,T<:AbstractFloat}
+    vi, vj       = ps_a.v[i], ps_b.v[j]
+    rho_i, rho_j = ps_a.rho[i], ps_b.rho[j]
+    mass_j       = ps_b.mass
+    dv           = vi - vj
+
+    piv = artificial_viscosity(dx, dv, f.h, rho_i, rho_j, f.art_visc_alpha, f.art_visc_beta, ps_a.c, ps_a.c)
+    rf  = lennard_jones(dx, ps_b.lj_cutoff, ps_a.c, 12, 6)
+    return (dvdt = -mass_j * piv * gx + rf * dx,)
+end
+
+@inline _onesided_zero_coupled(::FluidPfn{S,D,E,T}, ::AbstractParticleSystem{T,ND}, ::StaticBoundarySystem, i) where {S,D,E,ND,T} =
+    (dvdt = zero(SVector{ND,T}),)
+
+@inline @Base.propagate_inbounds function _onesided_writeback_coupled!(::FluidPfn, ps_a, ::StaticBoundarySystem, i, acc)
+    ps_a.dvdt[i] += acc.dvdt
+    return nothing
+end
+
 # Coupled dynamic boundary (derives velocity, pressure-based)
 @inline @Base.propagate_inbounds function (f::FluidPfn{S,D,E,T})(ps_a::AbstractParticleSystem{T,ND}, ps_b::DynamicBoundarySystem{T,ND}, i::Int, j::Int, dx::SVector{ND,T}, gx::SVector{ND,T}, w::T) where {S,D,E,ND,T<:AbstractFloat}
     da = dot(ps_a.x[i] - ps_b.boundary_point, ps_b.boundary_normal)

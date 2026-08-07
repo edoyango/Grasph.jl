@@ -1,4 +1,4 @@
-export SystemInteraction, is_coupled, create_grid!, sweep!, adjust_v!
+export SystemInteraction, is_coupled, create_grid!, sweep!, adjust_v!, pfn_contribution
 
 # ---------------------------------------------------------------------------
 # Struct
@@ -20,7 +20,7 @@ index of the first particle in cell `c` (0 if empty); `_cell_count[c]` is the
 number of particles in cell `c`.  This requires that particles are sorted by cell
 before `create_grid!` is called (handled by `sort_particles!` in the time loop).
 """
-struct SystemInteraction{T<:AbstractFloat, ND, KT<:AbstractKernel{T,ND}, SA<:AbstractParticleSystem{T,ND}, SB<:Union{Nothing,AbstractParticleSystem{T,ND}}, PFNS<:Tuple, VPFN}
+struct SystemInteraction{T<:AbstractFloat, ND, KT<:AbstractKernel{T,ND}, SA<:AbstractParticleSystem{T,ND}, SB<:Union{Nothing,AbstractParticleSystem{T,ND}}, PFNS<:Tuple, VPFN, ONESIDED}
     kernel::KT
     pfns::PFNS
     vadjust_pfn::VPFN
@@ -33,9 +33,10 @@ struct SystemInteraction{T<:AbstractFloat, ND, KT<:AbstractKernel{T,ND}, SA<:Abs
     _mingridx_a::MVector{ND,T}          # min position of system_a particles per dim (ndims,)
     _maxgridx_a::MVector{ND,T}          # max position of system_a particles per dim (ndims,)
     _cell_size::T
-    function SystemInteraction{T, ND, KT, SA, SB, PFNS, VPFN}(args...) where {T, ND, KT, SA, SB, PFNS, VPFN}
+    function SystemInteraction{T, ND, KT, SA, SB, PFNS, VPFN, ONESIDED}(args...) where {T, ND, KT, SA, SB, PFNS, VPFN, ONESIDED}
         ND isa Int || throw(ArgumentError("ND must be an Int, got $(typeof(ND))"))
-        new{T, ND, KT, SA, SB, PFNS, VPFN}(args...)
+        ONESIDED isa Bool || throw(ArgumentError("ONESIDED must be a Bool, got $(typeof(ONESIDED))"))
+        new{T, ND, KT, SA, SB, PFNS, VPFN, ONESIDED}(args...)
     end
 end
 
@@ -57,13 +58,22 @@ Construct a `SystemInteraction`.
 - Pass `system_b` for a coupled (e.g. fluid–boundary) sweep.
 
 Raises `ArgumentError` if `system_b.ndims ≠ system_a.ndims`.
+
+Pass `onesided=true` to use the particle-parallel, full-stencil, one-sided
+accumulation sweep instead of the default coloured half-shell sweep. This
+requires every pfn used by this interaction to implement the `pfn_contribution`
+one-sided protocol (see `pfn_contribution` docstring) — currently only
+`FluidPfn`'s self-interaction and `StaticBoundarySystem`-coupled methods do.
+Default `false` reproduces today's behaviour exactly; existing call sites are
+unaffected.
 """
 function SystemInteraction(
     kernel::AbstractKernel,
     pairwise_fn,
     system_a::AbstractParticleSystem{T, ND},
     system_b::Union{Nothing, AbstractParticleSystem} = nothing;
-    velocity_adjust_pairwise_fn = nothing
+    velocity_adjust_pairwise_fn = nothing,
+    onesided::Bool = false,
 ) where {T<:AbstractFloat, ND}
     nd = Int(ND)
     kernel.ndims == nd || throw(ArgumentError(
@@ -74,7 +84,7 @@ function SystemInteraction(
     _check_functors_eltype(pfns, T, "pairwise functor")
     SystemInteraction{
         T, nd, typeof(kernel),
-        typeof(system_a), typeof(system_b), typeof(pfns), typeof(velocity_adjust_pairwise_fn)
+        typeof(system_a), typeof(system_b), typeof(pfns), typeof(velocity_adjust_pairwise_fn), onesided
     }(
         kernel,
         pfns,
@@ -303,8 +313,14 @@ _sweep_pfns!(si, system_b, ::Tuple{}, stage) = nothing
     end
 end
 
-_sweep_dispatch!(si, ::Nothing, pfn) = _sweep_self!(si, pfn)
-_sweep_dispatch!(si, system_b, pfn) = _sweep_coupled!(si, system_b, pfn)
+_sweep_dispatch!(si::SystemInteraction{T,ND,KT,SA,SB,PFNS,VPFN,false}, ::Nothing, pfn) where {T,ND,KT,SA,SB,PFNS,VPFN} =
+    _sweep_self!(si, pfn)
+_sweep_dispatch!(si::SystemInteraction{T,ND,KT,SA,SB,PFNS,VPFN,false}, system_b, pfn) where {T,ND,KT,SA,SB,PFNS,VPFN} =
+    _sweep_coupled!(si, system_b, pfn)
+_sweep_dispatch!(si::SystemInteraction{T,ND,KT,SA,SB,PFNS,VPFN,true}, ::Nothing, pfn) where {T,ND,KT,SA,SB,PFNS,VPFN} =
+    _sweep_self_onesided!(si, pfn)
+_sweep_dispatch!(si::SystemInteraction{T,ND,KT,SA,SB,PFNS,VPFN,true}, system_b, pfn) where {T,ND,KT,SA,SB,PFNS,VPFN} =
+    _sweep_coupled_onesided!(si, system_b, pfn)
 
 adjust_v!(si::SystemInteraction) = _sweep_pfns!(si, si.system_b, (si.vadjust_pfn,), 1)
 
@@ -728,5 +744,228 @@ end
             gx         = grad_coeff * dx
             pfn(ps_a, ps_b, i, j, dx, gx, w)
         end
+    end
+end
+
+# ---------------------------------------------------------------------------
+# One-sided, particle-parallel sweep (opt-in via `onesided=true`)
+#
+# GPU-shaped alternative to the coloured half-shell/9-27-colour sweeps above.
+# Thread/task granularity is PER PARTICLE `i` rather than per active cell:
+# each particle scans the FULL 3x3 (2D) / 3x3x3 (3D) neighbour-cell block
+# (not just the "forward" half-shell), accumulates every pair's contribution
+# to `i` in a local variable, and writes each affected field exactly once at
+# the end. Because no thread ever writes to another particle's memory, this
+# has no write conflicts regardless of execution order — colouring, which
+# exists solely to serialise conflicting writes under the old two-sided
+# `dvdt[i] += ...; dvdt[j] -= ...` contract, is unnecessary here.
+#
+# This requires a different pfn contract: instead of mutating both particles,
+# `pfn_contribution(pfn, ps, i, j, dx, gx, w)` RETURNS "the contribution to i
+# from j" as a NamedTuple. Newton's third law is recovered for free: when the
+# sweep later visits particle j and scans its neighbour block, it calls
+# `pfn_contribution(pfn, ps, j, i, dx_ji, gx_ji, w)` with dx_ji = -dx and
+# gx_ji = -gx (recomputed from swapped positions) — for SPH pair forces built
+# from a kernel gradient that is odd in dx and a kernel value that is even in
+# dx, this reproduces the old mirror term exactly, with no new physics.
+#
+# Costs 2x pairwise-function evaluations versus the half-shell (each pair is
+# visited from both directions); in exchange there are 0 atomics, 0 colour
+# passes, and 1 write per particle per field — the shape a GPU kernel wants.
+#
+# Only pfns that implement `pfn_contribution` (see PairwiseFunctors.jl) work
+# with `onesided=true`; currently that is `FluidPfn`'s self-interaction and
+# `StaticBoundarySystem`-coupled methods.
+# ---------------------------------------------------------------------------
+
+"""
+    pfn_contribution(pfn, ps, i, j, dx, gx, w) -> NamedTuple
+    pfn_contribution(pfn, ps_a, ps_b, i, j, dx, gx, w) -> NamedTuple
+
+One-sided pairwise contract: return particle `i`'s contribution from
+neighbour `j` as a `NamedTuple` (field name → value), instead of mutating
+`ps` in place. Used by the `onesided=true` sweep; see the "One-sided,
+particle-parallel sweep" notes above for why this reproduces the two-sided
+mutating contract's physics exactly with no new derivation.
+"""
+function pfn_contribution end
+
+# Generic accumulator: element-wise add two NamedTuples with identical field
+# names. Field names are part of the type, so this specialises per pfn with
+# no runtime branching.
+@inline _acc_add(acc::NamedTuple{names}, contrib::NamedTuple{names}) where {names} =
+    NamedTuple{names}(map(+, values(acc), values(contrib)))
+
+@inline function _pair_self_onesided!(pfn, ps, i::Int, j::Int, kernel::AbstractKernel{T,ND}, h::T, cutoff_sq::T, ::Val{ND}, acc) where {T,ND}
+    @inbounds begin
+        xa = ps.x
+        dx   = xa[i] - xa[j]
+        r_sq = dot(dx, dx)
+        if r_sq < cutoff_sq
+            r          = sqrt(r_sq)
+            q          = r / h
+            grad_coeff = kernel_dw_dq(kernel, q) / (r * h)
+            w          = kernel_w(kernel, q)
+            gx         = grad_coeff * dx
+            return _acc_add(acc, pfn_contribution(pfn, ps, i, j, dx, gx, w))
+        end
+        return acc
+    end
+end
+
+@inline function _pair_coupled_onesided!(pfn, ps_a, ps_b, i::Int, j::Int, kernel::AbstractKernel{T,ND}, h::T, cutoff_sq::T, ::Val{ND}, acc) where {T,ND}
+    @inbounds begin
+        xa = ps_a.x
+        xb = ps_b.x
+        dx   = xa[i] - xb[j]
+        r_sq = dot(dx, dx)
+        if r_sq < cutoff_sq
+            r          = sqrt(r_sq)
+            q          = r / h
+            grad_coeff = kernel_dw_dq(kernel, q) / (r * h)
+            w          = kernel_w(kernel, q)
+            gx         = grad_coeff * dx
+            return _acc_add(acc, pfn_contribution(pfn, ps_a, ps_b, i, j, dx, gx, w))
+        end
+        return acc
+    end
+end
+
+# --- self-interaction, particle-parallel ---
+
+function _sweep_self_onesided!(si::SystemInteraction{T,2}, ::Nothing) where {T}
+end
+function _sweep_self_onesided!(si::SystemInteraction{T,3}, ::Nothing) where {T}
+end
+
+function _sweep_self_onesided!(si::SystemInteraction{T,2}, pfn::PFN) where {T,PFN}
+    ps         = si.system_a
+    kernel     = si.kernel
+    h          = T(kernel.h)
+    cutoff_sq  = si._cell_size * si._cell_size
+    cell_start = si._cell_start::Vector{Int}
+    n_cells_y  = Int(si._ngridx[2])
+    mingridx   = si._mingridx
+    cutoff     = si._cell_size
+    ngridx     = si._ngridx
+    val_ndims  = Val{2}()
+    n          = ps.n
+
+    @inbounds @batch for i in 1:n
+        cell_idx = _cell_1idx(ps.x[i], mingridx, cutoff, ngridx, val_ndims)
+        acc = _onesided_zero_self(pfn, ps, i)
+        for dx_cell in -1:1
+            neighbour_cell_idx = cell_idx + dx_cell * n_cells_y - 1
+            pstart = cell_start[neighbour_cell_idx]
+            pend   = cell_start[neighbour_cell_idx + 3]
+            for j in pstart:pend-1
+                j == i && continue   # a particle never pairs with itself
+                acc = _pair_self_onesided!(pfn, ps, i, j, kernel, h, cutoff_sq, val_ndims, acc)
+            end
+        end
+        _onesided_writeback_self!(pfn, ps, i, acc)
+    end
+end
+
+function _sweep_self_onesided!(si::SystemInteraction{T,3}, pfn::PFN) where {T,PFN}
+    ps         = si.system_a
+    kernel     = si.kernel
+    h          = T(kernel.h)
+    cutoff_sq  = si._cell_size * si._cell_size
+    cell_start = si._cell_start::Vector{Int}
+    n_cells_z  = Int(si._ngridx[3])
+    n_cells_y  = Int(si._ngridx[2])
+    n_cells_yz = n_cells_y * n_cells_z
+    mingridx   = si._mingridx
+    cutoff     = si._cell_size
+    ngridx     = si._ngridx
+    val_ndims  = Val{3}()
+    n          = ps.n
+
+    @inbounds @batch for i in 1:n
+        cell_idx = _cell_1idx(ps.x[i], mingridx, cutoff, ngridx, val_ndims)
+        acc = _onesided_zero_self(pfn, ps, i)
+        for dx_cell in -1:1
+            for dy_cell in -1:1
+                neighbour_cell_idx = cell_idx + dx_cell * n_cells_yz + dy_cell * n_cells_z - 1
+                pstart = cell_start[neighbour_cell_idx]
+                pend   = cell_start[neighbour_cell_idx + 3]
+                for j in pstart:pend-1
+                    j == i && continue   # a particle never pairs with itself
+                    acc = _pair_self_onesided!(pfn, ps, i, j, kernel, h, cutoff_sq, val_ndims, acc)
+                end
+            end
+        end
+        _onesided_writeback_self!(pfn, ps, i, acc)
+    end
+end
+
+# --- coupled interaction, particle-parallel ---
+#
+# No `j == i` guard is needed: ps_a and ps_b are distinct systems (distinct
+# backing arrays), so index collision between i and j has no meaning here.
+
+function _sweep_coupled_onesided!(si::SystemInteraction{T,2}, ps_b, ::Nothing) where {T}
+end
+function _sweep_coupled_onesided!(si::SystemInteraction{T,3}, ps_b, ::Nothing) where {T}
+end
+
+function _sweep_coupled_onesided!(si::SystemInteraction{T,2}, ps_b, pfn::PFN) where {T,PFN}
+    ps_a       = si.system_a
+    kernel     = si.kernel
+    h          = T(kernel.h)
+    cutoff_sq  = si._cell_size * si._cell_size
+    cell_start = si._cell_start::Vector{Int}
+    n_cells_y  = Int(si._ngridx[2])
+    mingridx   = si._mingridx
+    cutoff     = si._cell_size
+    ngridx     = si._ngridx
+    val_ndims  = Val{2}()
+    n          = ps_a.n
+
+    @inbounds @batch for i in 1:n
+        cell_idx = _cell_1idx(ps_a.x[i], mingridx, cutoff, ngridx, val_ndims)
+        acc = _onesided_zero_coupled(pfn, ps_a, ps_b, i)
+        for dx_cell in -1:1
+            neighbour_cell_idx = cell_idx + dx_cell * n_cells_y - 1
+            pstart = cell_start[neighbour_cell_idx]
+            pend   = cell_start[neighbour_cell_idx + 3]
+            for j in pstart:pend-1
+                acc = _pair_coupled_onesided!(pfn, ps_a, ps_b, i, j, kernel, h, cutoff_sq, val_ndims, acc)
+            end
+        end
+        _onesided_writeback_coupled!(pfn, ps_a, ps_b, i, acc)
+    end
+end
+
+function _sweep_coupled_onesided!(si::SystemInteraction{T,3}, ps_b, pfn::PFN) where {T,PFN}
+    ps_a       = si.system_a
+    kernel     = si.kernel
+    h          = T(kernel.h)
+    cutoff_sq  = si._cell_size * si._cell_size
+    cell_start = si._cell_start::Vector{Int}
+    n_cells_z  = Int(si._ngridx[3])
+    n_cells_y  = Int(si._ngridx[2])
+    n_cells_yz = n_cells_y * n_cells_z
+    mingridx   = si._mingridx
+    cutoff     = si._cell_size
+    ngridx     = si._ngridx
+    val_ndims  = Val{3}()
+    n          = ps_a.n
+
+    @inbounds @batch for i in 1:n
+        cell_idx = _cell_1idx(ps_a.x[i], mingridx, cutoff, ngridx, val_ndims)
+        acc = _onesided_zero_coupled(pfn, ps_a, ps_b, i)
+        for dx_cell in -1:1
+            for dy_cell in -1:1
+                neighbour_cell_idx = cell_idx + dx_cell * n_cells_yz + dy_cell * n_cells_z - 1
+                pstart = cell_start[neighbour_cell_idx]
+                pend   = cell_start[neighbour_cell_idx + 3]
+                for j in pstart:pend-1
+                    acc = _pair_coupled_onesided!(pfn, ps_a, ps_b, i, j, kernel, h, cutoff_sq, val_ndims, acc)
+                end
+            end
+        end
+        _onesided_writeback_coupled!(pfn, ps_a, ps_b, i, acc)
     end
 end

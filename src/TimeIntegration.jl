@@ -610,10 +610,9 @@ function time_integrate!(
     q0_bufs = map(_make_q0_bufs, sys)
 
     sort_cutoff       = T(2) * integrator.h
-    sort_nd           = first(sys).ndims
     sort_max_n        = maximum(ps.n for ps in sys)
     sort_perm_buf     = Vector{Int}(undef, sort_max_n)
-    sort_key_buf      = Vector{SVector{sort_nd,Int}}(undef, sort_max_n)
+    sort_key_buf      = Vector{UInt64}(undef, sort_max_n)
     sys_scratches     = map(_make_sort_scratch, sys)
     ghost_scratches   = [_make_empty_sort_scratch(ge.ghost) for ge in integrator.ghosts]
     virtual_scratches = [_make_sort_scratch(vps) for vps in vsys]
@@ -746,9 +745,8 @@ function time_integrate!(
     acc_bufs = map(_make_acc_bufs, sys)
 
     sort_cutoff       = T(2) * integrator.h
-    sort_nd           = first(sys).ndims
     sort_perm_buf     = Vector{Int}(undef, maximum(ps.n for ps in sys))
-    sort_key_buf      = Vector{SVector{sort_nd,Int}}(undef, maximum(ps.n for ps in sys))
+    sort_key_buf      = Vector{UInt64}(undef, maximum(ps.n for ps in sys))
     sys_scratches     = map(_make_sort_scratch, sys)
     ghost_scratches   = [_make_empty_sort_scratch(ge.ghost) for ge in integrator.ghosts]
     virtual_scratches = [_make_sort_scratch(vps) for vps in vsys]
