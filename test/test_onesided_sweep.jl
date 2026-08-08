@@ -701,3 +701,103 @@ end
     # The forward pass must ALSO have run and written non-vacuously into system_a.
     @test any(v -> norm(v) > 0, ps_a.dvdt)
 end
+
+# ---------------------------------------------------------------------------
+# 9. Phase 3: Bucket B conversions (InterpolateFieldFn, NeighborCountFn) —
+#    both already write into `ps_b` (a virtual or probe target) in their
+#    two-sided mutating form, so `_onesided_shape = WritesB()` and no script
+#    changes are needed. Unlike every comparison above, the field(s) under
+#    test now live on `system_b`, not `system_a` — the harness below diffs
+#    the *target* system, since a broken WritesB() pass would be invisible
+#    to the system_a-only harnesses used in sections 1-7.
+# ---------------------------------------------------------------------------
+
+function _zero_interp_target!(ps, fields)
+    fill!(ps.w_sum, zero(eltype(ps.w_sum)))
+    for f in fields
+        arr = getproperty(ps, f)
+        fill!(arr, zero(eltype(arr)))
+    end
+end
+
+# Coupled comparison, mirroring _compare_coupled_generic but diffing the
+# *target* (system_b: virtual/probe) instead of system_a, since that's what
+# InterpolateFieldFn/NeighborCountFn actually write. `a` is shared (read-only,
+# untouched by either pfn) between the two interactions, sorted once; `b` is
+# zeroed (matching auto_zero_virtual!/auto_zero_probe! in the real driver)
+# then deepcopy'd so the coloured and onesided sweeps start identical.
+function _compare_coupled_sweep_writes_b(rng, pfn, build_a, build_b, fields, n_a, n_b, ndims; L=1.0, h=0.08)
+    kernel = CubicSplineKernel(h; ndims=ndims)
+    cutoff = kernel.interaction_length
+    a = build_a(rng, n_a, ndims; L=L)
+    a_dvdt_before, a_drhodt_before = deepcopy(a.dvdt), deepcopy(a.drhodt)
+
+    b_old = build_b(rng, n_b, ndims; L=L)
+    _zero_interp_target!(b_old, fields)
+    b_new = deepcopy(b_old)
+
+    si_old = SystemInteraction(kernel, pfn, a, b_old)
+    si_new = SystemInteraction(kernel, pfn, a, b_new; onesided=true)
+
+    pa, ka_, sa = _sortbufs(a)
+    sort_particles!(a, cutoff, pa, ka_, sa)
+
+    for (b, si) in ((b_old, si_old), (b_new, si_new))
+        pb, kb, sb = _sortbufs(b)
+        sort_particles!(b, cutoff, pb, kb, sb)
+        create_grid!(si)
+        sweep!(si)
+    end
+
+    # WritesB() must leave system_a completely untouched.
+    @test a.dvdt   == a_dvdt_before
+    @test a.drhodt == a_drhodt_before
+
+    for f in fields
+        va, vb = getproperty(b_old, f), getproperty(b_new, f)
+        @test _elemdiff(va, vb) < 1e-9 * _elemscale(va)
+    end
+    @test maximum(abs.(b_old.w_sum .- b_new.w_sum)) < 1e-9 * max(maximum(abs.(b_old.w_sum)), 1.0)
+end
+
+_random_probe_rv(rng, n, ndims; L=1.0) = ProbeParticleSystem(
+    "probe", [SVector(ntuple(_ -> L * rand(rng), ndims)...) for _ in 1:n];
+    extras=(rho=zeros(n), v=[zero(SVector{ndims,Float64}) for _ in 1:n]),
+)
+
+_random_probe_nbr(rng, n, ndims; L=1.0) = ProbeParticleSystem(
+    "probe", [SVector(ntuple(_ -> L * rand(rng), ndims)...) for _ in 1:n];
+    extras=(nbr_count=zeros(Int, n),),
+)
+
+@testset "onesided=true InterpolateFieldFn (WritesB, virtual target) matches coloured sweep" begin
+    rng = MersenneTwister(50)
+    pfn = InterpolateFieldFn(:v, :rho; accumulate_wsum=true)
+    for ndims in (2, 3)
+        _compare_coupled_sweep_writes_b(rng, pfn, _random_fluid, _as_virtual_fluid, (:v, :rho), 300, 200, ndims)
+    end
+end
+
+@testset "onesided=true InterpolateFieldFn (WritesB, stress field, no wsum) matches coloured sweep" begin
+    rng = MersenneTwister(51)
+    pfn = InterpolateFieldFn(:stress; accumulate_wsum=false)
+    for ndims in (2, 3)
+        _compare_coupled_sweep_writes_b(rng, pfn, _random_stress, _as_virtual_stress, (:stress,), 250, 180, ndims)
+    end
+end
+
+@testset "onesided=true InterpolateFieldFn (WritesB, probe target) matches coloured sweep" begin
+    rng = MersenneTwister(52)
+    pfn = InterpolateFieldFn(:v, :rho; accumulate_wsum=true)
+    for ndims in (2, 3)
+        _compare_coupled_sweep_writes_b(rng, pfn, _random_fluid, _random_probe_rv, (:v, :rho), 300, 200, ndims)
+    end
+end
+
+@testset "onesided=true NeighborCountFn (WritesB) matches coloured sweep" begin
+    rng = MersenneTwister(53)
+    pfn = NeighborCountFn(:nbr_count)
+    for ndims in (2, 3)
+        _compare_coupled_sweep_writes_b(rng, pfn, _random_fluid, _random_probe_nbr, (:nbr_count,), 300, 200, ndims)
+    end
+end

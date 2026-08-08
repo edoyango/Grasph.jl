@@ -770,6 +770,56 @@ end
     ACC_WSUM && (ps_b.w_sum[j] += kw)
 end
 
+# --- One-sided `pfn_contribution` method ---
+#
+# Every script call site couples a real source system as system_a against a
+# virtual or probe target as system_b (Trapdoor.jl, EP_ColumnCollapse2.jl):
+# `_onesided_shape = WritesB()` for that shape. The reverse sweep's call
+# convention puts the write target (the virtual/probe system_b) in the
+# "ps_a" position and the read-only neighbour (real system_a) in "ps_b" —
+# same as every other coupled pfn_contribution method — so this reads
+# exactly like the mutating method above with the roles already swapped:
+# `kw` uses the *neighbour's* mass/rho (ps_b here), and the interpolated
+# value is `kw * neighbour.field[j]`, written back into `ps_a[i]` (the
+# target) by the generic writeback below.
+#
+# `fields` is a runtime-opaque, compile-time-known tuple of symbols (part of
+# the type), so contributions are built the same way `_interp_fields_ab!`
+# mutates them: recursively over the tuple, unrolled at compile time.
+
+_interp_values(::Tuple{}, ps, j, kw) = ()
+@inline @Base.propagate_inbounds function _interp_values(fields::Tuple, ps, j, kw)
+    fname = first(fields)
+    return (kw * getproperty(ps, fname)[j], _interp_values(Base.tail(fields), ps, j, kw)...)
+end
+
+_interp_zeros(::Tuple{}, ps) = ()
+@inline @Base.propagate_inbounds function _interp_zeros(fields::Tuple, ps)
+    fname = first(fields)
+    return (zero(eltype(getproperty(ps, fname))), _interp_zeros(Base.tail(fields), ps)...)
+end
+
+_onesided_shape(::InterpolateFieldFn, ::AbstractParticleSystem, ::Union{VirtualParticleSystem,ProbeParticleSystem}) = WritesB()
+
+@inline @Base.propagate_inbounds function pfn_contribution(::InterpolateFieldFn{fields, ACC_WSUM}, ps_a::Union{VirtualParticleSystem{T,ND},ProbeParticleSystem{T,ND}}, ps_b::AbstractParticleSystem{T,ND}, i::Int, j::Int, dx::SVector{ND,T}, gx::SVector{ND,T}, w::T) where {fields, ACC_WSUM, ND, T<:AbstractFloat}
+    kw = w * (ps_b.mass / ps_b.rho[j])
+    vals = _interp_values(fields, ps_b, j, kw)
+    if ACC_WSUM
+        return NamedTuple{(fields..., :w_sum)}((vals..., kw))
+    else
+        return NamedTuple{fields}(vals)
+    end
+end
+
+@inline function _onesided_zero_coupled(::InterpolateFieldFn{fields, ACC_WSUM}, ps_a::Union{VirtualParticleSystem{T,ND},ProbeParticleSystem{T,ND}}, ::AbstractParticleSystem{T,ND}, i) where {fields, ACC_WSUM, ND, T<:AbstractFloat}
+    zeros_ = _interp_zeros(fields, ps_a)
+    if ACC_WSUM
+        return NamedTuple{(fields..., :w_sum)}((zeros_..., zero(T)))
+    else
+        return NamedTuple{fields}(zeros_)
+    end
+end
+
 """
     NeighborCountFn(field::Symbol)
 
@@ -789,6 +839,21 @@ NeighborCountFn(field::Symbol) = NeighborCountFn{field}()
 ) where {field}
     getproperty(probe, field)[j] += 1
 end
+
+# --- One-sided `pfn_contribution` method ---
+#
+# Only ever used as (system_a=real, system_b=probe), so this is WritesB():
+# the reverse sweep's call convention puts the write target (probe) in the
+# "ps_a" position, matching the mutating method above with roles swapped.
+
+_onesided_shape(::NeighborCountFn, ::AbstractParticleSystem, ::ProbeParticleSystem) = WritesB()
+
+@inline @Base.propagate_inbounds function pfn_contribution(::NeighborCountFn{field}, probe::ProbeParticleSystem{T,ND}, ps_b::AbstractParticleSystem{T,ND}, i::Int, j::Int, dx::SVector{ND,T}, gx::SVector{ND,T}, w::T) where {field,ND,T<:AbstractFloat}
+    return NamedTuple{(field,)}((one(eltype(getproperty(probe, field))),))
+end
+
+@inline _onesided_zero_coupled(::NeighborCountFn{field}, probe::ProbeParticleSystem, ::AbstractParticleSystem, i) where {field} =
+    NamedTuple{(field,)}((zero(eltype(getproperty(probe, field))),))
 
 """
     FluidSolidPfn{S, D, T}
