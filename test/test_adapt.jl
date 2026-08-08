@@ -2,6 +2,7 @@ using Test
 using Grasph
 using StaticArrays
 using Adapt
+using CUDA
 
 # ---------------------------------------------------------------------------
 # Phase B1 — array-type-generic particle systems.
@@ -172,6 +173,116 @@ using Adapt
         @test all(isfinite, reinterpret(Float64, fluid_a.x))
         @test all(isfinite, fluid_a.rho)
         @test all(r -> r > 0, fluid_a.rho)
+    end
+
+    # -----------------------------------------------------------------------
+    # Real CuArray round-trips. Everything above only exercises adapt(Array,
+    # ps), the trivial identity path, because the machine Phase B1 was built
+    # on had no GPU. Now that one exists (see docs/gpu-migration-plan.md),
+    # round-trip through an actual device array — CUDA.functional()-guarded
+    # so this stays skippable on CPU-only machines.
+    # -----------------------------------------------------------------------
+
+    if CUDA.functional()
+
+        @testset "Adapt round-trip through CuArray" begin
+            basic = BasicParticleSystem("basic", 6, 2, 1.5, 3.0; source_v=[0.0, -9.81])
+            basic.x .= [SVector(Float64(i), Float64(2i)) for i in 1:6]
+            basic.v .= [SVector(0.1 * i, -0.1 * i) for i in 1:6]
+            basic.rho .= 1000.0 .+ (1:6)
+            add_print_field!(basic, :v)
+
+            fluid = FluidParticleSystem("fluid", 6, 2, 1.5, 3.0; state_updater=TaitEOSUpdater(1000.0))
+            fluid.x .= [SVector(Float64(i), 0.0) for i in 1:6]
+            fluid.rho .= 1000.0
+            update_state!(fluid, 1)
+
+            stress = StressParticleSystem("stress", 5, 2, 3, 1.0, 2.0)
+            stress.stress .= [SVector(Float64(i), 0.0, 0.0) for i in 1:5]
+
+            ep2d = ElastoPlasticParticleSystem("ep2d", 5, 2, 3, 1.0, 2.0)
+            ep2d.vorticity .= collect(1.0:5.0)
+            ep3d = ElastoPlasticParticleSystem("ep3d", 5, 3, 6, 1.0, 2.0)
+            ep3d.vorticity .= [SVector(Float64(i), 0.0, 0.0) for i in 1:5]
+
+            vps_source = BasicParticleSystem("basic2", 5, 2, 1.0, 2.0)
+            vps = VirtualParticleSystem(vps_source, "virt", 5, 2, 1.0, 2.0; zero_fields=(:w_sum,))
+            getfield(vps, :w_sum) .= collect(1.0:5.0)
+
+            sb = StaticBoundarySystem(basic, 0.5)
+            db = DynamicBoundarySystem(basic, [1.0, 0.0], [0.0, 0.0], 1.0)
+
+            for ps in (basic, fluid, stress, ep2d, ep3d, vps, sb, db)
+                d = adapt(CuArray, ps)
+                r = adapt(Array, d)
+                @test typeof(r) == typeof(ps)
+            end
+
+            # Field-exact round-trips and device-storage-type assertions for
+            # the three systems reachable in the dambreak.jl vertical slice.
+            for (ps, arrtype) in ((basic, SVector{2,Float64}), (fluid, SVector{2,Float64}))
+                d = adapt(CuArray, ps)
+                @test d.x isa CuArray{arrtype}
+                @test getfield(d, :id) isa CuArray{Int}
+                r = adapt(Array, d)
+                @test r.x == ps.x && r.v == ps.v && r.rho == ps.rho
+                @test getfield(r, :id) == getfield(ps, :id)
+                @test r.mass == ps.mass && r.c == ps.c
+                # _print_fields is intentionally passed through unadapted
+                # (host-only bookkeeping) — the SAME vector, not a copy.
+                @test getfield(d, :_print_fields) === getfield(ps, :_print_fields)
+            end
+
+            d_sb = adapt(CuArray, sb)
+            @test getfield(d_sb, :inner).x isa CuArray{SVector{2,Float64}}
+            r_sb = adapt(Array, d_sb)
+            @test r_sb.x == sb.x && r_sb.lj_cutoff == sb.lj_cutoff
+
+            # Functional GPU twin of "Adapted system is fully functional"
+            # above — this is Tier 3 in miniature, and where a broken
+            # struct-to-device wiring actually shows up.
+            n_fluid = 25
+            h = 0.6
+            fluid2 = FluidParticleSystem("fluid", n_fluid, 2, 1.0, 20.0;
+                                         source_v=[0.0, -9.81], state_updater=TaitEOSUpdater(1000.0))
+            let k = 1
+                for i in 0:4, j in 0:4
+                    fluid2.x[k] = SVector(0.5 * i, 0.5 * j)
+                    k += 1
+                end
+            end
+            fill!(fluid2.v, zero(SVector{2,Float64}))
+            fluid2.rho .= 1000.0
+            update_state!(fluid2, 1)
+
+            boundary2 = BasicParticleSystem("boundary", 12, 2, 1.0, 20.0)
+            let k = 1
+                for i in 0:11
+                    boundary2.x[k] = SVector(0.5 * i, -0.5)
+                    k += 1
+                end
+            end
+            boundary2.rho .= 1000.0
+            fill!(boundary2.v, zero(SVector{2,Float64}))
+
+            fluid2_g    = adapt(CuArray, fluid2)
+            boundary2_g = adapt(CuArray, boundary2)
+
+            kernel = CubicSplineKernel(h; ndims=2)
+            static_boundary_g = StaticBoundarySystem(boundary2_g, 0.5)
+            fluid_int_g = SystemInteraction(kernel, FluidPfn(0.01, 0.0, h), fluid2_g; onesided=true, ka=true)
+            fluid_boundary_int_g = SystemInteraction(kernel, FluidPfn(0.01, 0.0, h), fluid2_g, static_boundary_g;
+                                                     onesided=true, ka=true)
+
+            integrator_g = LeapFrogTimeIntegrator([fluid2_g, boundary2_g], [fluid_int_g, fluid_boundary_int_g])
+            CUDA.allowscalar(false)
+            time_integrate!(integrator_g, 10, 1000, 1000, 0.1, nothing; print_timer=false)
+
+            @test all(isfinite, Array(reinterpret(Float64, fluid2_g.x)))
+            @test all(isfinite, Array(fluid2_g.rho))
+            @test all(r -> r > 0, Array(fluid2_g.rho))
+        end
+
     end
 
 end
