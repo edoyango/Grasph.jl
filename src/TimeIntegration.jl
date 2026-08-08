@@ -184,11 +184,11 @@ _make_q0_bufs(ps, ::Tuple{}) = ()
 end
 @inline _make_q0_bufs(ps::AbstractParticleSystem) = _make_q0_bufs(ps, getfield(ps, :pairs))
 
-# Snapshot current q values into the pre-allocated buffers (buf = q + 0*q).
+# Snapshot current q values into the pre-allocated buffers.
 _save_q0_pairs!(ps, ::Tuple{}, ::Tuple{}) = nothing
 @inline function _save_q0_pairs!(ps, pairs::Tuple, bufs::Tuple)
     q_val = first(first(pairs))
-    _axpy_oop!(first(bufs), _getf(ps, q_val), _getf(ps, q_val), 0)
+    copyto!(first(bufs), _getf(ps, q_val))
     _save_q0_pairs!(ps, Base.tail(pairs), Base.tail(bufs))
 end
 
@@ -251,9 +251,7 @@ end
 @inline _apply_damping_pair!(ps, ::Val{:v}, dqdt_val::Val, Γ_dt) = begin
     v    = _getf(ps, Val{:v}())
     dvdt = _getf(ps, dqdt_val)
-    @inbounds for i in eachindex(v)
-        dvdt[i] -= Γ_dt * v[i]
-    end
+    @. dvdt -= Γ_dt * v
 end
 @inline _apply_damping_pair!(ps, ::Val, ::Val, ::Any) = nothing
 
@@ -420,7 +418,14 @@ end
 
 # XSPH velocity correction: subtract the accumulated v_adjustment, re-run the
 # XSPH sweep via adjust_v!, then add the freshly computed adjustment back.
+#
+# Skipped entirely when no interaction has a velocity-adjust pfn: v_adjustment
+# then stays permanently zero (nothing ever writes it), so the whole sequence
+# is mathematically a no-op — subtract 0, zero an already-zero field, run a
+# sweep that dispatches to a no-op stub for pfn=nothing, add 0 back. Guarding
+# it skips those launches rather than actually performing a no-op.
 function _xsph_correction!(sys, ints, to, ps_labels, inter_labels)
+    any(inter -> inter.vadjust_pfn !== nothing, ints) || return nothing
     for (i, ps) in enumerate(sys)
         @timeit to ps_labels[i].v_adjust @timeit to ps_labels[i].name _axpy_ip!(ps.v, ps.v_adjustment, -1)
     end
@@ -508,7 +513,7 @@ function _maybe_print!(sys, to, global_step, print_interval_step, dt)
             sim_time = global_step * dt
             println("\nStep $global_step (t = $(@sprintf("%.6g", sim_time)))")
             for ps in sys
-                print_summary(ps)
+                print_summary(_to_host(ps))
             end
         end
     end
@@ -532,16 +537,16 @@ function _maybe_save!(sys, ghosts, virtual_sys, probes, probe_ints, probe_scratc
                 HDF5.attrs(f)["step"]     = global_step
                 HDF5.attrs(f)["sim_time"] = Float64(global_step * dt)
                 for ps in sys
-                    write_h5(ps, create_group(f, ps.name))
+                    write_h5(_to_host(ps), create_group(f, ps.name))
                 end
                 for ge in ghosts
-                    write_h5(ge.ghost, create_group(f, ge.ghost.name))
+                    write_h5(_to_host(ge.ghost), create_group(f, ge.ghost.name))
                 end
                 for vps in virtual_sys
-                    write_h5(vps, create_group(f, vps.name))
+                    write_h5(_to_host(vps), create_group(f, vps.name))
                 end
                 for probe in probes
-                    write_h5(probe, create_group(f, probe.name))
+                    write_h5(_to_host(probe), create_group(f, probe.name))
                 end
             end
         end
@@ -611,8 +616,8 @@ function time_integrate!(
 
     sort_cutoff       = T(2) * integrator.h
     sort_max_n        = maximum(ps.n for ps in sys)
-    sort_perm_buf     = Vector{Int}(undef, sort_max_n)
-    sort_key_buf      = Vector{UInt64}(undef, sort_max_n)
+    sort_perm_buf     = similar(first(sys).x, Int, sort_max_n)
+    sort_key_buf      = similar(first(sys).x, UInt64, sort_max_n)
     sys_scratches     = map(_make_sort_scratch, sys)
     ghost_scratches   = [_make_empty_sort_scratch(ge.ghost) for ge in integrator.ghosts]
     virtual_scratches = [_make_sort_scratch(vps) for vps in vsys]

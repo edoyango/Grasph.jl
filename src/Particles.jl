@@ -700,10 +700,19 @@ function _update_state!(ps, fns::Tuple, dt)
     _update_state!(ps, first(fns), dt)
     _update_state!(ps, Base.tail(fns), dt)
 end
-function _update_state!(ps, fn::SFN, dt) where {SFN}
+
+_update_state!(ps, fn::SFN, dt) where {SFN} = _update_state!(KA.get_backend(ps.x), ps, fn, dt)
+
+function _update_state!(::KA.CPU, ps, fn::SFN, dt) where {SFN}
     @inbounds @batch for i in 1:ps.n
         fn(ps, i, dt)
     end
+end
+
+function _update_state!(backend::KA.Backend, ps, fn::SFN, dt) where {SFN}
+    _update_state_kernel!(backend, _KA_WORKGROUP)(device_view(ps), fn, dt; ndrange = ps.n)
+    KA.synchronize(backend)
+    return nothing
 end
 
 # ---------------------------------------------------------------------------

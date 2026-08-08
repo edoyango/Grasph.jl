@@ -1,8 +1,8 @@
 # This file is machine-generated - editing it directly is not advised
 
-julia_version = "1.12.6"
+julia_version = "1.12.5"
 manifest_format = "2.0"
-project_hash = "27dc506c6ead4ce1456c09ea2e8015c65e3f748e"
+project_hash = "01b7d9ef5d2a22d2505c707e954b034d8bf44cf4"
 
 [[deps.Adapt]]
 deps = ["LinearAlgebra"]
@@ -179,7 +179,7 @@ uuid = "7b1f6079-737a-58dc-b8bc-7a2ca5c1b5ee"
 version = "1.11.0"
 
 [[deps.Grasph]]
-deps = ["ArgParse", "Atomix", "HDF5", "LinearAlgebra", "MPI", "Polyester", "PrettyTables", "Printf", "Random", "StaticArrays", "Test", "TimerOutputs"]
+deps = ["Adapt", "ArgParse", "Atomix", "HDF5", "KernelAbstractions", "LinearAlgebra", "MPI", "Polyester", "PrettyTables", "Printf", "Random", "StaticArrays", "Test", "TimerOutputs"]
 path = "."
 uuid = "a8f2b3c4-5d6e-4f80-91a2-b3c4d5e6f708"
 version = "0.1.0"
@@ -231,6 +231,22 @@ version = "1.7.1"
 deps = ["StyledStrings"]
 uuid = "ac6e5ff7-fb65-4e79-a425-ec3bc9c03011"
 version = "1.12.0"
+
+[[deps.KernelAbstractions]]
+deps = ["Adapt", "Atomix", "InteractiveUtils", "MacroTools", "PrecompileTools", "Requires", "StaticArrays", "UUIDs"]
+git-tree-sha1 = "a5b87110fa95d711355af44832497745aa93fb52"
+uuid = "63c18a36-062a-441e-b654-da1e3ab1ce7c"
+version = "0.9.42"
+
+    [deps.KernelAbstractions.extensions]
+    EnzymeExt = "EnzymeCore"
+    LinearAlgebraExt = "LinearAlgebra"
+    SparseArraysExt = "SparseArrays"
+
+    [deps.KernelAbstractions.weakdeps]
+    EnzymeCore = "f151be2c-9106-41f4-ab19-57ee4f262869"
+    LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
+    SparseArrays = "2f01184e-e22b-5df5-ae63-d93ebab69eaf"
 
 [[deps.LaTeXStrings]]
 git-tree-sha1 = "dda21b8cbd6a6c40d9d02a73230f9d70fed6918c"
@@ -329,6 +345,11 @@ deps = ["Artifacts", "CompilerSupportLibraries_jll", "JLLWrappers", "LazyArtifac
 git-tree-sha1 = "36c2d142e7d45fb98b5f83925213feb3292ca348"
 uuid = "f1f71cc9-e9ae-5b93-9b94-4fe0e1ad3748"
 version = "5.5.5+0"
+
+[[deps.MacroTools]]
+git-tree-sha1 = "1e0228a030642014fe5cfe68c2c0a818f9e3f522"
+uuid = "1914dd2f-81c6-5fcd-8719-6d5c9610ff09"
+version = "0.5.16"
 
 [[deps.ManualMemory]]
 git-tree-sha1 = "bcaef4fc7a0cfe2cba636d84cda54b5e4e4ca3cd"

@@ -20,7 +20,7 @@ index of the first particle in cell `c` (0 if empty); `_cell_count[c]` is the
 number of particles in cell `c`.  This requires that particles are sorted by cell
 before `create_grid!` is called (handled by `sort_particles!` in the time loop).
 """
-struct SystemInteraction{T<:AbstractFloat, ND, KT<:AbstractKernel{T,ND}, SA<:AbstractParticleSystem{T,ND}, SB<:Union{Nothing,AbstractParticleSystem{T,ND}}, PFNS<:Tuple, VPFN, ONESIDED}
+struct SystemInteraction{T<:AbstractFloat, ND, KT<:AbstractKernel{T,ND}, SA<:AbstractParticleSystem{T,ND}, SB<:Union{Nothing,AbstractParticleSystem{T,ND}}, PFNS<:Tuple, VPFN, CSA<:AbstractVector{Int}, MODE<:ExecMode}
     kernel::KT
     pfns::PFNS
     vadjust_pfn::VPFN
@@ -28,15 +28,14 @@ struct SystemInteraction{T<:AbstractFloat, ND, KT<:AbstractKernel{T,ND}, SA<:Abs
     system_b::SB
     _mingridx::MVector{ND,T}            # grid origin in each dimension (ndims,)
     _ngridx::MVector{ND,Int}            # number of cells in each dimension (ndims,)
-    _cell_start::Vector{Int}            # CSR prefix-sum: cell_start[c]..cell_start[c+1]-1 is the range of system_b particles in cell c; length = ncells+1
-    _cell_start_a::Vector{Int}          # same for system_a (coupled only); length = ncells+1
+    _cell_start::CSA                    # CSR prefix-sum: cell_start[c]..cell_start[c+1]-1 is the range of system_b particles in cell c; length = ncells+1
+    _cell_start_a::CSA                  # same for system_a (coupled only); length = ncells+1
     _mingridx_a::MVector{ND,T}          # min position of system_a particles per dim (ndims,)
     _maxgridx_a::MVector{ND,T}          # max position of system_a particles per dim (ndims,)
     _cell_size::T
-    function SystemInteraction{T, ND, KT, SA, SB, PFNS, VPFN, ONESIDED}(args...) where {T, ND, KT, SA, SB, PFNS, VPFN, ONESIDED}
+    function SystemInteraction{T, ND, KT, SA, SB, PFNS, VPFN, CSA, MODE}(args...) where {T, ND, KT, SA, SB, PFNS, VPFN, CSA, MODE}
         ND isa Int || throw(ArgumentError("ND must be an Int, got $(typeof(ND))"))
-        ONESIDED isa Bool || throw(ArgumentError("ONESIDED must be a Bool, got $(typeof(ONESIDED))"))
-        new{T, ND, KT, SA, SB, PFNS, VPFN, ONESIDED}(args...)
+        new{T, ND, KT, SA, SB, PFNS, VPFN, CSA, MODE}(args...)
     end
 end
 
@@ -66,6 +65,11 @@ one-sided protocol (see `pfn_contribution` docstring) — currently only
 `FluidPfn`'s self-interaction and `StaticBoundarySystem`-coupled methods do.
 Default `false` reproduces today's behaviour exactly; existing call sites are
 unaffected.
+
+Pass `ka=true` (requires `onesided=true`) to additionally run the one-sided
+sweep as a `KernelAbstractions.jl` kernel rather than a Polyester `@batch`
+loop — the same kernel source that runs on `system_a`'s array backend,
+`CPU()` or any GPU backend.
 """
 function SystemInteraction(
     kernel::AbstractKernel,
@@ -74,17 +78,24 @@ function SystemInteraction(
     system_b::Union{Nothing, AbstractParticleSystem} = nothing;
     velocity_adjust_pairwise_fn = nothing,
     onesided::Bool = false,
+    ka::Bool = false,
 ) where {T<:AbstractFloat, ND}
     nd = Int(ND)
     kernel.ndims == nd || throw(ArgumentError(
         "kernel.ndims ($(kernel.ndims)) must match system_a.ndims ($nd)"))
     system_b !== nothing && system_b.ndims != nd && throw(ArgumentError(
         "system_b.ndims ($(system_b.ndims)) must match system_a.ndims ($nd)"))
+    ka && !onesided && throw(ArgumentError(
+        "ka=true requires onesided=true (the KernelAbstractions sweep only implements the one-sided protocol)"))
     pfns = pairwise_fn isa Tuple ? pairwise_fn : (pairwise_fn,)
     _check_functors_eltype(pfns, T, "pairwise functor")
+    mode = ka ? OnesidedKA() : onesided ? OnesidedCPU() : ColouredCPU()
+    cell_start   = similar(system_a.x, Int, 0)
+    cell_start_a = similar(system_a.x, Int, 0)
     SystemInteraction{
         T, nd, typeof(kernel),
-        typeof(system_a), typeof(system_b), typeof(pfns), typeof(velocity_adjust_pairwise_fn), onesided
+        typeof(system_a), typeof(system_b), typeof(pfns), typeof(velocity_adjust_pairwise_fn),
+        typeof(cell_start), typeof(mode)
     }(
         kernel,
         pfns,
@@ -93,8 +104,8 @@ function SystemInteraction(
         system_b,
         MVector{nd,T}(undef),
         MVector{nd,Int}(undef),
-        Vector{Int}(),
-        Vector{Int}(),
+        cell_start,
+        cell_start_a,
         MVector{nd,T}(undef),
         MVector{nd,T}(undef),
         T(kernel.interaction_length),
@@ -138,14 +149,19 @@ end
 
 # --- self-interaction ---
 
+# Bounding box of a position array, via a mapreduce with an explicit init (an
+# unseeded `minimum`/`maximum` errors on SVector — no `typemax(SVector)`
+# method — and mapreduce with `init` works identically on Vector and CuArray).
+# min/max have no rounding error, so this is bit-identical to a scalar
+# incremental loop regardless of reduction order.
+@inline function _bbox(xa::AbstractVector{SVector{ND,T}}) where {ND,T}
+    z = SVector{ND,T}(ntuple(_ -> typemax(T), Val(ND)))
+    o = SVector{ND,T}(ntuple(_ -> typemin(T), Val(ND)))
+    mapreduce(v -> (v, v), (a, b) -> (min.(a[1], b[1]), max.(a[2], b[2])), xa; init = (z, o))
+end
+
 function _create_grid_impl!(si::SystemInteraction{T}, ::Nothing, cutoff::T) where {T}
-    xa = si.system_a.x
-    mn = xa[1]; mx = xa[1]
-    @inbounds for i in 2:length(xa)
-        xi = xa[i]
-        mn = min.(mn, xi)
-        mx = max.(mx, xi)
-    end
+    mn, mx = _bbox(si.system_a.x)
     # Snap mingridx down to the nearest multiple of cutoff below the padded minimum.
     # Since cutoff is identical for all interactions, every snapped origin is an integer
     # multiple of cutoff from 0, so cell boundaries align across all grids in the
@@ -159,20 +175,10 @@ end
 # --- coupled interaction ---
 
 function _create_grid_impl!(si::SystemInteraction{T}, system_b, cutoff::T) where {T}
-    xa = si.system_a.x
-    xb = system_b.x
-    mn_a = xa[1]; mx_a = xa[1]
-    @inbounds for i in 2:length(xa)
-        xi = xa[i]
-        mn_a = min.(mn_a, xi)
-        mx_a = max.(mx_a, xi)
-    end
-    mn = mn_a; mx = mx_a
-    @inbounds for i in eachindex(xb)
-        xi = xb[i]
-        mn = min.(mn, xi)
-        mx = max.(mx, xi)
-    end
+    mn_a, mx_a = _bbox(si.system_a.x)
+    mn_b, mx_b = _bbox(system_b.x)
+    mn = min.(mn_a, mn_b)
+    mx = max.(mx_a, mx_b)
     mingridx = _snap_to_grid(mn .- 2*cutoff, cutoff)
     maxgridx = mx .+ 2*cutoff
     _setup_cell_arrays!(si, mingridx, maxgridx, cutoff; coupled=true)
@@ -221,7 +227,10 @@ end
 # After the call:
 #   cell_start[c] .. cell_start[c+1]-1  is the (inclusive) range of particles in cell c.
 #   Empty cells satisfy cell_start[c] == cell_start[c+1].
-function _populate_cells_sorted!(cell_start::Vector{Int},
+@inline _populate_cells_sorted!(cell_start::AbstractVector{Int}, x, mingridx, cutoff, ngridx, vnd) =
+    _populate_cells_sorted!(KA.get_backend(cell_start), cell_start, x, mingridx, cutoff, ngridx, vnd)
+
+function _populate_cells_sorted!(::KA.CPU, cell_start::AbstractVector{Int},
                                   x, mingridx, cutoff, ngridx, vnd)
     ncells = length(cell_start) - 1
     n      = length(x)
@@ -243,6 +252,42 @@ function _populate_cells_sorted!(cell_start::Vector{Int},
             cell_start[c] = cell_start[c + 1]
         end
     end
+end
+
+# Non-CPU backends: atomic histogram (counts[cell+1] += 1) + inclusive prefix
+# sum, reusing cell_start itself as scratch (cumsum! is aliasing-safe
+# in-place, verified against CUDA.jl). Provably the same output as the
+# sequential scan above: cell_start[c] = 1 + sum(count[k] for k < c), with
+# the n+1 sentinel falling out of the total count at c = ncells+1 — no serial
+# dependency, at the cost of one histogram pass. mingridx/ngridx are
+# snapshotted from SystemInteraction's mutable MVector fields to immutable
+# SVectors here, since MVector cannot cross the kernel boundary.
+function _populate_cells_sorted!(backend::KA.GPU, cell_start::AbstractVector{Int},
+                                  x, mingridx, cutoff, ngridx, ::Val{2})
+    fill!(cell_start, 0)
+    n = length(x)
+    if n > 0
+        _cell_histogram_kernel_2d!(backend, _KA_WORKGROUP)(
+            cell_start, x, SVector(mingridx), cutoff, SVector(ngridx); ndrange = n)
+        KA.synchronize(backend)
+    end
+    cumsum!(cell_start, cell_start)
+    cell_start .+= 1
+    return nothing
+end
+
+function _populate_cells_sorted!(backend::KA.GPU, cell_start::AbstractVector{Int},
+                                  x, mingridx, cutoff, ngridx, ::Val{3})
+    fill!(cell_start, 0)
+    n = length(x)
+    if n > 0
+        _cell_histogram_kernel_3d!(backend, _KA_WORKGROUP)(
+            cell_start, x, SVector(mingridx), cutoff, SVector(ngridx); ndrange = n)
+        KA.synchronize(backend)
+    end
+    cumsum!(cell_start, cell_start)
+    cell_start .+= 1
+    return nothing
 end
 
 function _populate_cells_self!(si::SystemInteraction{T,ND}, cutoff::T) where {T,ND}
@@ -313,14 +358,18 @@ _sweep_pfns!(si, system_b, ::Tuple{}, stage) = nothing
     end
 end
 
-_sweep_dispatch!(si::SystemInteraction{T,ND,KT,SA,SB,PFNS,VPFN,false}, ::Nothing, pfn) where {T,ND,KT,SA,SB,PFNS,VPFN} =
-    _sweep_self!(si, pfn)
-_sweep_dispatch!(si::SystemInteraction{T,ND,KT,SA,SB,PFNS,VPFN,false}, system_b, pfn) where {T,ND,KT,SA,SB,PFNS,VPFN} =
-    _sweep_coupled!(si, system_b, pfn)
-_sweep_dispatch!(si::SystemInteraction{T,ND,KT,SA,SB,PFNS,VPFN,true}, ::Nothing, pfn) where {T,ND,KT,SA,SB,PFNS,VPFN} =
-    _sweep_self_onesided!(si, pfn)
-_sweep_dispatch!(si::SystemInteraction{T,ND,KT,SA,SB,PFNS,VPFN,true}, system_b, pfn) where {T,ND,KT,SA,SB,PFNS,VPFN} =
-    _sweep_coupled_onesided!(si, system_b, pfn)
+# The full parameter list is spelled once here; adding an ExecMode doesn't
+# require touching this accessor's signature.
+@inline _exec_mode(::SystemInteraction{T,ND,KT,SA,SB,PFNS,VPFN,CSA,MODE}) where {T,ND,KT,SA,SB,PFNS,VPFN,CSA,MODE} = MODE()
+
+@inline _sweep_dispatch!(si::SystemInteraction, system_b, pfn) = _sweep_mode!(_exec_mode(si), si, system_b, pfn)
+
+_sweep_mode!(::ColouredCPU, si, ::Nothing, pfn) = _sweep_self!(si, pfn)
+_sweep_mode!(::ColouredCPU, si, system_b, pfn)  = _sweep_coupled!(si, system_b, pfn)
+_sweep_mode!(::OnesidedCPU, si, ::Nothing, pfn) = _sweep_self_onesided!(si, pfn)
+_sweep_mode!(::OnesidedCPU, si, system_b, pfn)  = _sweep_coupled_onesided!(si, system_b, pfn)
+_sweep_mode!(::OnesidedKA,  si, ::Nothing, pfn) = _sweep_self_ka!(si, pfn)
+_sweep_mode!(::OnesidedKA,  si, system_b, pfn)  = _sweep_coupled_ka!(si, system_b, pfn)
 
 adjust_v!(si::SystemInteraction) = _sweep_pfns!(si, si.system_b, (si.vadjust_pfn,), 1)
 
@@ -411,7 +460,7 @@ function _sweep_self!(si::SystemInteraction{T,2}, pfn::PFN) where {T,PFN}
     kernel     = si.kernel
     h          = T(kernel.h)
     cutoff_sq  = si._cell_size * si._cell_size
-    cell_start = si._cell_start::Vector{Int}
+    cell_start = si._cell_start::AbstractVector{Int}
     n_cells_y  = Int(si._ngridx[2])
     n_cells_x  = Int(si._ngridx[1])
     val_ndims  = Val{2}()
@@ -495,7 +544,7 @@ function _sweep_self!(si::SystemInteraction{T,3}, pfn::PFN) where {T,PFN}
     kernel     = si.kernel
     h          = T(kernel.h)
     cutoff_sq  = si._cell_size * si._cell_size
-    cell_start = si._cell_start::Vector{Int}
+    cell_start = si._cell_start::AbstractVector{Int}
     n_cells_z  = Int(si._ngridx[3])
     n_cells_y  = Int(si._ngridx[2])
     n_cells_x  = Int(si._ngridx[1])
@@ -618,8 +667,8 @@ function _sweep_coupled!(si::SystemInteraction{T,2}, system_b, pfn::PFN) where {
     kernel        = si.kernel
     h             = T(kernel.h)
     cutoff_sq     = si._cell_size * si._cell_size
-    cell_start    = si._cell_start::Vector{Int}
-    cell_start_a  = si._cell_start_a::Vector{Int}
+    cell_start    = si._cell_start::AbstractVector{Int}
+    cell_start_a  = si._cell_start_a::AbstractVector{Int}
     n_cells_y     = Int(si._ngridx[2])
     n_cells_x     = Int(si._ngridx[1])
     val_ndims     = Val{2}()
@@ -678,8 +727,8 @@ function _sweep_coupled!(si::SystemInteraction{T,3}, system_b, pfn::PFN) where {
     kernel        = si.kernel
     h             = T(kernel.h)
     cutoff_sq     = si._cell_size * si._cell_size
-    cell_start    = si._cell_start::Vector{Int}
-    cell_start_a  = si._cell_start_a::Vector{Int}
+    cell_start    = si._cell_start::AbstractVector{Int}
+    cell_start_a  = si._cell_start_a::AbstractVector{Int}
     n_cells_z     = Int(si._ngridx[3])
     n_cells_y     = Int(si._ngridx[2])
     n_cells_x     = Int(si._ngridx[1])
@@ -843,7 +892,7 @@ function _sweep_self_onesided!(si::SystemInteraction{T,2}, pfn::PFN) where {T,PF
     kernel     = si.kernel
     h          = T(kernel.h)
     cutoff_sq  = si._cell_size * si._cell_size
-    cell_start = si._cell_start::Vector{Int}
+    cell_start = si._cell_start::AbstractVector{Int}
     n_cells_y  = Int(si._ngridx[2])
     mingridx   = si._mingridx
     cutoff     = si._cell_size
@@ -872,7 +921,7 @@ function _sweep_self_onesided!(si::SystemInteraction{T,3}, pfn::PFN) where {T,PF
     kernel     = si.kernel
     h          = T(kernel.h)
     cutoff_sq  = si._cell_size * si._cell_size
-    cell_start = si._cell_start::Vector{Int}
+    cell_start = si._cell_start::AbstractVector{Int}
     n_cells_z  = Int(si._ngridx[3])
     n_cells_y  = Int(si._ngridx[2])
     n_cells_yz = n_cells_y * n_cells_z
@@ -915,7 +964,7 @@ function _sweep_coupled_onesided!(si::SystemInteraction{T,2}, ps_b, pfn::PFN) wh
     kernel     = si.kernel
     h          = T(kernel.h)
     cutoff_sq  = si._cell_size * si._cell_size
-    cell_start = si._cell_start::Vector{Int}
+    cell_start = si._cell_start::AbstractVector{Int}
     n_cells_y  = Int(si._ngridx[2])
     mingridx   = si._mingridx
     cutoff     = si._cell_size
@@ -943,7 +992,7 @@ function _sweep_coupled_onesided!(si::SystemInteraction{T,3}, ps_b, pfn::PFN) wh
     kernel     = si.kernel
     h          = T(kernel.h)
     cutoff_sq  = si._cell_size * si._cell_size
-    cell_start = si._cell_start::Vector{Int}
+    cell_start = si._cell_start::AbstractVector{Int}
     n_cells_z  = Int(si._ngridx[3])
     n_cells_y  = Int(si._ngridx[2])
     n_cells_yz = n_cells_y * n_cells_z

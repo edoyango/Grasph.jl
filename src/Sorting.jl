@@ -119,13 +119,33 @@ end
     end
 end
 
-# Walk a heterogeneous tuple of (arr, scratch) pairs, peeling one element at
-# a time so each call to _apply_perm! sees a concrete array type.
-_apply_perms!(::Tuple{}, ::Tuple{}, ::AbstractVector{Int}, ::Int) = nothing
-@inline function _apply_perms!(arrs::Tuple, scratches::Tuple,
-                                perm::AbstractVector{Int}, n::Int)
+# Backend-dispatched. On KA.CPU(), walk the heterogeneous tuple of (arr,
+# scratch) pairs one element at a time via _apply_perm! (unchanged, 2
+# scalar-loop launches per array). On any other backend, walk the WHOLE
+# tuple inside one kernel per pass (gather, then copy-back) — 2 launches for
+# the entire system instead of 2 per array, since scalar-loop `_apply_perm!`
+# would be illegal on a GPU array.
+_apply_perms!(arrs::Tuple, scratches::Tuple, perm::AbstractVector{Int}, n::Int) =
+    _apply_perms!(KA.get_backend(perm), arrs, scratches, perm, n)
+
+_apply_perms!(::KA.CPU, arrs::Tuple, scratches::Tuple, perm::AbstractVector{Int}, n::Int) =
+    _apply_perms_cpu!(arrs, scratches, perm, n)
+
+_apply_perms_cpu!(::Tuple{}, ::Tuple{}, ::AbstractVector{Int}, ::Int) = nothing
+@inline function _apply_perms_cpu!(arrs::Tuple, scratches::Tuple,
+                                    perm::AbstractVector{Int}, n::Int)
     _apply_perm!(first(arrs), perm, first(scratches), n)
-    _apply_perms!(Base.tail(arrs), Base.tail(scratches), perm, n)
+    _apply_perms_cpu!(Base.tail(arrs), Base.tail(scratches), perm, n)
+end
+
+function _apply_perms!(backend::KA.Backend, arrs::Tuple, scratches::Tuple,
+                        perm::AbstractVector{Int}, n::Int)
+    n == 0 && return nothing
+    _gather_perm_kernel!(backend, _KA_WORKGROUP)(scratches, arrs, perm; ndrange = n)
+    KA.synchronize(backend)
+    _copyback_kernel!(backend, _KA_WORKGROUP)(arrs, scratches; ndrange = n)
+    KA.synchronize(backend)
+    return nothing
 end
 
 # Grow each scratch vector to at least n elements (only triggers for ghost
@@ -161,12 +181,54 @@ end
     (cx << (2 * _KEY_BITS_PER_DIM)) | (cy << _KEY_BITS_PER_DIM) | cz
 end
 
+# GPU-only variant: _cellcoord_to_field's range check throws a formatted
+# ArgumentError on failure, and GPUCompiler rejects any reachable kernel code
+# path that needs dynamic string construction — confirmed empirically, not a
+# theoretical concern (compiling _pos_to_key inside a @kernel function fails
+# with "unsupported call to a lazy-initialized function" from the `string(c)`
+# inside the error path, even though that branch is never taken for valid
+# input). The check exists to catch a domain/cutoff combination needing more
+# than ~1M cells per dimension — unreachable for any problem size this
+# migration targets. The device path skips it; an out-of-range coordinate
+# would silently wrap instead of throwing, on GPU only.
+@inline _cellcoord_to_field_gpu(c::Int) = (c + _KEY_BIAS) % UInt64
+
+@inline function _pos_to_key_gpu(xi::SVector{1,T}, cutoff::T) where {T}
+    _cellcoord_to_field_gpu(floor(Int, xi[1] / cutoff))
+end
+
+@inline function _pos_to_key_gpu(xi::SVector{2,T}, cutoff::T) where {T}
+    cx = _cellcoord_to_field_gpu(floor(Int, xi[1] / cutoff))
+    cy = _cellcoord_to_field_gpu(floor(Int, xi[2] / cutoff))
+    (cx << _KEY_BITS_PER_DIM) | cy
+end
+
+@inline function _pos_to_key_gpu(xi::SVector{3,T}, cutoff::T) where {T}
+    cx = _cellcoord_to_field_gpu(floor(Int, xi[1] / cutoff))
+    cy = _cellcoord_to_field_gpu(floor(Int, xi[2] / cutoff))
+    cz = _cellcoord_to_field_gpu(floor(Int, xi[3] / cutoff))
+    (cx << (2 * _KEY_BITS_PER_DIM)) | (cy << _KEY_BITS_PER_DIM) | cz
+end
+
 # UInt64 has native `<`, so no custom comparator is needed any more — this is
 # what makes the key GPU-radix-sortable, unlike the old SVector+lt= key.
+#
+# InsertionSort is a CPU-only algorithm choice (fast on the near-sorted input
+# sort_particles! typically sees after the first few timesteps); dropped on
+# non-CPU backends, where CUDA.jl's sortperm! is the only option and is
+# verified stable (bit-identical permutation to Base's stable sort on ties).
+# Ghost systems stay on Base's default sortperm! unconditionally — ghosts are
+# not GPU-resident in this migration (see docs/gpu-migration-plan.md).
 @inline _sortperm_by_key!(::AbstractParticleSystem, perm_view, key_view) =
-    sortperm!(perm_view, key_view; alg=InsertionSort)
+    _sortperm_by_key_backend!(KA.get_backend(perm_view), perm_view, key_view)
 
 @inline _sortperm_by_key!(::AbstractGhostParticleSystem, perm_view, key_view) =
+    sortperm!(perm_view, key_view)
+
+@inline _sortperm_by_key_backend!(::KA.CPU, perm_view, key_view) =
+    sortperm!(perm_view, key_view; alg=InsertionSort)
+
+@inline _sortperm_by_key_backend!(::KA.Backend, perm_view, key_view) =
     sortperm!(perm_view, key_view)
 
 """
@@ -195,8 +257,8 @@ reused across all calls within a timestep (real and ghost systems).
 (growth only occurs for ghost systems whose count varies each step).
 """
 function sort_particles!(ps::AbstractParticleSystem{T,ND}, cutoff::T,
-                          perm_buf::Vector{Int},
-                          key_buf::Vector{UInt64},
+                          perm_buf::AbstractVector{Int},
+                          key_buf::AbstractVector{UInt64},
                           scratch_arrays::Tuple) where {T,ND}
     n = ps.n
     n <= 1 && return
@@ -209,21 +271,14 @@ function sort_particles!(ps::AbstractParticleSystem{T,ND}, cutoff::T,
     # Compute packed cell-coordinate keys from particle positions.
     arrs = _particle_arrays(ps)
     x    = first(arrs)       # x is always the first array
-    @inbounds for i in 1:n
-        key_buf[i] = _pos_to_key(x[i], cutoff)
-    end
+    _compute_keys!(key_buf, x, cutoff, n)
 
     # Fast path: if keys are already non-decreasing, no reordering needed.
     # Avoids both sortperm! and _apply_perms! on steps where particles haven't
-    # crossed cell boundaries — common after the first few timesteps.
-    already_sorted = true
-    @inbounds for i in 1:n-1
-        if key_buf[i+1] < key_buf[i]
-            already_sorted = false
-            break
-        end
-    end
-    already_sorted && return
+    # crossed cell boundaries — common after the first few timesteps. CPU-only:
+    # it's a serial scan, and on GPU the D2H sync it would need to branch on
+    # costs more than the sort it might save (see docs/gpu-migration-plan.md).
+    _maybe_return_if_sorted!(KA.get_backend(key_buf), key_buf, n) && return
 
     # Compute the sorting permutation in-place (no allocation).
     perm_view = view(perm_buf, 1:n)
@@ -233,3 +288,27 @@ function sort_particles!(ps::AbstractParticleSystem{T,ND}, cutoff::T,
     # Apply permutation to every per-particle array.
     _apply_perms!(arrs, scratch_arrays, perm_view, n)
 end
+
+@inline _compute_keys!(key_buf, x, cutoff, n) = _compute_keys!(KA.get_backend(key_buf), key_buf, x, cutoff, n)
+
+@inline function _compute_keys!(::KA.CPU, key_buf, x, cutoff, n)
+    @inbounds for i in 1:n
+        key_buf[i] = _pos_to_key(x[i], cutoff)
+    end
+end
+
+function _compute_keys!(backend::KA.Backend, key_buf, x, cutoff, n)
+    n == 0 && return nothing
+    _pos_to_key_kernel!(backend, _KA_WORKGROUP)(key_buf, x, cutoff; ndrange = n)
+    KA.synchronize(backend)
+    return nothing
+end
+
+function _maybe_return_if_sorted!(::KA.CPU, key_buf, n)
+    @inbounds for i in 1:n-1
+        key_buf[i+1] < key_buf[i] && return false
+    end
+    return true
+end
+
+@inline _maybe_return_if_sorted!(::KA.Backend, key_buf, n) = false

@@ -14,19 +14,31 @@
 
 # ---------------------------------------------------------------------------
 # Primitive axpy operations
+#
+# Backend-dispatched: Polyester @batch on KA.CPU() (byte-for-byte the original
+# body), a plain broadcast on any other KA backend (GPUArrays fuses this into
+# one kernel launch; @batch has no GPU dispatch path at all).
 # ---------------------------------------------------------------------------
 
-@inline function _axpy_ip!(q, dqdt, a)
+@inline _axpy_ip!(q, dqdt, a) = _axpy_ip!(KA.get_backend(q), q, dqdt, a)
+
+@inline function _axpy_ip!(::KA.CPU, q, dqdt, a)
     @inbounds @fastmath @batch for i in eachindex(q)
         q[i] += a * dqdt[i]
     end
 end
 
-@inline function _axpy_oop!(q, q0, dqdt, a)
+@inline _axpy_ip!(::KA.Backend, q, dqdt, a) = (@. q += a * dqdt; nothing)
+
+@inline _axpy_oop!(q, q0, dqdt, a) = _axpy_oop!(KA.get_backend(q), q, q0, dqdt, a)
+
+@inline function _axpy_oop!(::KA.CPU, q, q0, dqdt, a)
     @inbounds @fastmath @batch for i in eachindex(q)
         q[i] = q0[i] + a * dqdt[i]
     end
 end
+
+@inline _axpy_oop!(::KA.Backend, q, q0, dqdt, a) = (@. q = q0 + a * dqdt; nothing)
 
 @inline function _zero_field(ps::AbstractParticleSystem, field::Symbol)
     f = _getf(ps, Val(field))

@@ -1,0 +1,239 @@
+# ---------------------------------------------------------------------------
+# KernelAbstractions.jl kernels — one source, dispatched onto KA.CPU() or any
+# GPU backend (CUDABackend, etc.) by the array type of the particle systems
+# involved. Each kernel here is a mechanical transcription of an existing
+# Polyester @batch loop; see the call site (Particles.jl/Interaction.jl) for
+# the CPU original it replaces on non-CPU backends.
+#
+# Every launch below is immediately followed by KA.synchronize — this trades
+# some performance (an extra host sync per launch) for a simple, obviously
+# correct first pass. Removing synchronization to chain kernels without a
+# host round-trip is a deliberate follow-up once correctness is established
+# (see docs/gpu-migration-plan.md's benchmark step).
+# ---------------------------------------------------------------------------
+
+const _KA_WORKGROUP = 256
+
+@kernel function _update_state_kernel!(ps, fn, dt)
+    i = @index(Global, Linear)
+    @inbounds fn(ps, i, dt)
+end
+
+# ---------------------------------------------------------------------------
+# Cell-histogram kernels for the non-CPU branch of _populate_cells_sorted!
+# (Interaction.jl). One atomic increment per particle; Atomix works
+# identically on KA.CPU() and CUDABackend().
+# ---------------------------------------------------------------------------
+
+@kernel function _cell_histogram_kernel_2d!(counts, @Const(x), mingridx, cutoff, ngridx)
+    i = @index(Global, Linear)
+    @inbounds begin
+        c = _cell_1idx(x[i], mingridx, cutoff, ngridx, Val{2}())
+        Atomix.@atomic counts[c + 1] += 1
+    end
+end
+
+@kernel function _cell_histogram_kernel_3d!(counts, @Const(x), mingridx, cutoff, ngridx)
+    i = @index(Global, Linear)
+    @inbounds begin
+        c = _cell_1idx(x[i], mingridx, cutoff, ngridx, Val{3}())
+        Atomix.@atomic counts[c + 1] += 1
+    end
+end
+
+# ---------------------------------------------------------------------------
+# Sort kernels for the non-CPU branch of sort_particles! (Sorting.jl).
+# ---------------------------------------------------------------------------
+
+@kernel function _pos_to_key_kernel!(key_buf, @Const(x), cutoff)
+    i = @index(Global, Linear)
+    @inbounds key_buf[i] = _pos_to_key_gpu(x[i], cutoff)
+end
+
+# Fused permutation apply: the whole heterogeneous tuple of per-particle
+# arrays is walked per-thread via the same Base.tail recursion _apply_perm!
+# uses on CPU, so the entire system reorders in 2 kernel launches (gather,
+# then copy-back) instead of 2 per array.
+@inline _gather_tuple!(::Tuple{}, ::Tuple{}, i, pi) = nothing
+@inline function _gather_tuple!(dsts::Tuple, srcs::Tuple, i, pi)
+    @inbounds first(dsts)[i] = first(srcs)[pi]
+    _gather_tuple!(Base.tail(dsts), Base.tail(srcs), i, pi)
+end
+
+@kernel function _gather_perm_kernel!(scratches, arrs, @Const(perm))
+    i = @index(Global, Linear)
+    @inbounds pi = perm[i]
+    _gather_tuple!(scratches, arrs, i, pi)
+end
+
+@inline _copyback_tuple!(::Tuple{}, ::Tuple{}, i) = nothing
+@inline function _copyback_tuple!(dsts::Tuple, srcs::Tuple, i)
+    @inbounds first(dsts)[i] = first(srcs)[i]
+    _copyback_tuple!(Base.tail(dsts), Base.tail(srcs), i)
+end
+
+@kernel function _copyback_kernel!(arrs, scratches)
+    i = @index(Global, Linear)
+    _copyback_tuple!(arrs, scratches, i)
+end
+
+# ---------------------------------------------------------------------------
+# One-sided, particle-parallel sweep kernels — line-for-line transcriptions of
+# _sweep_self_onesided!/_sweep_coupled_onesided! (Interaction.jl), with
+# `@batch for i in 1:n` replaced by `@index(Global, Linear)`. The loop nesting
+# and iteration order within each thread are preserved exactly, so a thread's
+# accumulation is bit-identical to the corresponding Polyester thread's.
+#
+# mingridx/ngridx must be snapshotted from SystemInteraction's mutable MVector
+# fields to immutable SVectors at the launch site — MVector is not isbits and
+# cannot cross the kernel boundary. `ps`/`ps_a`/`ps_b` must be `device_view`s,
+# not the real particle-system structs (see DeviceViews.jl for why).
+# ---------------------------------------------------------------------------
+
+# --- self-interaction ---
+
+@kernel function _sweep_self_onesided_kernel_2d!(ps, pfn, kernel, h, cutoff, @Const(cell_start), mingridx, ngridx)
+    i = @index(Global, Linear)
+    @inbounds begin
+        cutoff_sq = cutoff * cutoff
+        n_cells_y = ngridx[2]
+        val_ndims = Val{2}()
+        cell_idx  = _cell_1idx(ps.x[i], mingridx, cutoff, ngridx, val_ndims)
+        acc = _onesided_zero_self(pfn, ps, i)
+        for dx_cell in -1:1
+            neighbour_cell_idx = cell_idx + dx_cell * n_cells_y - 1
+            pstart = cell_start[neighbour_cell_idx]
+            pend   = cell_start[neighbour_cell_idx + 3]
+            for j in pstart:pend-1
+                j == i && continue
+                acc = _pair_self_onesided!(pfn, ps, i, j, kernel, h, cutoff_sq, val_ndims, acc)
+            end
+        end
+        _onesided_writeback_self!(pfn, ps, i, acc)
+    end
+end
+
+@kernel function _sweep_self_onesided_kernel_3d!(ps, pfn, kernel, h, cutoff, @Const(cell_start), mingridx, ngridx)
+    i = @index(Global, Linear)
+    @inbounds begin
+        cutoff_sq  = cutoff * cutoff
+        n_cells_z  = ngridx[3]
+        n_cells_y  = ngridx[2]
+        n_cells_yz = n_cells_y * n_cells_z
+        val_ndims  = Val{3}()
+        cell_idx   = _cell_1idx(ps.x[i], mingridx, cutoff, ngridx, val_ndims)
+        acc = _onesided_zero_self(pfn, ps, i)
+        for dx_cell in -1:1
+            for dy_cell in -1:1
+                neighbour_cell_idx = cell_idx + dx_cell * n_cells_yz + dy_cell * n_cells_z - 1
+                pstart = cell_start[neighbour_cell_idx]
+                pend   = cell_start[neighbour_cell_idx + 3]
+                for j in pstart:pend-1
+                    j == i && continue
+                    acc = _pair_self_onesided!(pfn, ps, i, j, kernel, h, cutoff_sq, val_ndims, acc)
+                end
+            end
+        end
+        _onesided_writeback_self!(pfn, ps, i, acc)
+    end
+end
+
+_sweep_self_ka!(si::SystemInteraction{T,2}, ::Nothing) where {T} = nothing
+_sweep_self_ka!(si::SystemInteraction{T,3}, ::Nothing) where {T} = nothing
+
+function _sweep_self_ka!(si::SystemInteraction{T,2}, pfn::PFN) where {T,PFN}
+    ps      = si.system_a
+    backend = KA.get_backend(ps.x)
+    _sweep_self_onesided_kernel_2d!(backend, _KA_WORKGROUP)(
+        device_view(ps), pfn, si.kernel, T(si.kernel.h), si._cell_size,
+        si._cell_start, SVector(si._mingridx), SVector(si._ngridx);
+        ndrange = ps.n)
+    KA.synchronize(backend)
+    return nothing
+end
+
+function _sweep_self_ka!(si::SystemInteraction{T,3}, pfn::PFN) where {T,PFN}
+    ps      = si.system_a
+    backend = KA.get_backend(ps.x)
+    _sweep_self_onesided_kernel_3d!(backend, _KA_WORKGROUP)(
+        device_view(ps), pfn, si.kernel, T(si.kernel.h), si._cell_size,
+        si._cell_start, SVector(si._mingridx), SVector(si._ngridx);
+        ndrange = ps.n)
+    KA.synchronize(backend)
+    return nothing
+end
+
+# --- coupled interaction ---
+#
+# No `j == i` guard: ps_a and ps_b are distinct systems (distinct backing
+# arrays), so index collision between i and j has no meaning here — matches
+# _sweep_coupled_onesided!'s comment in Interaction.jl.
+
+@kernel function _sweep_coupled_onesided_kernel_2d!(ps_a, ps_b, pfn, kernel, h, cutoff, @Const(cell_start), mingridx, ngridx)
+    i = @index(Global, Linear)
+    @inbounds begin
+        cutoff_sq = cutoff * cutoff
+        n_cells_y = ngridx[2]
+        val_ndims = Val{2}()
+        cell_idx  = _cell_1idx(ps_a.x[i], mingridx, cutoff, ngridx, val_ndims)
+        acc = _onesided_zero_coupled(pfn, ps_a, ps_b, i)
+        for dx_cell in -1:1
+            neighbour_cell_idx = cell_idx + dx_cell * n_cells_y - 1
+            pstart = cell_start[neighbour_cell_idx]
+            pend   = cell_start[neighbour_cell_idx + 3]
+            for j in pstart:pend-1
+                acc = _pair_coupled_onesided!(pfn, ps_a, ps_b, i, j, kernel, h, cutoff_sq, val_ndims, acc)
+            end
+        end
+        _onesided_writeback_coupled!(pfn, ps_a, ps_b, i, acc)
+    end
+end
+
+@kernel function _sweep_coupled_onesided_kernel_3d!(ps_a, ps_b, pfn, kernel, h, cutoff, @Const(cell_start), mingridx, ngridx)
+    i = @index(Global, Linear)
+    @inbounds begin
+        cutoff_sq  = cutoff * cutoff
+        n_cells_z  = ngridx[3]
+        n_cells_y  = ngridx[2]
+        n_cells_yz = n_cells_y * n_cells_z
+        val_ndims  = Val{3}()
+        cell_idx   = _cell_1idx(ps_a.x[i], mingridx, cutoff, ngridx, val_ndims)
+        acc = _onesided_zero_coupled(pfn, ps_a, ps_b, i)
+        for dx_cell in -1:1
+            for dy_cell in -1:1
+                neighbour_cell_idx = cell_idx + dx_cell * n_cells_yz + dy_cell * n_cells_z - 1
+                pstart = cell_start[neighbour_cell_idx]
+                pend   = cell_start[neighbour_cell_idx + 3]
+                for j in pstart:pend-1
+                    acc = _pair_coupled_onesided!(pfn, ps_a, ps_b, i, j, kernel, h, cutoff_sq, val_ndims, acc)
+                end
+            end
+        end
+        _onesided_writeback_coupled!(pfn, ps_a, ps_b, i, acc)
+    end
+end
+
+_sweep_coupled_ka!(si::SystemInteraction{T,2}, ps_b, ::Nothing) where {T} = nothing
+_sweep_coupled_ka!(si::SystemInteraction{T,3}, ps_b, ::Nothing) where {T} = nothing
+
+function _sweep_coupled_ka!(si::SystemInteraction{T,2}, ps_b, pfn::PFN) where {T,PFN}
+    ps_a    = si.system_a
+    backend = KA.get_backend(ps_a.x)
+    _sweep_coupled_onesided_kernel_2d!(backend, _KA_WORKGROUP)(
+        device_view(ps_a), device_view(ps_b), pfn, si.kernel, T(si.kernel.h), si._cell_size,
+        si._cell_start, SVector(si._mingridx), SVector(si._ngridx);
+        ndrange = ps_a.n)
+    KA.synchronize(backend)
+    return nothing
+end
+
+function _sweep_coupled_ka!(si::SystemInteraction{T,3}, ps_b, pfn::PFN) where {T,PFN}
+    ps_a    = si.system_a
+    backend = KA.get_backend(ps_a.x)
+    _sweep_coupled_onesided_kernel_3d!(backend, _KA_WORKGROUP)(
+        device_view(ps_a), device_view(ps_b), pfn, si.kernel, T(si.kernel.h), si._cell_size,
+        si._cell_start, SVector(si._mingridx), SVector(si._ngridx);
+        ndrange = ps_a.n)
+    KA.synchronize(backend)
+    return nothing
+end
