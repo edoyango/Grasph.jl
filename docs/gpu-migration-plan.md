@@ -175,10 +175,16 @@ assumed. Measured on this machine: Float64 FMA throughput is 0.138 TFLOP/s on
 the GPU vs. 0.143–0.311 TFLOP/s on the 16-core CPU (**no FP64 compute
 advantage**; FP32 is 35× faster than FP64 on this card). The GPU's only real
 edge is bandwidth (216 GB/s vs. ~50–80 GB/s) and it pays a flat ~8.3 µs per
-kernel launch regardless of size. Conclusion, confirmed by later benchmarking
-below: this machine is the **correctness/parity target**, not a performance
-target — exactly the posture the "measure, don't assume" note above
-recommended.
+kernel launch regardless of size. Conclusion, refined by the actual
+crossover benchmark (see "Next steps" below, now done): at `dambreak.jl`'s
+own production scale (2,500 particles) this machine is indeed the
+**correctness/parity target**, not a performance win — the GPU is 3.6×
+slower there. But it is *not* uniformly performance-irrelevant: the
+benchmark found a real, bandwidth/launch-amortization-driven crossover
+around 40,000 particles, past which the GPU wins by a growing margin. So the
+"measure, don't assume" posture holds at the scale actually shipped, but
+doesn't generalize to "this GPU is never worth it" — that would have been
+the wrong conclusion to draw from the small-scale-only smoke test.
 
 **Scope**: a vertical slice — `dambreak.jl` (2D) fully GPU-resident
 end-to-end (sort → grid → sweep → state update → integrator), gated behind
@@ -321,13 +327,35 @@ stayed at 834/834 throughout every step of this work.
      path) — the actual risk to the other 12 scripts is type instability from
      the new `SystemInteraction` parameters, which an allocation check catches
      precisely where a wall-clock timing test would just be flaky.
-2. **The crossover benchmark** (`bench/dambreak_scaling.jl`) — scale the
-   *domain*, not `dx` (smoothing length `h` is a `CubicSplineKernel` type
-   parameter, so varying resolution recompiles the whole sweep per size
-   point and changes `dt` too). Report CPU-coloured, CPU-onesided, *and* GPU
-   per-step time — without the CPU-onesided column a GPU "speedup" can't be
-   told apart from an artifact of comparing against a half-shell algorithm
-   that does half the pair evaluations.
+2. ~~**The crossover benchmark**~~ — **done**, run at default scale
+   (`nfx` = 50, 100, 200, 320, 450 → `n_fluid` = 2,500 to 202,500; via a
+   throwaway merged Grasph+CUDA environment, the same way as the 3D smoke
+   test above):
+
+   | nfx | n_fluid | cpu_col µs/step | cpu_1s µs/step | gpu µs/step | gpu/col | gpu/1s |
+   |---|---|---|---|---|---|---|
+   | 50  | 2,500   | 398    | 542    | 1,445  | 3.63 | 2.67 |
+   | 100 | 10,000  | 1,692  | 2,907  | 1,899  | 1.12 | 0.65 |
+   | 200 | 40,000  | 5,810  | 8,794  | 4,518  | 0.78 | 0.51 |
+   | 320 | 102,400 | 16,028 | 24,920 | 9,240  | 0.58 | 0.37 |
+   | 450 | 202,500 | 26,008 | 55,105 | 16,980 | 0.65 | 0.31 |
+
+   **There is a real crossover, and it sits close to dambreak's own scale.**
+   The GPU loses badly at `dambreak.jl`'s actual production size (2,500
+   particles — 3.6× slower than CPU-coloured, matching the original
+   small-scale prediction), but flips to a **win** by `n_fluid ≈ 40,000`
+   (`nfx = 200`) and the margin grows with size — 1.5–3.2× faster than both
+   CPU columns by 202,500 particles. This confirms the plan's fallback
+   hypothesis: with no FP64 throughput edge on this card, the crossover is
+   driven by amortizing the ~8.3 µs/launch overhead over more work per
+   launch, not raw compute — and it lands well within a range this class of
+   simulation could plausibly reach (dam breaks at a few hundred thousand
+   particles are not unusual), not just in some purely theoretical regime.
+   The `bench-output/*.csv` this run produced is gitignored, not committed;
+   re-run `julia --project bench/dambreak_scaling.jl` (in a CUDA-capable
+   merged environment) to reproduce, or pass `--sizes`/`--budget` to push
+   toward the ~1M-particle range for a finer picture of where the win keeps
+   growing.
 3. ~~**3D** (`dambreak_3d.jl`)~~ — **done.** Got the same `GRASPH_BACKEND`
    switch as `dambreak.jl`; the 2D/3D histogram, sort-key, and sweep kernels
    already existed and needed no changes. This was also the first time the
