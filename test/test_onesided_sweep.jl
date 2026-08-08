@@ -385,3 +385,167 @@ end
         @test all(x -> all(abs.(x) .< 50.0), fluid.x)
     end
 end
+
+# ---------------------------------------------------------------------------
+# 7. Phase 1 conversions (see docs — "convert the remaining pairwise
+#    functors" plan): StrainRatePfn, StrainRateVorticityPfn, CauchyFluidPfn,
+#    XSPHPfn (self only), and FluidPfn's remaining ghost/virtual +
+#    dynamic-boundary variants. Same strategy as above: build identical
+#    particle clouds, run coloured vs onesided=true through the real
+#    sort_particles!/create_grid!/sweep! path, compare the fields each pfn
+#    actually writes.
+# ---------------------------------------------------------------------------
+
+_elemscale(v::AbstractVector{<:Real}) = max(maximum(abs, v), 1.0)
+_elemscale(v::AbstractVector{<:SVector}) = max(maximum(norm, v), 1.0)
+_elemdiff(a::AbstractVector{<:Real}, b::AbstractVector{<:Real}) = maximum(abs.(a .- b))
+_elemdiff(a::AbstractVector{<:SVector}, b::AbstractVector{<:SVector}) = maximum(norm.(a .- b))
+
+function _random_stress(rng, n, ndims; ns = ndims == 2 ? 3 : 6, L=1.0)
+    ps = StressParticleSystem("stress", n, ndims, ns, 1.0, 10.0)
+    for i in 1:n
+        ps.x[i]      = SVector(ntuple(_ -> L * rand(rng), ndims)...)
+        ps.v[i]      = SVector(ntuple(_ -> 0.2 * (rand(rng) - 0.5), ndims)...)
+        ps.stress[i] = SVector(ntuple(_ -> 50.0 * (rand(rng) - 0.5), ns)...)
+    end
+    ps.rho .= 1000.0 .+ 20 .* (rand(rng, n) .- 0.5)
+    ps.p   .= 100.0 .* rand(rng, n)
+    fill!(ps.dvdt, zero(SVector{ndims,Float64})); ps.drhodt .= 0.0
+    fill!(ps.strain_rate, zero(eltype(ps.strain_rate)))
+    return ps
+end
+
+function _random_ep(rng, n, ndims; ns = ndims == 2 ? 3 : 6, L=1.0)
+    ps = ElastoPlasticParticleSystem("ep", n, ndims, ns, 1.0, 10.0)
+    for i in 1:n
+        ps.x[i]      = SVector(ntuple(_ -> L * rand(rng), ndims)...)
+        ps.v[i]      = SVector(ntuple(_ -> 0.2 * (rand(rng) - 0.5), ndims)...)
+        ps.stress[i] = SVector(ntuple(_ -> 50.0 * (rand(rng) - 0.5), ns)...)
+    end
+    ps.rho .= 1000.0 .+ 20 .* (rand(rng, n) .- 0.5)
+    ps.p   .= 100.0 .* rand(rng, n)
+    fill!(ps.dvdt, zero(SVector{ndims,Float64})); ps.drhodt .= 0.0
+    fill!(ps.strain_rate, zero(eltype(ps.strain_rate)))
+    fill!(ps.vorticity, zero(eltype(ps.vorticity)))
+    return ps
+end
+
+_dynamic_boundary(rng, n, ndims; L=1.0) = DynamicBoundarySystem(
+    _random_boundary(rng, n, ndims; L=L),
+    ndims == 2 ? SVector(0.0, 1.0) : SVector(0.0, 0.0, 1.0),
+    zero(SVector{ndims,Float64}),
+    3.0,
+)
+
+function _compare_self_generic(rng, pfn, build, fields, n, ndims; L=1.0, h=0.08)
+    kernel = CubicSplineKernel(h; ndims=ndims)
+    cutoff = kernel.interaction_length
+    ps_old = build(rng, n, ndims; L=L)
+    ps_new = deepcopy(ps_old)
+    si_old = SystemInteraction(kernel, pfn, ps_old)
+    si_new = SystemInteraction(kernel, pfn, ps_new; onesided=true)
+    for (ps, si) in ((ps_old, si_old), (ps_new, si_new))
+        perm_buf, key_buf, scratch = _sortbufs(ps)
+        sort_particles!(ps, cutoff, perm_buf, key_buf, scratch)
+        create_grid!(si)
+        sweep!(si)
+    end
+    for f in fields
+        va, vb = getproperty(ps_old, f), getproperty(ps_new, f)
+        @test _elemdiff(va, vb) < 1e-9 * _elemscale(va)
+    end
+end
+
+_sortable(ps::AbstractBoundarySystem) = getfield(ps, :inner)   # StaticBoundarySystem/DynamicBoundarySystem
+_sortable(ps) = ps                                              # VirtualParticleSystem delegates to :source itself
+
+function _compare_coupled_generic(rng, pfn, build_a, build_b, fields, n_a, n_b, ndims; L=1.0, h=0.08)
+    kernel = CubicSplineKernel(h; ndims=ndims)
+    cutoff = kernel.interaction_length
+    a_old = build_a(rng, n_a, ndims; L=L)
+    a_new = deepcopy(a_old)
+    b     = build_b(rng, n_b, ndims; L=L)
+
+    si_old = SystemInteraction(kernel, pfn, a_old, b)
+    si_new = SystemInteraction(kernel, pfn, a_new, b; onesided=true)
+
+    b_sort = _sortable(b)
+    pb, kb, sc = _sortbufs(b_sort)
+    sort_particles!(b_sort, cutoff, pb, kb, sc)
+
+    for (ps, si) in ((a_old, si_old), (a_new, si_new))
+        p2, k2, s2 = _sortbufs(ps)
+        sort_particles!(ps, cutoff, p2, k2, s2)
+        create_grid!(si)
+        sweep!(si)
+    end
+
+    for f in fields
+        va, vb2 = getproperty(a_old, f), getproperty(a_new, f)
+        @test _elemdiff(va, vb2) < 1e-9 * _elemscale(va)
+    end
+end
+
+_as_virtual_stress(rng, n, ndims; L=1.0) =
+    let src = _random_stress(rng, n, ndims; L=L)
+        VirtualParticleSystem(src, "virt", src.n, ndims, src.mass, src.c)
+    end
+_as_virtual_ep(rng, n, ndims; L=1.0) =
+    let src = _random_ep(rng, n, ndims; L=L)
+        VirtualParticleSystem(src, "virt", src.n, ndims, src.mass, src.c)
+    end
+_as_virtual_fluid(rng, n, ndims; L=1.0) =
+    let src = _random_fluid(rng, n, ndims; L=L)
+        VirtualParticleSystem(src, "virt", src.n, ndims, src.mass, src.c)
+    end
+
+@testset "onesided=true StrainRatePfn matches coloured sweep" begin
+    rng = MersenneTwister(30)
+    pfn = StrainRatePfn()
+    for ndims in (2, 3)
+        _compare_self_generic(rng, pfn, _random_stress, (:strain_rate,), 300, ndims)
+        _compare_coupled_generic(rng, pfn, _random_stress, _as_virtual_stress, (:strain_rate,), 200, 150, ndims)
+        _compare_coupled_generic(rng, pfn, _random_stress, _dynamic_boundary, (:strain_rate,), 200, 150, ndims)
+    end
+end
+
+@testset "onesided=true StrainRateVorticityPfn matches coloured sweep" begin
+    rng = MersenneTwister(31)
+    pfn = StrainRateVorticityPfn()
+    for ndims in (2, 3)
+        _compare_self_generic(rng, pfn, _random_ep, (:strain_rate, :vorticity), 300, ndims)
+        _compare_coupled_generic(rng, pfn, _random_ep, _as_virtual_ep, (:strain_rate, :vorticity), 200, 150, ndims)
+        _compare_coupled_generic(rng, pfn, _random_ep, _dynamic_boundary, (:strain_rate, :vorticity), 200, 150, ndims)
+    end
+end
+
+@testset "onesided=true CauchyFluidPfn matches coloured sweep" begin
+    rng = MersenneTwister(32)
+    pfn = CauchyFluidPfn(0.03, 0.0, 0.08)
+    for ndims in (2, 3)
+        _compare_self_generic(rng, pfn, _random_stress, (:dvdt, :drhodt), 300, ndims)
+        _compare_coupled_generic(rng, pfn, _random_stress, _as_virtual_stress, (:dvdt, :drhodt), 200, 150, ndims)
+        _compare_coupled_generic(rng, pfn, _random_stress, _dynamic_boundary, (:dvdt, :drhodt), 200, 150, ndims)
+    end
+end
+
+@testset "onesided=true XSPHPfn (self) matches coloured sweep" begin
+    rng = MersenneTwister(33)
+    pfn = XSPHPfn(0.5)
+    build(rng, n, ndims; L=1.0) = let ps = _random_fluid(rng, n, ndims; L=L)
+        fill!(ps.v_adjustment, zero(SVector{ndims,Float64}))
+        ps
+    end
+    for ndims in (2, 3)
+        _compare_self_generic(rng, pfn, build, (:v_adjustment,), 300, ndims)
+    end
+end
+
+@testset "onesided=true FluidPfn ghost/virtual + dynamic-boundary variants match coloured sweep" begin
+    rng = MersenneTwister(34)
+    pfn = FluidPfn(0.03, 0.0, 0.08)
+    for ndims in (2, 3)
+        _compare_coupled_generic(rng, pfn, _random_fluid, _as_virtual_fluid, (:dvdt, :drhodt), 300, 200, ndims)
+        _compare_coupled_generic(rng, pfn, _random_fluid, _dynamic_boundary, (:dvdt, :drhodt), 300, 200, ndims)
+    end
+end

@@ -69,6 +69,59 @@ end
     ps_a.strain_rate[i] += sr * (mass / rho_j)
 end
 
+# --- One-sided `pfn_contribution` methods ---
+
+@inline @Base.propagate_inbounds function pfn_contribution(f::StrainRatePfn, ps::AbstractParticleSystem{T,ND}, i::Int, j::Int, dx::SVector{ND,T}, gx::SVector{ND,T}, w::T) where {ND,T<:AbstractFloat}
+    N = length(eltype(ps.strain_rate))
+    rho_i, rho_j = ps.rho[i], ps.rho[j]
+    mass         = ps.mass
+    dv           = ps.v[j] - ps.v[i]
+
+    sr = N == 4 ? strain_rate_tensor(dv, gx, Val{4}) : strain_rate_tensor(dv, gx)
+
+    return (strain_rate = sr * (mass / rho_j),)
+end
+
+@inline _onesided_zero_self(::StrainRatePfn, ps::AbstractParticleSystem{T,ND}, i) where {T,ND} =
+    (strain_rate = zero(eltype(ps.strain_rate)),)
+
+# Coupled generic (one-sided) — ghosts and virtual systems. Narrowly typed
+# (not `::AbstractParticleSystem`) for the same reason as FluidPfn's
+# equivalent method: every actual call site (grep-verified) targets a ghost
+# or virtual system_b, never a second genuinely-real dynamic system.
+@inline @Base.propagate_inbounds function pfn_contribution(f::StrainRatePfn, ps_a::AbstractParticleSystem{T,ND}, ps_b::Union{AbstractGhostParticleSystem{T,ND},VirtualParticleSystem{T,ND}}, i::Int, j::Int, dx::SVector{ND,T}, gx::SVector{ND,T}, w::T) where {ND,T<:AbstractFloat}
+    N = length(eltype(ps_a.strain_rate))
+    rho_j = ps_b.rho[j]
+    mass  = ps_b.mass
+    dv    = ps_b.v[j] - ps_a.v[i]
+
+    sr = N == 4 ? strain_rate_tensor(dv, gx, Val{4}) : strain_rate_tensor(dv, gx)
+
+    return (strain_rate = sr * (mass / rho_j),)
+end
+
+@inline _onesided_zero_coupled(::StrainRatePfn, ps_a::AbstractParticleSystem{T,ND}, ::Union{AbstractGhostParticleSystem{T,ND},VirtualParticleSystem{T,ND}}, i) where {T,ND} =
+    (strain_rate = zero(eltype(ps_a.strain_rate)),)
+
+# Coupled dynamic boundary — derives velocity from distance ratio
+@inline @Base.propagate_inbounds function pfn_contribution(f::StrainRatePfn, ps_a::AbstractParticleSystem{T,ND}, ps_b::DynamicBoundarySystem{T,ND}, i::Int, j::Int, dx::SVector{ND,T}, gx::SVector{ND,T}, w::T) where {ND,T<:AbstractFloat}
+    N = length(eltype(ps_a.strain_rate))
+    da    = dot(ps_a.x[i] - ps_b.boundary_point, ps_b.boundary_normal)
+    db    = dot(ps_b.x[j] - ps_b.boundary_point, ps_b.boundary_normal)
+    vi    = ps_a.v[i]
+    vj    = -min(ps_b.boundary_beta, abs(db/da)) * vi
+    rho_j = ps_a.rho[i]
+    mass  = ps_a.mass
+    dv    = vj - vi
+
+    sr = N == 4 ? strain_rate_tensor(dv, gx, Val{4}) : strain_rate_tensor(dv, gx)
+
+    return (strain_rate = sr * (mass / rho_j),)
+end
+
+@inline _onesided_zero_coupled(::StrainRatePfn, ps_a::AbstractParticleSystem{T,ND}, ::DynamicBoundarySystem{T,ND}, i) where {T,ND} =
+    (strain_rate = zero(eltype(ps_a.strain_rate)),)
+
 """
     StrainRateVorticityPfn()
 
@@ -124,6 +177,60 @@ end
     ps_a.strain_rate[i] += sr * (mass / rho_j)
     ps_a.vorticity[i]   += vor * (mass / rho_j)
 end
+
+# --- One-sided `pfn_contribution` methods ---
+
+@inline @Base.propagate_inbounds function pfn_contribution(f::StrainRateVorticityPfn, ps::AbstractParticleSystem{T,ND}, i::Int, j::Int, dx::SVector{ND,T}, gx::SVector{ND,T}, w::T) where {ND,T<:AbstractFloat}
+    N = length(eltype(ps.strain_rate))
+    rho_i, rho_j = ps.rho[i], ps.rho[j]
+    mass         = ps.mass
+    dv           = ps.v[j] - ps.v[i]
+
+    sr  = N == 4 ? strain_rate_tensor(dv, gx, Val{4}) : strain_rate_tensor(dv, gx)
+    vor = vorticity_tensor(dv, gx)
+
+    return (strain_rate = sr * (mass / rho_j), vorticity = vor * (mass / rho_j))
+end
+
+@inline _onesided_zero_self(::StrainRateVorticityPfn, ps::AbstractParticleSystem{T,ND}, i) where {T,ND} =
+    (strain_rate = zero(eltype(ps.strain_rate)), vorticity = zero(eltype(ps.vorticity)))
+
+# Coupled generic (one-sided) — ghosts and virtual systems (see StrainRatePfn's
+# equivalent method for why this is narrowly typed).
+@inline @Base.propagate_inbounds function pfn_contribution(f::StrainRateVorticityPfn, ps_a::AbstractParticleSystem{T,ND}, ps_b::Union{AbstractGhostParticleSystem{T,ND},VirtualParticleSystem{T,ND}}, i::Int, j::Int, dx::SVector{ND,T}, gx::SVector{ND,T}, w::T) where {ND,T<:AbstractFloat}
+    N = length(eltype(ps_a.strain_rate))
+    rho_j = ps_b.rho[j]
+    mass  = ps_b.mass
+    dv    = ps_b.v[j] - ps_a.v[i]
+
+    sr  = N == 4 ? strain_rate_tensor(dv, gx, Val{4}) : strain_rate_tensor(dv, gx)
+    vor = vorticity_tensor(dv, gx)
+
+    return (strain_rate = sr * (mass / rho_j), vorticity = vor * (mass / rho_j))
+end
+
+@inline _onesided_zero_coupled(::StrainRateVorticityPfn, ps_a::AbstractParticleSystem{T,ND}, ::Union{AbstractGhostParticleSystem{T,ND},VirtualParticleSystem{T,ND}}, i) where {T,ND} =
+    (strain_rate = zero(eltype(ps_a.strain_rate)), vorticity = zero(eltype(ps_a.vorticity)))
+
+# Coupled dynamic boundary
+@inline @Base.propagate_inbounds function pfn_contribution(f::StrainRateVorticityPfn, ps_a::AbstractParticleSystem{T,ND}, ps_b::DynamicBoundarySystem{T,ND}, i::Int, j::Int, dx::SVector{ND,T}, gx::SVector{ND,T}, w::T) where {ND,T<:AbstractFloat}
+    N = length(eltype(ps_a.strain_rate))
+    da    = dot(ps_a.x[i] - ps_b.boundary_point, ps_b.boundary_normal)
+    db    = dot(ps_b.x[j] - ps_b.boundary_point, ps_b.boundary_normal)
+    vi    = ps_a.v[i]
+    vj    = -min(ps_b.boundary_beta, abs(db/da)) * vi
+    rho_j = ps_a.rho[i]
+    mass  = ps_a.mass
+    dv    = vj - vi
+
+    sr  = N == 4 ? strain_rate_tensor(dv, gx, Val{4}) : strain_rate_tensor(dv, gx)
+    vor = vorticity_tensor(dv, gx)
+
+    return (strain_rate = sr * (mass / rho_j), vorticity = vor * (mass / rho_j))
+end
+
+@inline _onesided_zero_coupled(::StrainRateVorticityPfn, ps_a::AbstractParticleSystem{T,ND}, ::DynamicBoundarySystem{T,ND}, i) where {T,ND} =
+    (strain_rate = zero(eltype(ps_a.strain_rate)), vorticity = zero(eltype(ps_a.vorticity)))
 
 """
     FluidPfn{S, D, E, T}
@@ -230,11 +337,26 @@ end
 # swap-antisymmetry argument in Interaction.jl's "One-sided, particle-parallel
 # sweep" section.
 #
-# Only the two dambreak.jl/dambreak_3d.jl paths are covered so far: fluid
-# self-interaction, and the fluid<->StaticBoundarySystem coupling (which was
-# already one-sided in its two-sided form above, since a static boundary has
-# no dynamics to update). Other pfns do not yet implement this protocol.
+# `_onesided_zero_self`/`_onesided_zero_coupled` (pfn-specific: they must
+# construct a zero value of whatever type/shape that pfn's `pfn_contribution`
+# returns) and `_onesided_writeback_self!`/`_onesided_writeback_coupled!`
+# (fully generic below — every existing hand-written one was just
+# `ps.field[i] += acc.field` per field, so a single NamedTuple-dispatched
+# method covers all pfns) round out the per-pfn hooks the sweep needs.
 # ---------------------------------------------------------------------------
+
+@inline _onesided_writeback_fields!(::Tuple{}, ps, i, acc) = nothing
+@inline @Base.propagate_inbounds function _onesided_writeback_fields!(names::Tuple, ps, i, acc)
+    fname = first(names)
+    getproperty(ps, fname)[i] += getproperty(acc, fname)
+    _onesided_writeback_fields!(Base.tail(names), ps, i, acc)
+end
+
+@inline @Base.propagate_inbounds _onesided_writeback_self!(pfn, ps, i, acc::NamedTuple{names}) where {names} =
+    _onesided_writeback_fields!(names, ps, i, acc)
+
+@inline @Base.propagate_inbounds _onesided_writeback_coupled!(pfn, ps_a, ps_b, i, acc::NamedTuple{names}) where {names} =
+    _onesided_writeback_fields!(names, ps_a, i, acc)
 
 @inline @Base.propagate_inbounds function pfn_contribution(f::FluidPfn{S,D,E,T}, ps::AbstractParticleSystem{T,ND}, i::Int, j::Int, dx::SVector{ND,T}, gx::SVector{ND,T}, w::T) where {S,D,E,ND,T}
     vi, vj       = ps.v[i], ps.v[j]
@@ -257,12 +379,6 @@ end
 @inline _onesided_zero_self(::FluidPfn{S,D,E,T}, ::AbstractParticleSystem{T,ND}, i) where {S,D,E,ND,T} =
     (dvdt = zero(SVector{ND,T}), drhodt = zero(T))
 
-@inline @Base.propagate_inbounds function _onesided_writeback_self!(::FluidPfn, ps, i, acc)
-    ps.dvdt[i]   += acc.dvdt
-    ps.drhodt[i] += acc.drhodt
-    return nothing
-end
-
 # Coupled static boundary — already one-sided in its two-sided form (a static
 # boundary has no dynamics), so this is a direct transcription: return instead
 # of mutate.
@@ -280,12 +396,61 @@ end
 @inline _onesided_zero_coupled(::FluidPfn{S,D,E,T}, ::AbstractParticleSystem{T,ND}, ::StaticBoundarySystem, i) where {S,D,E,ND,T} =
     (dvdt = zero(SVector{ND,T}),)
 
-@inline @Base.propagate_inbounds function _onesided_writeback_coupled!(::FluidPfn, ps_a, ::StaticBoundarySystem, i, acc)
-    ps_a.dvdt[i] += acc.dvdt
-    return nothing
+# Coupled generic (one-sided) — ghosts and virtual systems. Narrowly typed
+# (not `::AbstractParticleSystem`) on purpose: once a reverse-pass sweep
+# exists (see Interaction.jl), a bare `(Abstract,Abstract)` method here would
+# silently absorb any mistyped reverse call instead of throwing MethodError.
+@inline @Base.propagate_inbounds function pfn_contribution(f::FluidPfn{S,D,E,T}, ps_a::AbstractParticleSystem{T,ND}, ps_b::Union{AbstractGhostParticleSystem{T,ND},VirtualParticleSystem{T,ND}}, i::Int, j::Int, dx::SVector{ND,T}, gx::SVector{ND,T}, w::T) where {S,D,E,ND,T<:AbstractFloat}
+    vi, vj       = ps_a.v[i], ps_b.v[j]
+    rho_i, rho_j = ps_a.rho[i], ps_b.rho[j]
+    p_i, p_j     = ps_a.p[i], ps_b.p[j]
+    mass_j       = ps_b.mass
+    dv           = vi - vj
+
+    piv = artificial_viscosity(dx, dv, f.h, rho_i, rho_j, f.art_visc_alpha, f.art_visc_beta, ps_a.c, ps_a.c)
+    dh  = pressure_force_coeff(p_i, p_j, rho_i, rho_j, Val(S))
+    dv_tmp = mass_j * (dh - piv) * gx
+
+    dr  = continuity_rate(dv, gx)
+    psi = diffusion_density(dx, rho_i, rho_j, ps_a.c, ps_a.c, f.h, f.h, gx, f.delta)
+    drho = mass_j * (dr * continuity_density_coeff(rho_i, rho_j, Val(S)) + psi / rho_j)
+
+    return (dvdt = dv_tmp, drhodt = drho)
 end
 
+@inline _onesided_zero_coupled(::FluidPfn{S,D,E,T}, ::AbstractParticleSystem{T,ND}, ::Union{AbstractGhostParticleSystem{T,ND},VirtualParticleSystem{T,ND}}, i) where {S,D,E,ND,T} =
+    (dvdt = zero(SVector{ND,T}), drhodt = zero(T))
+
 # Coupled dynamic boundary (derives velocity, pressure-based)
+@inline @Base.propagate_inbounds function pfn_contribution(f::FluidPfn{S,D,E,T}, ps_a::AbstractParticleSystem{T,ND}, ps_b::DynamicBoundarySystem{T,ND}, i::Int, j::Int, dx::SVector{ND,T}, gx::SVector{ND,T}, w::T) where {S,D,E,ND,T<:AbstractFloat}
+    da = dot(ps_a.x[i] - ps_b.boundary_point, ps_b.boundary_normal)
+    db = dot(ps_b.x[j] - ps_b.boundary_point, ps_b.boundary_normal)
+
+    vi       = ps_a.v[i]
+    vj       = -min(ps_b.boundary_beta, abs(db/da)) * vi
+    rho_i    = ps_a.rho[i]
+    rho_j    = rho_i
+    p_i      = ps_a.p[i]
+    p_j      = p_i
+    mass     = ps_a.mass
+    dv       = vi - vj
+
+    piv = artificial_viscosity(dx, dv, f.h, rho_i, rho_j, f.art_visc_alpha, f.art_visc_beta, ps_a.c, ps_a.c)
+    dh  = pressure_force_coeff(p_i, p_j, rho_i, rho_j, Val(S))
+    dv_tmp = mass * (dh - piv) * gx
+
+    dr  = continuity_rate(dv, gx)
+    psi = diffusion_density(dx, rho_i, rho_j, ps_a.c, ps_a.c, f.h, f.h, gx, f.delta)
+    drho = mass * (dr * continuity_density_coeff(rho_i, rho_j, Val(S)) + psi / rho_j)
+
+    return (dvdt = dv_tmp, drhodt = drho)
+end
+
+@inline _onesided_zero_coupled(::FluidPfn{S,D,E,T}, ::AbstractParticleSystem{T,ND}, ::DynamicBoundarySystem{T,ND}, i) where {S,D,E,ND,T} =
+    (dvdt = zero(SVector{ND,T}), drhodt = zero(T))
+
+# Below: the original two-sided mutating method (kept for the coloured
+# sweep's default path).
 @inline @Base.propagate_inbounds function (f::FluidPfn{S,D,E,T})(ps_a::AbstractParticleSystem{T,ND}, ps_b::DynamicBoundarySystem{T,ND}, i::Int, j::Int, dx::SVector{ND,T}, gx::SVector{ND,T}, w::T) where {S,D,E,ND,T<:AbstractFloat}
     da = dot(ps_a.x[i] - ps_b.boundary_point, ps_b.boundary_normal)
     db = dot(ps_b.x[j] - ps_b.boundary_point, ps_b.boundary_normal)
@@ -421,6 +586,85 @@ end
     ps_a.drhodt[i] += mass * (dr + psi / rho_j)
 end
 
+# --- One-sided `pfn_contribution` methods ---
+# The general two-real-system method above is not converted: it is unused by
+# any of the 13 experiment scripts (every coupled CauchyFluidPfn call site
+# targets a DynamicBoundarySystem, VirtualParticleSystem, or ghost system —
+# verified by grep), so it stays coloured-sweep-only and untouched.
+
+@inline @Base.propagate_inbounds function pfn_contribution(f::CauchyFluidPfn{D,T}, ps::AbstractParticleSystem{T,ND}, i::Int, j::Int, dx::SVector{ND,T}, gx::SVector{ND,T}, w::T) where {D,ND,T<:AbstractFloat}
+    vi, vj             = ps.v[i], ps.v[j]
+    rho_i, rho_j       = ps.rho[i], ps.rho[j]
+    stress_i, stress_j = ps.stress[i], ps.stress[j]
+    mass               = ps.mass
+    dv                 = vi - vj
+
+    piv    = artificial_viscosity(dx, dv, f.h, rho_i, rho_j, f.art_visc_alpha, f.art_visc_beta, ps.c, ps.c)
+    h_vec  = cauchy_stress_force(stress_i, stress_j, rho_i, rho_j, gx)
+    dv_tmp = mass * (h_vec - piv * gx)
+
+    dr  = continuity_rate(dv, gx)
+    psi = diffusion_density(dx, rho_i, rho_j, ps.c, ps.c, f.h, f.h, gx, f.delta)
+    drho = mass * (dr + psi / rho_j)
+
+    return (dvdt = dv_tmp, drhodt = drho)
+end
+
+@inline _onesided_zero_self(::CauchyFluidPfn{D,T}, ::AbstractParticleSystem{T,ND}, i) where {D,ND,T} =
+    (dvdt = zero(SVector{ND,T}), drhodt = zero(T))
+
+# Coupled generic (one-sided) — virtual or ghost ps_b. Narrowly typed on
+# purpose (not `::AbstractParticleSystem`) — see the note on FluidPfn's
+# equivalent method above for why.
+@inline @Base.propagate_inbounds function pfn_contribution(f::CauchyFluidPfn{D,T}, ps_a::AbstractParticleSystem{T,ND}, ps_b::Union{VirtualParticleSystem{T,ND}, AbstractGhostParticleSystem{T,ND}}, i::Int, j::Int, dx::SVector{ND,T}, gx::SVector{ND,T}, w::T) where {D,ND,T<:AbstractFloat}
+    vi, vj             = ps_a.v[i], ps_b.v[j]
+    rho_i, rho_j       = ps_a.rho[i], ps_b.rho[j]
+    stress_i, stress_j = ps_a.stress[i], ps_b.stress[j]
+    mass_j             = ps_b.mass
+    dv                 = vi - vj
+
+    piv   = artificial_viscosity(dx, dv, f.h, rho_i, rho_j, f.art_visc_alpha, f.art_visc_beta, ps_a.c, ps_b.c)
+    h_vec = cauchy_stress_force(stress_i, stress_j, rho_i, rho_j, gx)
+    dv_tmp = mass_j * (h_vec - piv * gx)
+
+    dr  = continuity_rate(dv, gx)
+    psi = diffusion_density(dx, rho_i, rho_j, ps_a.c, ps_a.c, f.h, f.h, gx, f.delta)
+    drho = mass_j * (dr + psi / rho_j)
+
+    return (dvdt = dv_tmp, drhodt = drho)
+end
+
+@inline _onesided_zero_coupled(::CauchyFluidPfn{D,T}, ::AbstractParticleSystem{T,ND}, ::Union{VirtualParticleSystem{T,ND}, AbstractGhostParticleSystem{T,ND}}, i) where {D,ND,T} =
+    (dvdt = zero(SVector{ND,T}), drhodt = zero(T))
+
+# Coupled dynamic boundary (derives velocity, stress-based)
+@inline @Base.propagate_inbounds function pfn_contribution(f::CauchyFluidPfn{D,T}, ps_a::AbstractParticleSystem{T,ND}, ps_b::DynamicBoundarySystem{T,ND}, i::Int, j::Int, dx::SVector{ND,T}, gx::SVector{ND,T}, w::T) where {D,ND,T<:AbstractFloat}
+    da = dot(ps_a.x[i] - ps_b.boundary_point, ps_b.boundary_normal)
+    db = dot(ps_b.x[j] - ps_b.boundary_point, ps_b.boundary_normal)
+
+    vi       = ps_a.v[i]
+    vj       = -min(ps_b.boundary_beta, abs(db/da)) * vi
+    rho_i    = ps_a.rho[i]
+    rho_j    = rho_i
+    stress_i = ps_a.stress[i]
+    stress_j = stress_i
+    mass     = ps_a.mass
+    dv       = vi - vj
+
+    piv    = artificial_viscosity(dx, dv, f.h, rho_i, rho_j, f.art_visc_alpha, f.art_visc_beta, ps_a.c, ps_a.c)
+    h_vec  = cauchy_stress_force(stress_i, stress_j, rho_i, rho_j, gx)
+    dv_tmp = mass * (h_vec - piv * gx)
+
+    dr  = continuity_rate(dv, gx)
+    psi = diffusion_density(dx, rho_i, rho_j, ps_a.c, ps_a.c, f.h, f.h, gx, f.delta)
+    drho = mass * (dr + psi / rho_j)
+
+    return (dvdt = dv_tmp, drhodt = drho)
+end
+
+@inline _onesided_zero_coupled(::CauchyFluidPfn{D,T}, ::AbstractParticleSystem{T,ND}, ::DynamicBoundarySystem{T,ND}, i) where {D,ND,T} =
+    (dvdt = zero(SVector{ND,T}), drhodt = zero(T))
+
 """
     XSPHPfn{T}
 """
@@ -455,6 +699,26 @@ end
     ps_b.v_adjustment[j] -= du*mass_i
 
 end
+
+# --- One-sided `pfn_contribution` method ---
+# Self only. The coupled variant above is unused by any of the 13 experiment
+# scripts (XSPHPfn is only ever passed as `velocity_adjust_pairwise_fn`
+# alongside a self-interaction FluidPfn, e.g. bubble3.jl) — not converted.
+
+@inline @Base.propagate_inbounds function pfn_contribution(f::XSPHPfn{T}, ps::AbstractParticleSystem, i::Int, j::Int, dx::SVector{ND,T}, gx::SVector{ND,T}, w::T) where {ND, T<:AbstractFloat}
+    vi, vj       = ps.v[i], ps.v[j]
+    rho_i, rho_j = ps.rho[i], ps.rho[j]
+    mass         = ps.mass
+    dv           = vi - vj
+    epsilon      = f.epsilon
+
+    du = xsph_veladjust(epsilon, dv, rho_i, rho_j, w)
+
+    return (v_adjustment = du * mass,)
+end
+
+@inline _onesided_zero_self(::XSPHPfn{T}, ps::AbstractParticleSystem{T,ND}, i) where {T,ND} =
+    (v_adjustment = zero(SVector{ND,T}),)
 
 """
     InterpolateFieldFn(:field1, :field2, …)
