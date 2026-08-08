@@ -118,6 +118,27 @@ boundary.rho .= rho0
 fill!(boundary.v, zero(SVector{3,Float64}))
 
 # ---------------------------------------------------------------------------
+# Backend selection
+#
+# Defaults to CPU (Vector-backed, coloured sweep) so the script is unchanged
+# in normal use. Set GRASPH_BACKEND=cuda to run GPU-resident via
+# KernelAbstractions.jl: adapts fluid/boundary to CuArray and switches the
+# interactions to the one-sided KA sweep (the only sweep implemented as a KA
+# kernel — see docs/gpu-migration-plan.md). Requires CUDA.jl in the active
+# environment (it is not a hard dependency of Grasph itself).
+# ---------------------------------------------------------------------------
+
+const GRASPH_BACKEND = get(ENV, "GRASPH_BACKEND", "cpu")
+const ka_mode = GRASPH_BACKEND == "cuda"
+
+if ka_mode
+    using CUDA
+    using Adapt
+    fluid    = adapt(CUDABackend(), fluid)
+    boundary = adapt(CUDABackend(), boundary)
+end
+
+# ---------------------------------------------------------------------------
 # Interactions and integrator
 # ---------------------------------------------------------------------------
 
@@ -127,14 +148,16 @@ static_boundary = StaticBoundarySystem(boundary, dx_spacing)
 fluid_interaction = SystemInteraction(
     kernel,
     FluidPfn(art_visc_alpha, art_visc_beta, h_sph),
-    fluid
+    fluid;
+    onesided = ka_mode, ka = ka_mode,
 )
 
 fluid_boundary_interaction = SystemInteraction(
     kernel,
     FluidPfn(art_visc_alpha, art_visc_beta, h_sph),
     fluid,
-    static_boundary
+    static_boundary;
+    onesided = ka_mode, ka = ka_mode,
 )
 
 integrator = LeapFrogTimeIntegrator(
@@ -146,7 +169,7 @@ integrator = LeapFrogTimeIntegrator(
 # Run
 # ---------------------------------------------------------------------------
 
-@printf("n_fluid = %d  |  n_boundary = %d  |  mass = %.4g\n", n_fluid, n_boundary, fluid_mass)
+@printf("n_fluid = %d  |  n_boundary = %d  |  mass = %.4g  |  backend = %s\n", n_fluid, n_boundary, fluid_mass, GRASPH_BACKEND)
 
 run_driver!(
     [Stage(integrator, 1000, 0.05, "run")],

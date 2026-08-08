@@ -180,11 +180,14 @@ below: this machine is the **correctness/parity target**, not a performance
 target — exactly the posture the "measure, don't assume" note above
 recommended.
 
-**Scope**: a vertical slice — `dambreak.jl` (2D only) fully GPU-resident
+**Scope**: a vertical slice — `dambreak.jl` (2D) fully GPU-resident
 end-to-end (sort → grid → sweep → state update → integrator), gated behind
-`GRASPH_BACKEND=cuda` (default `cpu`, zero behaviour change otherwise). 3D,
-the other 12 experiment scripts, and full pfn conversion are still out of
-scope — see "Explicitly deferred" below, which is mostly unchanged.
+`GRASPH_BACKEND=cuda` (default `cpu`, zero behaviour change otherwise).
+`dambreak_3d.jl` got the same wiring in a follow-up pass (see below) — the
+2D/3D histogram, sort-key, and sweep kernels were written side by side from
+the start and only needed the script-level switch and a validation pass. The
+other 12 experiment scripts and full pfn conversion are still out of scope —
+see "Explicitly deferred" below, which is mostly unchanged.
 
 **Key design decision that revised the original B2 text**: the coloured
 sweep **stays in `src/`** and remains every script's default. The original
@@ -325,9 +328,32 @@ stayed at 834/834 throughout every step of this work.
    per-step time — without the CPU-onesided column a GPU "speedup" can't be
    told apart from an artifact of comparing against a half-shell algorithm
    that does half the pair evaluations.
-3. **3D** (`dambreak_3d.jl`) — the 3D sweep/histogram kernels already exist
-   (written alongside the 2D ones throughout this session); only the script
-   wiring and a fresh validation pass remain.
+3. ~~**3D** (`dambreak_3d.jl`)~~ — **done.** Got the same `GRASPH_BACKEND`
+   switch as `dambreak.jl`; the 2D/3D histogram, sort-key, and sweep kernels
+   already existed and needed no changes. This was also the first time the
+   3D CUDA kernels ran on real hardware (Tier 2, `test_gpu_cuda.jl`, only
+   ever exercised 2D) — validated via a live `run_driver!`/CLI smoke run
+   (`GRASPH_BACKEND=cuda`, 30k fluid + 30k boundary particles, free-fall
+   velocities matching `g·t` exactly, `CUDA.allowscalar(false)`-clean) and a
+   new Tier 3 testset in `test/test_gpu_dambreak.jl`
+   (`_t3_build_3d`/"dambreak_3d-shaped end-to-end parity") mirroring the
+   existing 2D one: 20-step trajectory match at the same tolerances
+   (`1e-9`/`1e-7`/`1e-7`), plus 150-step physical invariants. Suite is now
+   935/935 (up from 921).
+   - Note for the next environment setup: `CUDA` is test-only, so running a
+     GPU-mode script directly (not via `Pkg.test()`) needs a merged
+     environment — stacking `JULIA_LOAD_PATH="@:test:@stdlib"` does **not**
+     work, because root's `PrettyTables = "2"` compat and `test/`'s
+     standalone resolve (unconstrained by that compat) land on different
+     `PrettyTables` versions, and only one can be loaded per process
+     (`CUDATools` needs the newer one, `Grasph` needs the older one —
+     manifests as `UndefVarError: TextHighlighter not defined`). The fix is
+     to build one throwaway environment the same way `Pkg.test()` does
+     internally: `Pkg.activate(path)`, `Pkg.develop(path="/path/to/Grasph.jl")`,
+     then `Pkg.add` the test-only deps (CUDA, Adapt, KernelAbstractions, plus
+     whatever the script itself `using`s directly, e.g. StaticArrays/Printf)
+     — letting the resolver settle everything at once avoids the conflict
+     (lands on CUDA 5.8.5, same as `Pkg.test()`'s own resolve).
 4. Converting the remaining pfns to `pfn_contribution`, and only then
    retiring the coloured sweep — unchanged from before, still not started.
 

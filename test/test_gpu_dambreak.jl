@@ -87,10 +87,99 @@ function _t3_build(nfx; backend = nothing)
     return integrator, fluid, boundary, nbx, nby, dx_spacing
 end
 
+function _t3_build_3d(nfx; backend = nothing)
+    dx_spacing = 0.5
+    h_sph = 1.2 * dx_spacing
+    rho0 = 1000.0
+    c_sound = 10.0 * sqrt(2.0 * 9.81 * 25.0)
+    art_visc_alpha = 0.005
+    art_visc_beta = 0.0
+
+    nfy = max(2, nfx ÷ 2)
+    nfz = nfx
+    nbx = nfx + 2
+    nby = nfy
+    nbz = nfz + 2
+
+    n_fluid = nfx * nfy * nfz
+    fluid_mass = rho0 * dx_spacing^3
+
+    fluid = FluidParticleSystem("fluid", n_fluid, 3, fluid_mass, c_sound;
+                                source_v = [0.0, 0.0, -9.81], state_updater = TaitEOSUpdater(rho0))
+    let k = 1
+        for i in 0:nfx-1, j in 0:nfy-1, m in 0:nfz-1
+            fluid.x[k] = SVector((i + 0.5) * dx_spacing, (j + 0.5) * dx_spacing, (m + 0.5) * dx_spacing)
+            k += 1
+        end
+    end
+    fill!(fluid.v, zero(SVector{3,Float64}))
+    fluid.rho .= rho0
+    update_state!(fluid, 1)
+
+    n_bottom = (nbx + 2) * (nby + 2)
+    n_top    = (nbx + 2) * (nby + 2)
+    n_left   = nby * nbz
+    n_right  = nby * nbz
+    n_front  = nbx * nbz
+    n_back   = nbx * nbz
+    n_boundary = n_bottom + n_top + n_left + n_right + n_front + n_back
+
+    boundary = BasicParticleSystem("boundary", n_boundary, 3, fluid_mass, c_sound)
+    let k = 1
+        for i in -1:nbx, j in -1:nby
+            boundary.x[k] = SVector((i + 0.5) * dx_spacing, (j + 0.5) * dx_spacing, -0.5 * dx_spacing)
+            k += 1
+        end
+        for i in -1:nbx, j in -1:nby
+            boundary.x[k] = SVector((i + 0.5) * dx_spacing, (j + 0.5) * dx_spacing, nbz * dx_spacing + 0.5 * dx_spacing)
+            k += 1
+        end
+        for j in 0:nby-1, m in 0:nbz-1
+            boundary.x[k] = SVector(-0.5 * dx_spacing, (j + 0.5) * dx_spacing, (m + 0.5) * dx_spacing)
+            k += 1
+        end
+        for j in 0:nby-1, m in 0:nbz-1
+            boundary.x[k] = SVector(nbx * dx_spacing + 0.5 * dx_spacing, (j + 0.5) * dx_spacing, (m + 0.5) * dx_spacing)
+            k += 1
+        end
+        for i in 0:nbx-1, m in 0:nbz-1
+            boundary.x[k] = SVector((i + 0.5) * dx_spacing, -0.5 * dx_spacing, (m + 0.5) * dx_spacing)
+            k += 1
+        end
+        for i in 0:nbx-1, m in 0:nbz-1
+            boundary.x[k] = SVector((i + 0.5) * dx_spacing, nby * dx_spacing + 0.5 * dx_spacing, (m + 0.5) * dx_spacing)
+            k += 1
+        end
+    end
+    boundary.rho .= rho0
+    fill!(boundary.v, zero(SVector{3,Float64}))
+
+    kernel = CubicSplineKernel(h_sph; ndims=3)
+
+    ka_mode = backend !== nothing
+    if ka_mode
+        fluid    = adapt(backend, fluid)
+        boundary = adapt(backend, boundary)
+    end
+
+    static_boundary = StaticBoundarySystem(boundary, dx_spacing)
+    fluid_interaction = SystemInteraction(kernel, FluidPfn(art_visc_alpha, art_visc_beta, h_sph), fluid;
+                                          onesided = ka_mode, ka = ka_mode)
+    fluid_boundary_interaction = SystemInteraction(kernel, FluidPfn(art_visc_alpha, art_visc_beta, h_sph),
+                                                   fluid, static_boundary; onesided = ka_mode, ka = ka_mode)
+    integrator = LeapFrogTimeIntegrator([fluid, boundary], [fluid_interaction, fluid_boundary_interaction])
+    return integrator, fluid, boundary, nbx, nby, nbz, dx_spacing
+end
+
 if !CUDA_OK_D
 
     @testset "dambreak-shaped end-to-end parity (CUDA)" begin
         @info "CUDA.functional() == false — Tier 3 (dambreak parity) tests skipped" CUDA.functional()
+        @test_skip "CUDA not functional on this machine"
+    end
+
+    @testset "dambreak_3d-shaped end-to-end parity (CUDA)" begin
+        @info "CUDA.functional() == false — Tier 3 (dambreak_3d parity) tests skipped" CUDA.functional()
         @test_skip "CUDA not functional on this machine"
     end
 
@@ -154,6 +243,73 @@ else
                 @test all(x -> all(!isnan, x), f.v)
                 @test sort(getfield(f, :id)) == 1:(nfx*nfx)
                 @test all(x -> -dx <= x[1] <= xmax && -dx <= x[2] <= ymax, f.x)
+            end
+        end
+
+    end
+
+    @testset "dambreak_3d-shaped end-to-end parity (CUDA)" begin
+
+        @testset "trajectory match at 20 steps" begin
+            CUDA.allowscalar(false)
+            nfx = 4
+            integ_cpu, fluid_cpu, bnd_cpu = _t3_build_3d(nfx)
+            integ_gpu, fluid_gpu, bnd_gpu = _t3_build_3d(nfx; backend = CUDABackend())
+
+            # Warmup (h is baked into CubicSplineKernel's type, so the first
+            # call compiles the whole sweep/integrator specialisation, and
+            # this is also the first real hardware exercise of the 3D
+            # histogram/sweep/sort-key KA kernels) — excluded from the
+            # compared run.
+            time_integrate!(integ_cpu, 1, 1000, 1000, 0.05, nothing; print_timer=false)
+            time_integrate!(integ_gpu, 1, 1000, 1000, 0.05, nothing; print_timer=false)
+            integ_cpu, fluid_cpu, bnd_cpu = _t3_build_3d(nfx)
+            integ_gpu, fluid_gpu, bnd_gpu = _t3_build_3d(nfx; backend = CUDABackend())
+
+            nsteps = 20
+            time_integrate!(integ_cpu, nsteps, nsteps + 1, nsteps + 1, 0.05, nothing; print_timer=false)
+            time_integrate!(integ_gpu, nsteps, nsteps + 1, nsteps + 1, 0.05, nothing; print_timer=false)
+
+            fluid_gpu_h = adapt(Array, fluid_gpu)
+            oc = sortperm(getfield(fluid_cpu, :id))
+            og = sortperm(getfield(fluid_gpu_h, :id))
+
+            x_scale   = max(maximum(norm.(fluid_cpu.x)), 1.0)
+            v_scale   = max(maximum(norm.(fluid_cpu.v)), 1.0)
+            rho_scale = max(maximum(abs.(fluid_cpu.rho)), 1.0)
+
+            x_diff   = maximum(norm.(fluid_cpu.x[oc]   .- fluid_gpu_h.x[og]))
+            v_diff   = maximum(norm.(fluid_cpu.v[oc]   .- fluid_gpu_h.v[og]))
+            rho_diff = maximum(abs.(fluid_cpu.rho[oc] .- fluid_gpu_h.rho[og]))
+
+            @test all(!isnan, reduce(vcat, [collect(v) for v in fluid_cpu.x]))
+            @test x_diff   < 1e-9 * x_scale
+            @test v_diff   < 1e-7 * v_scale
+            @test rho_diff < 1e-7 * rho_scale
+        end
+
+        @testset "long-run physical invariants (150 steps, CPU vs GPU independently)" begin
+            CUDA.allowscalar(false)
+            nfx = 4
+            nsteps = 150
+
+            integ_cpu, fluid_cpu, bnd_cpu, nbx, nby, nbz, dx = _t3_build_3d(nfx)
+            time_integrate!(integ_cpu, nsteps, nsteps + 1, nsteps + 1, 0.05, nothing; print_timer=false)
+
+            integ_gpu, fluid_gpu, bnd_gpu, _, _, _, _ = _t3_build_3d(nfx; backend = CUDABackend())
+            time_integrate!(integ_gpu, nsteps, nsteps + 1, nsteps + 1, 0.05, nothing; print_timer=false)
+            fluid_gpu_h = adapt(Array, fluid_gpu)
+
+            xmax = nbx * dx + dx
+            ymax = nby * dx + dx
+            zmax = nbz * dx + dx
+            n_fluid = nfx * max(2, nfx ÷ 2) * nfx
+            for f in (fluid_cpu, fluid_gpu_h)
+                @test all(!isnan, f.rho) && all(!isinf, f.rho)
+                @test all(x -> all(!isnan, x), f.x)
+                @test all(x -> all(!isnan, x), f.v)
+                @test sort(getfield(f, :id)) == 1:n_fluid
+                @test all(x -> -dx <= x[1] <= xmax && -dx <= x[2] <= ymax && -dx <= x[3] <= zmax, f.x)
             end
         end
 
