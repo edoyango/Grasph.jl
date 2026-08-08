@@ -1,4 +1,4 @@
-export FluidPfn, MultiPhaseFluidPfn, StrainRatePfn, StrainRateVorticityPfn, CauchyFluidPfn, XSPHPfn, InterpolateFieldFn, FluidSolidPfn, NeighborCountFn
+export FluidPfn, StrainRatePfn, StrainRateVorticityPfn, CauchyFluidPfn, XSPHPfn, InterpolateFieldFn, FluidSolidPfn, NeighborCountFn
 
 # ---------------------------------------------------------------------------
 # Premade pairwise interaction functors

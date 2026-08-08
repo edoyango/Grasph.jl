@@ -167,10 +167,8 @@ integrator = LeapFrogTimeIntegrator(
         n_fluid, n_bottom, fluid_mass)
 
 run_driver!(
-    integrator,
-    50000,                        # number of timesteps
+    [Stage(integrator, 50000, 0.1, "run")],
     1000,                          # print frequency
     1000,                          # save frequency
-    0.1,                          # CFL coefficient
-    "gcc-3d-output/sph"
+    "gcc-3d-output/sph",
 )
