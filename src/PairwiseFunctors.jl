@@ -700,6 +700,15 @@ end
 
 """
     XSPHPfn{T}
+
+XSPH velocity adjustment: nudges each particle's velocity a fraction
+`epsilon` of the way toward the local mass-weighted mean of its neighbours'
+velocities. Grep-verified real use, both in bubble3.jl:
+  - Self-coupled (`fluid_X_interaction`, `fluid_Y_interaction`): the
+    single-system method right below.
+  - Ghost-coupled (`fluid_boundary_interaction`, system_b=`boundary_ghost`):
+    the narrowly-typed one-sided method further down. See its comment for
+    why that method exists at all — it fixes a pre-existing bug.
 """
 struct XSPHPfn{T<:AbstractFloat}
     epsilon::T
@@ -719,6 +728,17 @@ end
 
 end
 
+# Coupled generic (two-sided, fully mutual) — kept for a genuinely
+# independent real-real coupling (e.g. two distinct FluidParticleSystem
+# instances interacting mutually). Grep of bubble.jl/bubble2.jl/bubble3.jl
+# confirms no experiment script currently passes XSPHPfn as
+# `velocity_adjust_pairwise_fn` for such a pairing (bubble3.jl's
+# `fluid_XY_interaction`, the only mutual two-real-fluid interaction that
+# exists, never sets `velocity_adjust_pairwise_fn`) — but the method is
+# still correct and is the right one to fall back to if one ever does.
+#
+# It must NOT be used for ghost/virtual system_b — see the narrowly-typed
+# method below, which Julia's dispatch picks instead for that case, for why.
 @inline @Base.propagate_inbounds function (f::XSPHPfn{T})(ps_a::AbstractParticleSystem, ps_b::AbstractParticleSystem, i::Int, j::Int, dx::SVector{ND,T}, gx::SVector{ND,T}, w::T) where {ND, T<:AbstractFloat}
     vi, vj             = ps_a.v[i], ps_b.v[j]
     rho_i, rho_j       = ps_a.rho[i], ps_b.rho[j]
@@ -733,10 +753,42 @@ end
 
 end
 
-# --- One-sided `pfn_contribution` method ---
-# Self only. The coupled variant above is unused by any of the 13 experiment
-# scripts (XSPHPfn is only ever passed as `velocity_adjust_pairwise_fn`
-# alongside a self-interaction FluidPfn, e.g. bubble3.jl) — not converted.
+# Coupled generic (one-sided) — ghosts and virtual systems. Fixes a
+# pre-existing bug: every real ghost in this codebase self-references its
+# source (`GhostParticleSystem(fluid_X, ...)` — the ghost's `source` IS
+# `fluid_X`; see bubble3.jl's `boundary_ghost`), and `GhostParticleSystem`
+# doesn't own a `v_adjustment` array, so under the fully generic two-sided
+# method above `ps_b.v_adjustment[j] -= du*mass_i` falls through
+# `getproperty` straight to `ghost.source.v_adjustment[j]` — aliasing back
+# into the real system's own array, but indexed by the ghost's LOCAL index
+# j, which does not correspond to the real particle the ghost mirrors. That
+# was silently wrong (writes landing on unrelated particles) whenever
+# ghost.n < fluid.n, and out-of-bounds (heap corruption/SIGABRT) whenever
+# ghost.n > fluid.n — hit by bubble3.jl's `fluid_boundary_interaction`
+# (velocity_adjust_pairwise_fn=XSPHPfn(0.5), system_b=boundary_ghost).
+#
+# Narrowly typed (not `::AbstractParticleSystem`, matching
+# FluidPfn/CauchyFluidPfn/StrainRatePfn's equivalent methods in this file)
+# so Julia picks this one-sided method over the generic two-sided one for
+# ghost/virtual system_b. It only ever writes ps_a — never ps_b — matching
+# every other ghost-coupled pfn's convention here: ghosts/virtuals aren't
+# independently integrated, so a ps_b write is never meaningful for them
+# regardless of aliasing; there is no correct index to write to even in
+# principle.
+@inline @Base.propagate_inbounds function (f::XSPHPfn{T})(ps_a::AbstractParticleSystem, ps_b::Union{AbstractGhostParticleSystem{T,ND},VirtualParticleSystem{T,ND}}, i::Int, j::Int, dx::SVector{ND,T}, gx::SVector{ND,T}, w::T) where {ND, T<:AbstractFloat}
+    vi, vj             = ps_a.v[i], ps_b.v[j]
+    rho_i, rho_j       = ps_a.rho[i], ps_b.rho[j]
+    mass_j             = ps_b.mass
+    dv                 = vi - vj
+    epsilon            = f.epsilon
+
+    du = xsph_veladjust(epsilon, dv, rho_i, rho_j, w)
+
+    ps_a.v_adjustment[i] += du*mass_j
+
+end
+
+# --- One-sided `pfn_contribution` methods ---
 
 @inline @Base.propagate_inbounds function pfn_contribution(f::XSPHPfn{T}, ps::AbstractParticleSystem, i::Int, j::Int, dx::SVector{ND,T}, gx::SVector{ND,T}, w::T) where {ND, T<:AbstractFloat}
     vi, vj       = ps.v[i], ps.v[j]
@@ -751,6 +803,25 @@ end
 end
 
 @inline _onesided_zero_self(::XSPHPfn{T}, ps::AbstractParticleSystem{T,ND}, i) where {T,ND} =
+    (v_adjustment = zero(SVector{ND,T}),)
+
+# Coupled generic (one-sided) — ghosts and virtual systems. Mirrors the
+# mutating method of the same signature above (see its comment for the
+# aliasing bug this narrow typing avoids); `_onesided_shape` is left at its
+# default `WritesA()` since this, too, only ever writes ps_a.
+@inline @Base.propagate_inbounds function pfn_contribution(f::XSPHPfn{T}, ps_a::AbstractParticleSystem, ps_b::Union{AbstractGhostParticleSystem{T,ND},VirtualParticleSystem{T,ND}}, i::Int, j::Int, dx::SVector{ND,T}, gx::SVector{ND,T}, w::T) where {ND, T<:AbstractFloat}
+    vi, vj       = ps_a.v[i], ps_b.v[j]
+    rho_i, rho_j = ps_a.rho[i], ps_b.rho[j]
+    mass_j       = ps_b.mass
+    dv           = vi - vj
+    epsilon      = f.epsilon
+
+    du = xsph_veladjust(epsilon, dv, rho_i, rho_j, w)
+
+    return (v_adjustment = du * mass_j,)
+end
+
+@inline _onesided_zero_coupled(::XSPHPfn{T}, ps_a::AbstractParticleSystem{T,ND}, ::Union{AbstractGhostParticleSystem{T,ND},VirtualParticleSystem{T,ND}}, i) where {T,ND} =
     (v_adjustment = zero(SVector{ND,T}),)
 
 """

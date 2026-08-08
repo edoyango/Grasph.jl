@@ -541,6 +541,156 @@ end
     end
 end
 
+# ---------------------------------------------------------------------------
+# 7b. XSPHPfn ghost-coupled regression — the aliasing-bug fix.
+#
+# XSPHPfn's coupled mutating method used to have only a fully generic/mutual
+# form (`ps_b::AbstractParticleSystem`, writing `ps_b.v_adjustment[j] -=
+# du*mass_i`). That is wrong whenever `ps_b` is a *self-referencing* ghost
+# (`GhostParticleSystem(fluid, ...)` with `ghost.source === fluid` — the
+# only pattern that exists anywhere in this codebase; see bubble3.jl's
+# `boundary_ghost`): `GhostParticleSystem` does not own a `v_adjustment`
+# array, so `ps_b.v_adjustment[j]` falls through `Base.getproperty` straight
+# to `ghost.source.v_adjustment[j]` — i.e. it aliases back into the real
+# fluid's own array, but indexed by the ghost's LOCAL index `j`, which does
+# not correspond to the real particle the ghost mirrors. Silently wrong
+# writes when `ghost.n < fluid.n`; out-of-bounds heap corruption when
+# `ghost.n > fluid.n`. Fixed by adding a narrowly-typed
+# `Union{AbstractGhostParticleSystem{T,ND}, VirtualParticleSystem{T,ND}}`
+# overload (matching FluidPfn/CauchyFluidPfn/StrainRatePfn's existing
+# convention in this file) that only ever writes `ps_a`, which Julia's
+# dispatch picks over the generic two-sided method for ghost/virtual `ps_b`.
+# See the comment above that method in src/PairwiseFunctors.jl for the full
+# mechanism.
+#
+# This exercises the fix (coloured sweep) and its `pfn_contribution`
+# counterpart (onesided=true sweep) against each other, using a REAL
+# self-referencing ghost — the only pattern that would have caught the
+# original bug — built standalone (not through the integrator loop) via
+# generate_ghosts!/sort_particles!/update_ghost_kinematics!/update_ghost!,
+# cribbed from test_ghost_particles.jl, in the exact order
+# TimeIntegration.jl's `_prepare_grids!` uses: sort the REAL system first
+# (so `idx_original` indexes the final fluid ordering), THEN
+# generate_ghosts! from that ordering, THEN sort the ghost itself.
+#
+# Two geometries, both mirroring bubble3.jl's `boundary_ghost` (all 4 walls
+# + 4 corners, `GhostCopier(:p)`, `h = 1.2*dx`, boundary cutoff `= 3h`):
+#   - "tight": box comparable in size to the boundary cutoff, so every fluid
+#     particle qualifies as a ghost source for every one of the 8
+#     boundaries -> ghost.n > fluid.n, the regime that produced heap
+#     corruption / SIGABRT before the fix.
+#   - "realistic": a much larger box relative to the same cutoff, so only a
+#     thin boundary layer of particles produces ghosts -> ghost.n
+#     comfortably < fluid.n, closer to bubble3.jl's actual proportions.
+# ---------------------------------------------------------------------------
+
+function _xsph_ghost_fluid(rng, nx, ny, dx)
+    n = nx * ny
+    fluid = FluidParticleSystem("fluid", n, 2, 1.0, 10.0; source_v = zeros(2))
+    k = 1
+    for i in 0:nx-1, j in 0:ny-1
+        fluid.x[k] = SVector((i + 0.5) * dx, (j + 0.5) * dx)
+        fluid.v[k] = SVector(0.2 * (rand(rng) - 0.5), 0.2 * (rand(rng) - 0.5))
+        k += 1
+    end
+    fluid.rho .= 1000.0 .+ 20 .* (rand(rng, n) .- 0.5)
+    fluid.p   .= 100.0 .* rand(rng, n)
+    fill!(fluid.dvdt, zero(SVector{2,Float64})); fluid.drhodt .= 0.0
+    fill!(fluid.v_adjustment, zero(SVector{2,Float64}))
+    return fluid
+end
+
+# Standalone build of a REAL self-referencing ghost (ghost.source === fluid)
+# mirroring bubble3.jl's boundary_ghost/boundary_ghost_entry: all 4 walls +
+# 4 corners of a [0,Lx]x[0,Ly] box, GhostCopier(:p). Ordering matches
+# TimeIntegration.jl's `_prepare_grids!`/stage loop exactly: sort the real
+# system first, THEN generate_ghosts!, THEN sort the ghost, THEN
+# update_ghost_kinematics! (v, rho), THEN update_ghost! (stage 1: p).
+function _xsph_ghost_setup!(fluid, sweep_cutoff, boundary_cutoff, Lx, Ly)
+    fp, fk, fs = _sortbufs(fluid)
+    sort_particles!(fluid, sweep_cutoff, fp, fk, fs)
+
+    ghost = GhostParticleSystem(fluid, GhostCopier(:p); name="ghost[$(fluid.name)]")
+    entry = GhostEntry(ghost, boundary_cutoff,
+        (SVector( 1.0,  0.0),            SVector(0.0, 0.0)),   # left wall
+        (SVector(-1.0,  0.0),            SVector(Lx,  0.0)),   # right wall
+        (SVector( 0.0,  1.0),            SVector(0.0, 0.0)),   # bottom wall
+        (SVector( 0.0, -1.0),            SVector(0.0, Ly)),    # top wall
+        (SVector( 1.0,  1.0)/sqrt(2.0),  SVector(0.0, 0.0)),   # bottom-left corner
+        (SVector(-1.0,  1.0)/sqrt(2.0),  SVector(Lx,  0.0)),   # bottom-right corner
+        (SVector( 1.0, -1.0)/sqrt(2.0),  SVector(0.0, Ly)),    # top-left corner
+        (SVector(-1.0, -1.0)/sqrt(2.0),  SVector(Lx,  Ly)),    # top-right corner
+    )
+    generate_ghosts!(entry)
+
+    gp, gk, gs = _sortbufs(ghost)
+    sort_particles!(ghost, sweep_cutoff, gp, gk, gs)
+
+    update_ghost_kinematics!(entry)
+    update_ghost!(ghost, 1)
+
+    return ghost
+end
+
+# Runs the coloured sweep (fixed one-sided mutating method) on fluid_old and
+# the onesided=true sweep (new pfn_contribution) on fluid_new — each against
+# its OWN self-referencing ghost, built from otherwise-identical starting
+# state — then diffs v_adjustment. Returns ghost.n for the geometry asserts.
+function _compare_xsph_ghost(fluid_old, fluid_new, kernel, boundary_cutoff, Lx, Ly)
+    sweep_cutoff = kernel.interaction_length
+    ghost_old = _xsph_ghost_setup!(fluid_old, sweep_cutoff, boundary_cutoff, Lx, Ly)
+    ghost_new = _xsph_ghost_setup!(fluid_new, sweep_cutoff, boundary_cutoff, Lx, Ly)
+    @test ghost_old.n == ghost_new.n   # identical starting state -> identical ghost geometry
+
+    pfn = XSPHPfn(0.5)
+    si_old = SystemInteraction(kernel, pfn, fluid_old, ghost_old)                 # coloured
+    si_new = SystemInteraction(kernel, pfn, fluid_new, ghost_new; onesided=true)  # onesided
+
+    create_grid!(si_old); sweep!(si_old)
+    create_grid!(si_new); sweep!(si_new)
+
+    # Sanity: the sweep actually produced non-vacuous output — otherwise the
+    # diff check below would pass trivially (both all-zero).
+    @test any(v -> norm(v) > 0, fluid_old.v_adjustment)
+
+    va, vb = fluid_old.v_adjustment, fluid_new.v_adjustment
+    @test _elemdiff(va, vb) < 1e-9 * _elemscale(va)
+
+    return ghost_old.n
+end
+
+@testset "onesided=true XSPHPfn ghost-coupled (self-referencing ghost) matches coloured sweep — aliasing-bug regression" begin
+    @testset "tight geometry: ghost.n > fluid.n (crashed pre-fix)" begin
+        rng = MersenneTwister(70)
+        nx, ny, dx = 3, 3, 0.1
+        h  = 1.2 * dx
+        Lx, Ly = nx * dx, ny * dx
+        boundary_cutoff = 3.0 * h
+        kernel = CubicSplineKernel(h; ndims=2)
+
+        fluid_base = _xsph_ghost_fluid(rng, nx, ny, dx)
+        fluid_old, fluid_new = deepcopy(fluid_base), deepcopy(fluid_base)
+
+        ghost_n = _compare_xsph_ghost(fluid_old, fluid_new, kernel, boundary_cutoff, Lx, Ly)
+        @test ghost_n > fluid_old.n   # the regime that produced heap corruption pre-fix
+    end
+
+    @testset "realistic geometry: ghost.n comfortably < fluid.n" begin
+        rng = MersenneTwister(71)
+        nx, ny, dx = 50, 40, 0.02
+        h  = 1.2 * dx
+        Lx, Ly = nx * dx, ny * dx
+        boundary_cutoff = 3.0 * h
+        kernel = CubicSplineKernel(h; ndims=2)
+
+        fluid_base = _xsph_ghost_fluid(rng, nx, ny, dx)
+        fluid_old, fluid_new = deepcopy(fluid_base), deepcopy(fluid_base)
+
+        ghost_n = _compare_xsph_ghost(fluid_old, fluid_new, kernel, boundary_cutoff, Lx, Ly)
+        @test ghost_n < fluid_old.n ÷ 2   # comfortably fewer ghosts than fluid particles
+    end
+end
+
 @testset "onesided=true FluidPfn ghost/virtual + dynamic-boundary variants match coloured sweep" begin
     rng = MersenneTwister(34)
     pfn = FluidPfn(0.03, 0.0, 0.08)
