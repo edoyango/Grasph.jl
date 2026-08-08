@@ -1,7 +1,7 @@
 using Test
 using Grasph
 using StaticArrays
-using LinearAlgebra: norm
+using LinearAlgebra: norm, dot
 using Random
 
 # ---------------------------------------------------------------------------
@@ -548,4 +548,156 @@ end
         _compare_coupled_generic(rng, pfn, _random_fluid, _as_virtual_fluid, (:dvdt, :drhodt), 300, 200, ndims)
         _compare_coupled_generic(rng, pfn, _random_fluid, _dynamic_boundary, (:dvdt, :drhodt), 300, 200, ndims)
     end
+end
+
+# ---------------------------------------------------------------------------
+# 8. Phase 2: reverse-sweep infrastructure ("writes into system_b")
+#
+# _onesided_shape(pfn, ps_a, ps_b) selects which of two independent sweep
+# passes runs for a coupled onesided interaction: the existing forward pass
+# (writes system_a, WritesA() — the default, exercised by every test above)
+# and the new reverse pass (writes system_b, WritesB()), or both
+# (WritesBoth()). The reverse pass is brand-new infrastructure with no
+# existing coloured-sweep counterpart to compare against, so it's validated
+# here against a brute-force O(n^2) reference that calls the exact same
+# pfn_contribution formula directly (no cell list) — this tests that the new
+# sweep function finds the same pairs and writes them to the same place as
+# an independent, cell-list-free computation.
+# ---------------------------------------------------------------------------
+
+# Shared test-only formula: writes into "ps_a"'s slot (the pfn_contribution
+# write-target position) as a function of ps_a's own rho/v at i and ps_b's
+# mass at j. Fully symmetric in role, not tied to which real system is which,
+# so the same method backs both a WritesB()-only pfn (isolating the reverse
+# pass) and a WritesBoth() pfn (exercising the dispatcher's "run both" arm).
+@inline _test_pfn_contribution(ps_a, ps_b, i, j, dx, gx, w) =
+    (dvdt = (ps_b.mass * w / ps_a.rho[i]) * gx, drhodt = ps_b.mass * dot(gx, ps_a.v[i]))
+@inline _test_pfn_zero(ps_a, i) = (dvdt = zero(eltype(ps_a.dvdt)), drhodt = zero(eltype(ps_a.drhodt)))
+
+struct _ReverseOnlyTestPfn end
+Grasph._onesided_shape(::_ReverseOnlyTestPfn, ps_a, ps_b) = Grasph.WritesB()
+@inline Grasph.pfn_contribution(::_ReverseOnlyTestPfn, ps_a, ps_b, i::Int, j::Int, dx::SVector, gx::SVector, w) =
+    _test_pfn_contribution(ps_a, ps_b, i, j, dx, gx, w)
+@inline Grasph._onesided_zero_coupled(::_ReverseOnlyTestPfn, ps_a, ps_b, i) = _test_pfn_zero(ps_a, i)
+
+struct _MutualTestPfn end
+Grasph._onesided_shape(::_MutualTestPfn, ps_a, ps_b) = Grasph.WritesBoth()
+@inline Grasph.pfn_contribution(::_MutualTestPfn, ps_a, ps_b, i::Int, j::Int, dx::SVector, gx::SVector, w) =
+    _test_pfn_contribution(ps_a, ps_b, i, j, dx, gx, w)
+@inline Grasph._onesided_zero_coupled(::_MutualTestPfn, ps_a, ps_b, i) = _test_pfn_zero(ps_a, i)
+
+# Brute-force O(n^2) reference for the contribution written into ps_b, using
+# the exact dx/gx/w formula _pair_coupled_onesided! computes, but with no
+# cell list involved at all — an independent check on which pairs the new
+# reverse-sweep grid scan finds.
+function _brute_force_reverse(pfn, ps_a, ps_b, kernel)
+    cutoff_sq = kernel.interaction_length^2
+    h = kernel.h
+    dvdt   = [zero(eltype(ps_b.dvdt)) for _ in 1:ps_b.n]
+    drhodt = zeros(ps_b.n)
+    for j in 1:ps_b.n, i in 1:ps_a.n
+        dx = ps_b.x[j] - ps_a.x[i]
+        r_sq = dot(dx, dx)
+        r_sq >= cutoff_sq && continue
+        r = sqrt(r_sq)
+        q = r / h
+        gx = (Grasph.kernel_dw_dq(kernel, q) / (r * h)) * dx
+        w  = Grasph.kernel_w(kernel, q)
+        c = Grasph.pfn_contribution(pfn, ps_b, ps_a, j, i, dx, gx, w)
+        dvdt[j]   += c.dvdt
+        drhodt[j] += c.drhodt
+    end
+    return dvdt, drhodt
+end
+
+@testset "onesided=true reverse sweep (WritesB) writes into system_b, matches brute force" begin
+    rng = MersenneTwister(40)
+    pfn = _ReverseOnlyTestPfn()
+    for ndims in (2, 3)
+        h = 0.08
+        kernel = CubicSplineKernel(h; ndims=ndims)
+        cutoff = kernel.interaction_length
+        ps_a = _random_fluid(rng, 250, ndims; L=1.0)
+        ps_b = _random_fluid(rng, 180, ndims; L=1.0)
+
+        si = SystemInteraction(kernel, pfn, ps_a, ps_b; onesided=true)
+        pa, ka_, sa = _sortbufs(ps_a)
+        sort_particles!(ps_a, cutoff, pa, ka_, sa)
+        pb, kb, sb = _sortbufs(ps_b)
+        sort_particles!(ps_b, cutoff, pb, kb, sb)
+        create_grid!(si)
+        sweep!(si)
+
+        expected_dvdt, expected_drhodt = _brute_force_reverse(pfn, ps_a, ps_b, kernel)
+
+        @test maximum(norm.(ps_b.dvdt .- expected_dvdt))    < 1e-9 * max(maximum(norm.(expected_dvdt)), 1.0)
+        @test maximum(abs.(ps_b.drhodt .- expected_drhodt)) < 1e-9 * max(maximum(abs.(expected_drhodt)), 1.0)
+        # A pure WritesB() pfn must leave system_a completely untouched.
+        @test all(==(zero(SVector{ndims,Float64})), ps_a.dvdt)
+        @test all(==(0.0), ps_a.drhodt)
+    end
+end
+
+@testset "onesided=true reverse sweep (WritesB) matches brute force — cell-boundary-adjacent positions" begin
+    # Duplicate of "self sweep matches coloured sweep — cell-boundary-adjacent
+    # positions" above, but coupled: system_a and system_b particles are both
+    # snapped onto/near cell boundaries so this is the first exercise of
+    # _cell_start_a as a multi-cell contiguous strip
+    # (cell_start_a[c]..cell_start_a[c+3]-1) rather than a single cell, in
+    # every neighbour-offset direction the full-stencil scan must cover.
+    h = 0.1
+    kernel = CubicSplineKernel(h; ndims=2)
+    cutoff = kernel.interaction_length
+    pfn = _ReverseOnlyTestPfn()
+
+    ps_a = FluidParticleSystem("fluid_a", 9, 2, 1.0, 10.0; source_v = zeros(2))
+    ps_b = FluidParticleSystem("fluid_b", 9, 2, 1.0, 10.0; source_v = zeros(2))
+    k = 1
+    for gi in -1:1, gj in -1:1
+        x = SVector((gi + 0.5) * cutoff * 0.99, (gj + 0.5) * cutoff * 0.99)
+        ps_a.x[k] = x
+        ps_b.x[k] = x + SVector(0.01 * cutoff, -0.01 * cutoff)
+        k += 1
+    end
+    for ps in (ps_a, ps_b)
+        fill!(ps.v, zero(SVector{2,Float64}))
+        ps.rho .= 1000.0; ps.p .= 50.0
+        fill!(ps.dvdt, zero(SVector{2,Float64})); ps.drhodt .= 0.0
+    end
+
+    si = SystemInteraction(kernel, pfn, ps_a, ps_b; onesided=true)
+    pa, ka_, sa = _sortbufs(ps_a)
+    sort_particles!(ps_a, cutoff, pa, ka_, sa)
+    pb, kb, sb = _sortbufs(ps_b)
+    sort_particles!(ps_b, cutoff, pb, kb, sb)
+    create_grid!(si)
+    sweep!(si)
+
+    expected_dvdt, expected_drhodt = _brute_force_reverse(pfn, ps_a, ps_b, kernel)
+    @test maximum(norm.(ps_b.dvdt .- expected_dvdt))    < 1e-12
+    @test maximum(abs.(ps_b.drhodt .- expected_drhodt)) < 1e-9
+end
+
+@testset "onesided=true reverse sweep (WritesBoth) writes into both systems" begin
+    rng = MersenneTwister(41)
+    pfn = _MutualTestPfn()
+    h = 0.08
+    kernel = CubicSplineKernel(h; ndims=2)
+    cutoff = kernel.interaction_length
+    ps_a = _random_fluid(rng, 200, 2; L=1.0)
+    ps_b = _random_fluid(rng, 150, 2; L=1.0)
+
+    si = SystemInteraction(kernel, pfn, ps_a, ps_b; onesided=true)
+    pa, ka_, sa = _sortbufs(ps_a)
+    sort_particles!(ps_a, cutoff, pa, ka_, sa)
+    pb, kb, sb = _sortbufs(ps_b)
+    sort_particles!(ps_b, cutoff, pb, kb, sb)
+    create_grid!(si)
+    sweep!(si)
+
+    expected_b_dvdt, expected_b_drhodt = _brute_force_reverse(pfn, ps_a, ps_b, kernel)
+    @test maximum(norm.(ps_b.dvdt .- expected_b_dvdt))    < 1e-9 * max(maximum(norm.(expected_b_dvdt)), 1.0)
+    @test maximum(abs.(ps_b.drhodt .- expected_b_drhodt)) < 1e-9 * max(maximum(abs.(expected_b_drhodt)), 1.0)
+    # The forward pass must ALSO have run and written non-vacuously into system_a.
+    @test any(v -> norm(v) > 0, ps_a.dvdt)
 end

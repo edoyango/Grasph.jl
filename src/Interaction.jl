@@ -367,9 +367,35 @@ end
 _sweep_mode!(::ColouredCPU, si, ::Nothing, pfn) = _sweep_self!(si, pfn)
 _sweep_mode!(::ColouredCPU, si, system_b, pfn)  = _sweep_coupled!(si, system_b, pfn)
 _sweep_mode!(::OnesidedCPU, si, ::Nothing, pfn) = _sweep_self_onesided!(si, pfn)
-_sweep_mode!(::OnesidedCPU, si, system_b, pfn)  = _sweep_coupled_onesided!(si, system_b, pfn)
+_sweep_mode!(::OnesidedCPU, si, system_b, pfn)  = _sweep_coupled_onesided_dispatch!(_onesided_shape(pfn, si.system_a, system_b), si, system_b, pfn)
 _sweep_mode!(::OnesidedKA,  si, ::Nothing, pfn) = _sweep_self_ka!(si, pfn)
 _sweep_mode!(::OnesidedKA,  si, system_b, pfn)  = _sweep_coupled_ka!(si, system_b, pfn)
+
+# ---------------------------------------------------------------------------
+# One-sided coupled write-direction trait
+#
+# Mutual-ness is a property of the (pfn, system_a, system_b) triple, not the
+# pfn alone: e.g. FluidPfn is mutual against another FluidParticleSystem but
+# one-sided (writes only system_a) against a boundary or ghost system. Every
+# pfn defaults to WritesA() (today's only one-sided shape); pfns that also
+# need to write into system_b (or both) override this narrowly for the
+# specific system-type combination it applies to.
+# ---------------------------------------------------------------------------
+
+abstract type OnesidedShape end
+struct WritesA    <: OnesidedShape end   # forward pass only: writes system_a (today's existing behaviour)
+struct WritesB    <: OnesidedShape end   # reverse pass only: writes system_b
+struct WritesBoth <: OnesidedShape end   # both passes: writes system_a and system_b
+
+@inline _onesided_shape(pfn, ps_a, ps_b) = WritesA()
+
+_sweep_coupled_onesided_dispatch!(::WritesA, si, system_b, pfn) = _sweep_coupled_onesided!(si, system_b, pfn)
+_sweep_coupled_onesided_dispatch!(::WritesB, si, system_b, pfn) = _sweep_coupled_onesided_reverse!(si, system_b, pfn)
+function _sweep_coupled_onesided_dispatch!(::WritesBoth, si, system_b, pfn)
+    _sweep_coupled_onesided!(si, system_b, pfn)
+    _sweep_coupled_onesided_reverse!(si, system_b, pfn)
+    nothing
+end
 
 adjust_v!(si::SystemInteraction) = _sweep_pfns!(si, si.system_b, (si.vadjust_pfn,), 1)
 
@@ -1016,5 +1042,84 @@ function _sweep_coupled_onesided!(si::SystemInteraction{T,3}, ps_b, pfn::PFN) wh
             end
         end
         _onesided_writeback_coupled!(pfn, ps_a, ps_b, i, acc)
+    end
+end
+
+# --- coupled interaction, particle-parallel, reverse pass (writes into system_b) ---
+#
+# Mirrors _sweep_coupled_onesided! with system_a/system_b's roles swapped:
+# iterates system_b in parallel, scans _cell_start_a (system_a's cell list,
+# already built unconditionally by _create_grid_impl! against the same shared
+# grid — _mingridx/_ngridx/_cell_size are common to both cell lists) for
+# system_a neighbours, and writes only into system_b.
+#
+# Reuses _pair_coupled_onesided!/_onesided_zero_coupled/_onesided_writeback_coupled!
+# unchanged by passing system_b in the "ps_a" (self/write-target) position and
+# system_a in the "ps_b" (neighbour) position — pfn_contribution then sees
+# (pfn, system_b, system_a, j, i, dx, gx, w) with dx = xb[j] - xa[i], the
+# correct sign for a contribution centred on system_b's particle j.
+
+function _sweep_coupled_onesided_reverse!(si::SystemInteraction{T,2}, ps_b, ::Nothing) where {T}
+end
+function _sweep_coupled_onesided_reverse!(si::SystemInteraction{T,3}, ps_b, ::Nothing) where {T}
+end
+
+function _sweep_coupled_onesided_reverse!(si::SystemInteraction{T,2}, ps_b, pfn::PFN) where {T,PFN}
+    ps_a         = si.system_a
+    kernel       = si.kernel
+    h            = T(kernel.h)
+    cutoff_sq    = si._cell_size * si._cell_size
+    cell_start_a = si._cell_start_a::AbstractVector{Int}
+    n_cells_y    = Int(si._ngridx[2])
+    mingridx     = si._mingridx
+    cutoff       = si._cell_size
+    ngridx       = si._ngridx
+    val_ndims    = Val{2}()
+    n            = ps_b.n
+
+    @inbounds @batch for j in 1:n
+        cell_idx = _cell_1idx(ps_b.x[j], mingridx, cutoff, ngridx, val_ndims)
+        acc = _onesided_zero_coupled(pfn, ps_b, ps_a, j)
+        for dx_cell in -1:1
+            neighbour_cell_idx = cell_idx + dx_cell * n_cells_y - 1
+            pstart = cell_start_a[neighbour_cell_idx]
+            pend   = cell_start_a[neighbour_cell_idx + 3]
+            for i in pstart:pend-1
+                acc = _pair_coupled_onesided!(pfn, ps_b, ps_a, j, i, kernel, h, cutoff_sq, val_ndims, acc)
+            end
+        end
+        _onesided_writeback_coupled!(pfn, ps_b, ps_a, j, acc)
+    end
+end
+
+function _sweep_coupled_onesided_reverse!(si::SystemInteraction{T,3}, ps_b, pfn::PFN) where {T,PFN}
+    ps_a         = si.system_a
+    kernel       = si.kernel
+    h            = T(kernel.h)
+    cutoff_sq    = si._cell_size * si._cell_size
+    cell_start_a = si._cell_start_a::AbstractVector{Int}
+    n_cells_z    = Int(si._ngridx[3])
+    n_cells_y    = Int(si._ngridx[2])
+    n_cells_yz   = n_cells_y * n_cells_z
+    mingridx     = si._mingridx
+    cutoff       = si._cell_size
+    ngridx       = si._ngridx
+    val_ndims    = Val{3}()
+    n            = ps_b.n
+
+    @inbounds @batch for j in 1:n
+        cell_idx = _cell_1idx(ps_b.x[j], mingridx, cutoff, ngridx, val_ndims)
+        acc = _onesided_zero_coupled(pfn, ps_b, ps_a, j)
+        for dx_cell in -1:1
+            for dy_cell in -1:1
+                neighbour_cell_idx = cell_idx + dx_cell * n_cells_yz + dy_cell * n_cells_z - 1
+                pstart = cell_start_a[neighbour_cell_idx]
+                pend   = cell_start_a[neighbour_cell_idx + 3]
+                for i in pstart:pend-1
+                    acc = _pair_coupled_onesided!(pfn, ps_b, ps_a, j, i, kernel, h, cutoff_sq, val_ndims, acc)
+                end
+            end
+        end
+        _onesided_writeback_coupled!(pfn, ps_b, ps_a, j, acc)
     end
 end
