@@ -801,3 +801,174 @@ end
         _compare_coupled_sweep_writes_b(rng, pfn, _random_fluid, _random_probe_nbr, (:nbr_count,), 300, 200, ndims)
     end
 end
+
+# ---------------------------------------------------------------------------
+# 10. Phase 4: coupled real-real `WritesBoth` pairs — `FluidPfn` fluid-fluid
+#    (e.g. bubble2.jl/bubble3.jl's two-phase coupling) and `FluidSolidPfn`
+#    fluid-solid (DambreakWall.jl's fluid<->wall coupling). Both mutate TWO
+#    real systems from a single interaction (`_onesided_shape = WritesBoth()`
+#    — forward pass writes system_a, reverse pass writes system_b), so
+#    neither existing coupled harness is sufficient on its own:
+#    `_compare_coupled_generic` only diffs system_a's fields,
+#    `_compare_coupled_sweep_writes_b` only diffs system_b's. A wrong-side
+#    bug confined to just one pass (e.g. the reverse pass silently reusing
+#    the forward pass's formula) would be invisible to either alone. The new
+#    harness below diffs both systems' fields between a coloured-sweep pair
+#    and a onesided-sweep pair built from deepcopy'd starting state.
+#
+#    Fixtures deliberately avoid `_random_boundary`'s degenerate uniform-rho/
+#    zero-v case (see this file's header note): both the fluid and solid/
+#    fluid-2 fixtures below carry non-uniform rho, nonzero v, and distinct
+#    mass/c per system, so a bug that reads the wrong side's value doesn't
+#    silently cancel out (e.g. under equal sound speeds, artificial viscosity
+#    and delta-SPH diffusion terms degenerate in ways that can mask exactly
+#    this class of bug).
+# ---------------------------------------------------------------------------
+
+function _random_fluid_mc(rng, n, ndims, mass, c; L=1.0)
+    ps = FluidParticleSystem("fluid", n, ndims, mass, c; source_v = zeros(ndims))
+    for i in 1:n
+        ps.x[i] = SVector(ntuple(_ -> L * rand(rng), ndims)...)
+        ps.v[i] = SVector(ntuple(_ -> 0.2 * (rand(rng) - 0.5), ndims)...)
+    end
+    ps.rho .= 1000.0 .+ 20 .* (rand(rng, n) .- 0.5)
+    ps.p   .= 100.0 .* rand(rng, n)
+    fill!(ps.dvdt, zero(SVector{ndims,Float64}))
+    ps.drhodt .= 0.0
+    return ps
+end
+
+# Two distinct real fluid phases (distinct mass/c) — mirrors bubble2.jl/
+# bubble3.jl's `fluid_X`/`fluid_Y`.
+_random_fluid_a(rng, n, ndims; L=1.0) = _random_fluid_mc(rng, n, ndims, 1.3, 12.0; L=L)
+_random_fluid_b(rng, n, ndims; L=1.0) = _random_fluid_mc(rng, n, ndims, 0.7, 18.0; L=L)
+
+# A real solid/wall system: non-uniform rho, nonzero v, distinct mass/c from
+# either fluid fixture above, and a nonzero *own* pressure field — the own
+# pressure is set here (rather than left at 0, which would make a bug that
+# reads it indistinguishable from correct code) precisely so the dedicated
+# pressure-invariance test below has something non-vacuous to vary.
+function _random_wall(rng, n, ndims; L=1.0, ns = ndims == 2 ? 3 : 6, mass=2.5, c=25.0)
+    ps = ElastoPlasticParticleSystem("wall", n, ndims, ns, mass, c)
+    for i in 1:n
+        ps.x[i]      = SVector(ntuple(_ -> L * rand(rng), ndims)...)
+        ps.v[i]      = SVector(ntuple(_ -> 0.2 * (rand(rng) - 0.5), ndims)...)
+        ps.stress[i] = SVector(ntuple(_ -> 50.0 * (rand(rng) - 0.5), ns)...)
+    end
+    ps.rho .= 2400.0 .+ 30 .* (rand(rng, n) .- 0.5)
+    ps.p   .= 100.0 .* rand(rng, n)
+    fill!(ps.dvdt, zero(SVector{ndims,Float64})); ps.drhodt .= 0.0
+    fill!(ps.strain_rate, zero(eltype(ps.strain_rate)))
+    fill!(ps.vorticity, zero(eltype(ps.vorticity)))
+    return ps
+end
+
+# WritesBoth-aware coupled comparison harness: builds a coloured-sweep pair
+# and a onesided-sweep pair from deepcopy'd starting state, sorts+grids+
+# sweeps both, then diffs BOTH system_a's and system_b's accumulator fields
+# between the two sweeps.
+function _compare_coupled_writesboth(rng, pfn, build_a, build_b, fields_a, fields_b, n_a, n_b, ndims; L=1.0, h=0.08)
+    kernel = CubicSplineKernel(h; ndims=ndims)
+    cutoff = kernel.interaction_length
+
+    a_old = build_a(rng, n_a, ndims; L=L)
+    b_old = build_b(rng, n_b, ndims; L=L)
+    a_new = deepcopy(a_old)
+    b_new = deepcopy(b_old)
+
+    si_old = SystemInteraction(kernel, pfn, a_old, b_old)
+    si_new = SystemInteraction(kernel, pfn, a_new, b_new; onesided=true)
+
+    for (a, b, si) in ((a_old, b_old, si_old), (a_new, b_new, si_new))
+        pa, ka_, sa = _sortbufs(a)
+        sort_particles!(a, cutoff, pa, ka_, sa)
+        pb, kb, sb = _sortbufs(b)
+        sort_particles!(b, cutoff, pb, kb, sb)
+        create_grid!(si)
+        sweep!(si)
+    end
+
+    for f in fields_a
+        va, vb = getproperty(a_old, f), getproperty(a_new, f)
+        @test _elemdiff(va, vb) < 1e-9 * _elemscale(va)
+    end
+    for f in fields_b
+        va, vb = getproperty(b_old, f), getproperty(b_new, f)
+        @test _elemdiff(va, vb) < 1e-9 * _elemscale(va)
+    end
+end
+
+@testset "onesided=true FluidPfn fluid-fluid (WritesBoth) matches coloured sweep" begin
+    rng = MersenneTwister(60)
+    # epsilon=0.1 (matching bubble3.jl's fluid_XY_interaction) exercises the
+    # artificial-surface-tension term the WritesBoth method includes.
+    pfn = FluidPfn(0.03, 0.0, 0.08; epsilon=0.1)
+    for ndims in (2, 3)
+        _compare_coupled_writesboth(rng, pfn, _random_fluid_a, _random_fluid_b, (:dvdt, :drhodt), (:dvdt, :drhodt), 250, 200, ndims)
+    end
+end
+
+@testset "onesided=true FluidSolidPfn fluid-solid (WritesBoth) matches coloured sweep" begin
+    rng = MersenneTwister(61)
+    pfn = FluidSolidPfn(0.03, 0.0, 0.08)
+    for ndims in (2, 3)
+        _compare_coupled_writesboth(rng, pfn, _random_fluid_a, _random_wall, (:dvdt, :drhodt), (:dvdt, :drhodt), 250, 150, ndims)
+    end
+end
+
+# The single most important test in this phase: FluidSolidPfn's whole design
+# point is that pressure must be continuous across the fluid-solid interface,
+# i.e. the FLUID's pressure is used for both sides of the force and the
+# solid's own pressure must never appear in the formula (see the comment
+# above the WritesBoth methods in src/PairwiseFunctors.jl). None of the
+# generic comparison tests above can catch a bug that reads the wrong side's
+# pressure consistently in both the coloured and onesided code paths, because
+# they compare a call against itself in the same orientation — a
+# `ps_a.p[i]`-vs-`ps_b.p[j]` mixup would reproduce identically on both sides
+# of that comparison. This test instead varies ONLY the solid's own pressure
+# field between two otherwise-identical runs against the SAME fluid system,
+# and asserts the outputs are bit-for-bit-at-roundoff identical — a leak of
+# the solid's own pressure into the force would make them differ.
+@testset "onesided=true FluidSolidPfn: solid's own pressure never leaks into the force (regression)" begin
+    rng = MersenneTwister(62)
+    pfn = FluidSolidPfn(0.03, 0.0, 0.08)
+    for ndims in (2, 3)
+        h = 0.08
+        kernel = CubicSplineKernel(h; ndims=ndims)
+        cutoff = kernel.interaction_length
+
+        fluid_base = _random_fluid_a(rng, 200, ndims)
+        wall_base  = _random_wall(rng, 150, ndims)
+
+        fluid1, wall1 = deepcopy(fluid_base), deepcopy(wall_base)
+        fluid2, wall2 = deepcopy(fluid_base), deepcopy(wall_base)
+
+        # Two arbitrary, distinct, non-vacuous own-pressure fields for the
+        # solid. Per FluidSolidPfn's contract neither should ever reach the
+        # force computation.
+        wall1.p .= 37.0 .+ 5.0  .* (1:wall1.n)
+        wall2.p .= -400.0 .- 11.0 .* (1:wall2.n)
+
+        si1 = SystemInteraction(kernel, pfn, fluid1, wall1; onesided=true)
+        si2 = SystemInteraction(kernel, pfn, fluid2, wall2; onesided=true)
+
+        for (f, w, si) in ((fluid1, wall1, si1), (fluid2, wall2, si2))
+            pf, kf, sf = _sortbufs(f)
+            sort_particles!(f, cutoff, pf, kf, sf)
+            pw, kw, sw = _sortbufs(w)
+            sort_particles!(w, cutoff, pw, kw, sw)
+            create_grid!(si)
+            sweep!(si)
+        end
+
+        # Sanity: the sweep actually produced non-vacuous output — otherwise
+        # the equality checks below would pass trivially (both all-zero).
+        @test any(v -> norm(v) > 0, fluid1.dvdt)
+        @test any(v -> norm(v) > 0, wall1.dvdt)
+
+        @test maximum(norm.(fluid1.dvdt   .- fluid2.dvdt))   < 1e-12 * max(maximum(norm.(fluid1.dvdt)), 1.0)
+        @test maximum(abs.(fluid1.drhodt .- fluid2.drhodt))  < 1e-12 * max(maximum(abs.(fluid1.drhodt)), 1.0)
+        @test maximum(norm.(wall1.dvdt    .- wall2.dvdt))    < 1e-12 * max(maximum(norm.(wall1.dvdt)), 1.0)
+        @test maximum(abs.(wall1.drhodt  .- wall2.drhodt))   < 1e-12 * max(maximum(abs.(wall1.drhodt)), 1.0)
+    end
+end

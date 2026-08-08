@@ -449,6 +449,39 @@ end
 @inline _onesided_zero_coupled(::FluidPfn{S,D,E,T}, ::AbstractParticleSystem{T,ND}, ::DynamicBoundarySystem{T,ND}, i) where {S,D,E,ND,T} =
     (dvdt = zero(SVector{ND,T}), drhodt = zero(T))
 
+# Coupled real-real fluid-fluid (mutual, WritesBoth) — two distinct
+# FluidParticleSystem instances (e.g. bubble.jl/bubble2.jl/bubble3.jl's two
+# phases) interact symmetrically under relabeling: each side's contribution
+# depends only on its own p/rho/mass plus the other side's p/rho/mass, so the
+# sweep can call this one method for both the forward pass (system_a in the
+# ps_a slot) and the reverse pass (system_b in the ps_a slot) — see the
+# WritesBoth dispatcher in Interaction.jl. Line-for-line the ps_a-side terms
+# of the two-real-system mutating method above, including the
+# artificial-surface-tension term (`ast`) that the self/ghost variants omit.
+_onesided_shape(::FluidPfn, ::FluidParticleSystem, ::FluidParticleSystem) = WritesBoth()
+
+@inline @Base.propagate_inbounds function pfn_contribution(f::FluidPfn{S,D,E,T}, ps_a::FluidParticleSystem{T,ND}, ps_b::FluidParticleSystem{T,ND}, i::Int, j::Int, dx::SVector{ND,T}, gx::SVector{ND,T}, w::T) where {S,D,E,ND,T<:AbstractFloat}
+    vi, vj       = ps_a.v[i], ps_b.v[j]
+    rho_i, rho_j = ps_a.rho[i], ps_b.rho[j]
+    p_i, p_j     = ps_a.p[i], ps_b.p[j]
+    mass_j       = ps_b.mass
+    dv           = vi - vj
+
+    piv    = artificial_viscosity(dx, dv, f.h, rho_i, rho_j, f.art_visc_alpha, f.art_visc_beta, ps_a.c, ps_b.c)
+    dh     = pressure_force_coeff(p_i, p_j, rho_i, rho_j, Val(S))
+    ast    = artificial_surface_tension_coeff(f.epsilon, p_i, p_j, rho_i, rho_j)
+    dv_tmp = mass_j * (dh + ast - piv) * gx
+
+    dr  = continuity_rate(dv, gx)
+    psi = diffusion_density(dx, rho_i, rho_j, ps_a.c, ps_b.c, f.h, f.h, gx, f.delta)
+    drho = mass_j * (dr * continuity_density_coeff(rho_i, rho_j, Val(S)) + psi / rho_j)
+
+    return (dvdt = dv_tmp, drhodt = drho)
+end
+
+@inline _onesided_zero_coupled(::FluidPfn{S,D,E,T}, ::FluidParticleSystem{T,ND}, ::FluidParticleSystem{T,ND}, i) where {S,D,E,ND,T} =
+    (dvdt = zero(SVector{ND,T}), drhodt = zero(T))
+
 # Below: the original two-sided mutating method (kept for the coloured
 # sweep's default path).
 @inline @Base.propagate_inbounds function (f::FluidPfn{S,D,E,T})(ps_a::AbstractParticleSystem{T,ND}, ps_b::DynamicBoundarySystem{T,ND}, i::Int, j::Int, dx::SVector{ND,T}, gx::SVector{ND,T}, w::T) where {S,D,E,ND,T<:AbstractFloat}
@@ -910,3 +943,71 @@ end
     ps_a.drhodt[i] += mass_j * (dr * continuity_density_coeff(rho_i, rho_j, Val(S)) + psi / rho_j)
     ps_b.drhodt[j] += mass_i * (dr * continuity_density_coeff(rho_j, rho_i, Val(S)) - psi / rho_i)
 end
+
+# ---------------------------------------------------------------------------
+# One-sided `pfn_contribution` methods — coupled real-real fluid-solid
+# (mutual, WritesBoth; used by DambreakWall.jl's fluid/wall interaction).
+#
+# Unlike FluidPfn's fluid-fluid case above, this physics is NOT symmetric
+# under relabeling: the pressure term must always use the FLUID's own
+# pressure for both sides (that is the entire point of FluidSolidPfn — a
+# continuous pressure field across the interface), never the solid's own
+# pressure. A single generic (AbstractParticleSystem, AbstractParticleSystem)
+# method keyed off "ps_a's own p" — the pattern that works for FluidPfn —
+# would silently use the solid's pressure whenever the reverse sweep puts the
+# solid in the ps_a slot. So two narrowly-typed methods instead, one per
+# physical assignment of the fluid/solid roles to the (ps_a, ps_b) slots,
+# each explicitly reading the fluid's pressure from wherever the fluid
+# actually is. No generic fallback is provided on purpose: a missing or
+# mistyped call must throw MethodError rather than silently compute with the
+# wrong side's pressure.
+# ---------------------------------------------------------------------------
+
+_onesided_shape(::FluidSolidPfn, ::FluidParticleSystem, ::ElastoPlasticParticleSystem) = WritesBoth()
+_onesided_shape(::FluidSolidPfn, ::ElastoPlasticParticleSystem, ::FluidParticleSystem) = WritesBoth()
+
+# Fluid is the target (ps_a): p_i is the fluid's own pressure, read directly.
+@inline @Base.propagate_inbounds function pfn_contribution(f::FluidSolidPfn{S,D,T}, ps_a::FluidParticleSystem{T,ND}, ps_b::ElastoPlasticParticleSystem{T,ND}, i::Int, j::Int, dx::SVector{ND,T}, gx::SVector{ND,T}, w::T) where {S,D,ND,T<:AbstractFloat}
+    vi, vj       = ps_a.v[i], ps_b.v[j]
+    rho_i, rho_j = ps_a.rho[i], ps_b.rho[j]
+    p_i          = ps_a.p[i]       # fluid pressure used for both sides
+    mass_j       = ps_b.mass
+    dv           = vi - vj
+
+    piv    = artificial_viscosity(dx, dv, f.h, rho_i, rho_j, f.art_visc_alpha, f.art_visc_beta, ps_a.c, ps_b.c)
+    dh     = pressure_force_coeff(p_i, p_i, rho_i, rho_j, Val(S))
+    dv_tmp = mass_j * (dh - piv) * gx
+
+    dr  = continuity_rate(dv, gx)
+    psi = diffusion_density(dx, rho_i, rho_j, ps_a.c, ps_b.c, f.h, f.h, gx, f.delta)
+    drho = mass_j * (dr * continuity_density_coeff(rho_i, rho_j, Val(S)) + psi / rho_j)
+
+    return (dvdt = dv_tmp, drhodt = drho)
+end
+
+@inline _onesided_zero_coupled(::FluidSolidPfn{S,D,T}, ::FluidParticleSystem{T,ND}, ::ElastoPlasticParticleSystem{T,ND}, i) where {S,D,ND,T} =
+    (dvdt = zero(SVector{ND,T}), drhodt = zero(T))
+
+# Solid is the target (ps_a): the fluid is now in ps_b, so its pressure must
+# be read from ps_b.p[j] — the solid's own pressure (ps_a.p[i]) must never
+# appear in this formula.
+@inline @Base.propagate_inbounds function pfn_contribution(f::FluidSolidPfn{S,D,T}, ps_a::ElastoPlasticParticleSystem{T,ND}, ps_b::FluidParticleSystem{T,ND}, i::Int, j::Int, dx::SVector{ND,T}, gx::SVector{ND,T}, w::T) where {S,D,ND,T<:AbstractFloat}
+    vi, vj       = ps_a.v[i], ps_b.v[j]
+    rho_i, rho_j = ps_a.rho[i], ps_b.rho[j]
+    p_fluid      = ps_b.p[j]       # fluid pressure used for both sides
+    mass_j       = ps_b.mass
+    dv           = vi - vj
+
+    piv    = artificial_viscosity(dx, dv, f.h, rho_i, rho_j, f.art_visc_alpha, f.art_visc_beta, ps_a.c, ps_b.c)
+    dh     = pressure_force_coeff(p_fluid, p_fluid, rho_i, rho_j, Val(S))
+    dv_tmp = mass_j * (dh - piv) * gx
+
+    dr  = continuity_rate(dv, gx)
+    psi = diffusion_density(dx, rho_i, rho_j, ps_a.c, ps_b.c, f.h, f.h, gx, f.delta)
+    drho = mass_j * (dr * continuity_density_coeff(rho_i, rho_j, Val(S)) + psi / rho_j)
+
+    return (dvdt = dv_tmp, drhodt = drho)
+end
+
+@inline _onesided_zero_coupled(::FluidSolidPfn{S,D,T}, ::ElastoPlasticParticleSystem{T,ND}, ::FluidParticleSystem{T,ND}, i) where {S,D,ND,T} =
+    (dvdt = zero(SVector{ND,T}), drhodt = zero(T))
