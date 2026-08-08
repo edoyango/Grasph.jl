@@ -101,6 +101,7 @@ using CUDA
 
     @testset "Adapt round-trip preserves fields exactly — VirtualParticleSystem" begin
         basic = BasicParticleSystem("basic", 5, 2, 1.0, 2.0)
+        basic.x .= [SVector(Float64(i), 0.0) for i in 1:5]
         vps = VirtualParticleSystem(basic, "virt", 5, 2, 1.0, 2.0; zero_fields=(:w_sum,))
         getfield(vps, :w_sum) .= collect(1.0:5.0)
 
