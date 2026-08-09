@@ -357,40 +357,98 @@ end
         @test all(==(0.0), a_ka.drhodt)
     end
 
-    @testset "coupled reverse sweep (FluidPfn fluid-fluid, WritesBoth): ka=true not yet reachable (known gap)" begin
+    @testset "coupled reverse sweep (FluidPfn fluid-fluid, WritesBoth): onesided vs ka=true" begin
         # bubble.jl/bubble2.jl/bubble3.jl's real two-phase coupling shape.
-        # This is NOT a success case: FluidPfn's fluid-fluid pfn_contribution/
-        # _onesided_zero_coupled methods (PairwiseFunctors.jl) are typed on
-        # the CONCRETE FluidParticleSystem{T,ND} on *both* sides, to
-        # disambiguate them from FluidPfn's other coupled methods (which all
-        # key off a specific wrapper type — StaticBoundarySystem,
-        # DynamicBoundarySystem, Union{Ghost,Virtual} — on ps_b). device_view
-        # erases that concrete identity: both fluid.x and fluid.y become the
-        # same generic Grasph.DeviceSystem type, indistinguishable from a
-        # device-viewed BasicParticleSystem/StressParticleSystem at the type
-        # level, so this MethodErrors instead of silently computing with the
-        # wrong dispatch (verified below to be the exact same gap already
-        # documented for FluidSolidPfn — see item 5's writeup in
-        # docs/gpu-migration-plan.md — just newly discovered here because
-        # this reverse-sweep work is what first exercises FluidPfn fluid-
-        # fluid under ka=true at all; previously nothing called it, forward
-        # or reverse). Deliberately left unfixed by this item: widening the
-        # dispatch safely needs device_view to preserve *which* concrete
-        # system a view came from, which is a shared prerequisite for both
-        # this and FluidSolidPfn, not a one-off patch — tracked as its own
-        # follow-up rather than folded in here.
+        # FluidPfn's fluid-fluid pfn_contribution/_onesided_zero_coupled
+        # methods (PairwiseFunctors.jl) are typed on the CONCRETE
+        # FluidParticleSystem{T,ND} on *both* sides, to disambiguate them
+        # from FluidPfn's other coupled methods (which all key off a
+        # specific wrapper type — StaticBoundarySystem, DynamicBoundarySystem,
+        # Union{Ghost,Virtual} — on ps_b instead). device_view used to erase
+        # that concrete identity entirely (every "bare" system type collapsed
+        # to the same generic DeviceSystem), which MethodError'd here rather
+        # than silently computing with the wrong dispatch — this was a known,
+        # pinned-down gap (see the previous version of this test and item 6's
+        # writeup in docs/gpu-migration-plan.md). Fixed by giving DeviceSystem
+        # a phantom `Kind` type parameter (DeviceViews.jl) recording which
+        # concrete host struct produced the view, and adding a
+        # DeviceSystem{T,ND,FluidParticleSystem} twin of this method
+        # (PairwiseFunctors.jl) — narrowly typed the same way the host method
+        # is, so an unrelated device-viewed pairing still MethodErrors.
+        rng = MersenneTwister(109)
         h = 0.08
         kernel = CubicSplineKernel(h; ndims=2)
+        cutoff = kernel.interaction_length
         pfn = FluidPfn(0.03, 0.0, h)
-        a = _kacpu_random_fluid(MersenneTwister(109), 5, 2; L=1.0)
-        b = _kacpu_random_fluid(MersenneTwister(110), 5, 2; L=1.0)
-        si = SystemInteraction(kernel, pfn, a, b; onesided=true, ka=true)
-        pa, ka_, sa = _kacpu_sortbufs(a)
-        sort_particles!(a, kernel.interaction_length, pa, ka_, sa)
-        pb, kb, sb = _kacpu_sortbufs(b)
-        sort_particles!(b, kernel.interaction_length, pb, kb, sb)
-        create_grid!(si)
-        @test_throws MethodError sweep!(si)
+        a_ref = _kacpu_random_fluid(rng, 220, 2; L=1.0)
+        b_ref = _kacpu_random_fluid(rng, 170, 2; L=1.0)
+        a_ka, b_ka = deepcopy(a_ref), deepcopy(b_ref)
+        si_ref = SystemInteraction(kernel, pfn, a_ref, b_ref; onesided=true)
+        si_ka  = SystemInteraction(kernel, pfn, a_ka, b_ka; onesided=true, ka=true)
+        for (a, b, si) in ((a_ref, b_ref, si_ref), (a_ka, b_ka, si_ka))
+            pa, ka_, sa = _kacpu_sortbufs(a)
+            sort_particles!(a, cutoff, pa, ka_, sa)
+            pb, kb, sb = _kacpu_sortbufs(b)
+            sort_particles!(b, cutoff, pb, kb, sb)
+            create_grid!(si)
+            sweep!(si)
+        end
+        _kacpu_assert_dvdt_close(a_ref.dvdt, a_ka.dvdt)
+        _kacpu_assert_drhodt_close(a_ref.drhodt, a_ka.drhodt)
+        _kacpu_assert_dvdt_close(b_ref.dvdt, b_ka.dvdt)
+        _kacpu_assert_drhodt_close(b_ref.drhodt, b_ka.drhodt)
+    end
+
+    @testset "coupled reverse sweep (FluidPfn fluid-fluid, WritesBoth) 3D: onesided vs ka=true" begin
+        # 3D sibling of the 2D test above, mirroring the file's established
+        # self/coupled-forward-sweep pattern (every 2D KA-equivalence test in
+        # this file has a 3D counterpart, since the extra loop-nesting level
+        # 3D adds changes KA.CPU()'s codegen relative to Polyester's — see the
+        # header comment at the top of this file). Exercises
+        # DeviceSystem{T,3,FluidParticleSystem} dispatch and the 3D
+        # reverse-sweep kernel's neighbour-stencil loop together.
+        rng = MersenneTwister(113)
+        h = 0.08
+        kernel = CubicSplineKernel(h; ndims=3)
+        cutoff = kernel.interaction_length
+        pfn = FluidPfn(0.03, 0.0, h)
+        a_ref = _kacpu_random_fluid(rng, 180, 3; L=1.0)
+        b_ref = _kacpu_random_fluid(rng, 140, 3; L=1.0)
+        a_ka, b_ka = deepcopy(a_ref), deepcopy(b_ref)
+        si_ref = SystemInteraction(kernel, pfn, a_ref, b_ref; onesided=true)
+        si_ka  = SystemInteraction(kernel, pfn, a_ka, b_ka; onesided=true, ka=true)
+        for (a, b, si) in ((a_ref, b_ref, si_ref), (a_ka, b_ka, si_ka))
+            pa, ka_, sa = _kacpu_sortbufs(a)
+            sort_particles!(a, cutoff, pa, ka_, sa)
+            pb, kb, sb = _kacpu_sortbufs(b)
+            sort_particles!(b, cutoff, pb, kb, sb)
+            create_grid!(si)
+            sweep!(si)
+        end
+        _kacpu_assert_dvdt_close(a_ref.dvdt, a_ka.dvdt)
+        _kacpu_assert_drhodt_close(a_ref.drhodt, a_ka.drhodt)
+        _kacpu_assert_dvdt_close(b_ref.dvdt, b_ka.dvdt)
+        _kacpu_assert_drhodt_close(b_ref.drhodt, b_ka.drhodt)
+    end
+
+    @testset "device_view Kind parameter: mismatched pairing still MethodErrors" begin
+        # Regression guard for the fix above: DeviceSystem{T,ND,Kind} must
+        # still throw MethodError for a pairing FluidPfn fluid-fluid was
+        # never meant to accept, not silently compute with the wrong
+        # dispatch. A device-viewed bare BasicParticleSystem (the same
+        # concrete type StaticBoundarySystem wraps as its `inner` field
+        # elsewhere in this file, but used here directly/unwrapped as a
+        # bare-system stand-in) paired with a device-viewed
+        # FluidParticleSystem must not match the new
+        # DeviceSystem{T,ND,FluidParticleSystem} method.
+        h = 0.1
+        kernel = CubicSplineKernel(h; ndims=2)
+        pfn = FluidPfn(0.03, 0.0, h)
+        fluid = _kacpu_random_fluid(MersenneTwister(111), 3, 2; L=0.05)
+        bnd   = _kacpu_random_boundary(MersenneTwister(112), 3, 2; L=0.05)
+        dx, gx, w = SVector(0.01, 0.0), SVector(1.0, 0.0), 0.5
+        @test_throws MethodError pfn_contribution(pfn, Grasph.device_view(fluid), Grasph.device_view(bnd), 1, 1, dx, gx, w)
+        @test_throws MethodError pfn_contribution(pfn, Grasph.device_view(bnd), Grasph.device_view(fluid), 1, 1, dx, gx, w)
     end
 
     @testset "coupled reverse sweep (InterpolateFieldFn, WritesB, virtual target): onesided vs ka=true" begin

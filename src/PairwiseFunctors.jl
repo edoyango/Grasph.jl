@@ -460,7 +460,13 @@ end
 # artificial-surface-tension term (`ast`) that the self/ghost variants omit.
 _onesided_shape(::FluidPfn, ::FluidParticleSystem, ::FluidParticleSystem) = WritesBoth()
 
-@inline @Base.propagate_inbounds function pfn_contribution(f::FluidPfn{S,D,E,T}, ps_a::FluidParticleSystem{T,ND}, ps_b::FluidParticleSystem{T,ND}, i::Int, j::Int, dx::SVector{ND,T}, gx::SVector{ND,T}, w::T) where {S,D,E,ND,T<:AbstractFloat}
+# Shared by the host (FluidParticleSystem) and device_view (DeviceSystem)
+# methods below — both need the exact same formula, only the dispatch type
+# on ps_a/ps_b differs. ps_a/ps_b are left untyped here on purpose: Julia
+# specializes per call site, so this costs nothing at runtime, and it's what
+# lets a single body serve both the host-typed and device-viewed entry points
+# without duplicating the arithmetic.
+@inline @Base.propagate_inbounds function _fluidpfn_fluidfluid_contribution(f::FluidPfn{S,D,E,T}, ps_a, ps_b, i::Int, j::Int, dx::SVector{ND,T}, gx::SVector{ND,T}, w::T) where {S,D,E,ND,T<:AbstractFloat}
     vi, vj       = ps_a.v[i], ps_b.v[j]
     rho_i, rho_j = ps_a.rho[i], ps_b.rho[j]
     p_i, p_j     = ps_a.p[i], ps_b.p[j]
@@ -479,7 +485,25 @@ _onesided_shape(::FluidPfn, ::FluidParticleSystem, ::FluidParticleSystem) = Writ
     return (dvdt = dv_tmp, drhodt = drho)
 end
 
+@inline @Base.propagate_inbounds pfn_contribution(f::FluidPfn{S,D,E,T}, ps_a::FluidParticleSystem{T,ND}, ps_b::FluidParticleSystem{T,ND}, i::Int, j::Int, dx::SVector{ND,T}, gx::SVector{ND,T}, w::T) where {S,D,E,ND,T<:AbstractFloat} =
+    _fluidpfn_fluidfluid_contribution(f, ps_a, ps_b, i, j, dx, gx, w)
+
 @inline _onesided_zero_coupled(::FluidPfn{S,D,E,T}, ::FluidParticleSystem{T,ND}, ::FluidParticleSystem{T,ND}, i) where {S,D,E,ND,T} =
+    (dvdt = zero(SVector{ND,T}), drhodt = zero(T))
+
+# ka=true twin: device_view(::FluidParticleSystem) erases concrete-type
+# identity (every "bare" system type collapses to the same generic
+# DeviceSystem), so this must be typed on DeviceSystem{T,ND,FluidParticleSystem}
+# specifically (see DeviceViews.jl's Kind parameter) rather than the loose
+# AbstractParticleSystem{T,ND} every other coupled FluidPfn method uses — a
+# looser type here would also match a device-viewed BasicParticleSystem/
+# StressParticleSystem/ElastoPlasticParticleSystem paired with a device-viewed
+# fluid, silently computing fluid-fluid physics for a pairing that was never
+# meant to interact that way, instead of throwing MethodError.
+@inline @Base.propagate_inbounds pfn_contribution(f::FluidPfn{S,D,E,T}, ps_a::DeviceSystem{T,ND,FluidParticleSystem}, ps_b::DeviceSystem{T,ND,FluidParticleSystem}, i::Int, j::Int, dx::SVector{ND,T}, gx::SVector{ND,T}, w::T) where {S,D,E,ND,T<:AbstractFloat} =
+    _fluidpfn_fluidfluid_contribution(f, ps_a, ps_b, i, j, dx, gx, w)
+
+@inline _onesided_zero_coupled(::FluidPfn{S,D,E,T}, ::DeviceSystem{T,ND,FluidParticleSystem}, ::DeviceSystem{T,ND,FluidParticleSystem}, i) where {S,D,E,ND,T} =
     (dvdt = zero(SVector{ND,T}), drhodt = zero(T))
 
 # Below: the original two-sided mutating method (kept for the coloured

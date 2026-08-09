@@ -170,21 +170,24 @@ else
             # _ReverseOnlyTestPfn as test_onesided_sweep.jl's CPU-side
             # reverse-sweep tests — in scope here via runtests.jl's shared
             # top-level @testset (same reuse convention test_device_views.jl
-            # documents) — rather than a real production WritesBoth pfn:
-            # FluidPfn's fluid-fluid method is typed on the concrete
-            # FluidParticleSystem{T,ND} on both sides, which device_view
-            # can't dispatch into yet (a known, separately-tracked gap; see
-            # test_ka_cpu.jl's "ka=true not yet reachable" regression test).
-            # _MutualTestPfn/_ReverseOnlyTestPfn are typed generically
-            # (::Any), so they validate the new sweep infrastructure itself
-            # on real CUDA hardware, independent of that gap.
+            # documents) — to validate the sweep infrastructure itself,
+            # independent of any one pfn's dispatch typing. Plus the real
+            # production FluidPfn fluid-fluid method (bubble.jl/bubble2.jl/
+            # bubble3.jl's shape): this used to be unreachable under ka=true
+            # (device_view erased which concrete system type produced a
+            # DeviceSystem, and FluidPfn's fluid-fluid method needs that
+            # identity on both sides — see test_ka_cpu.jl's regression test),
+            # fixed by giving DeviceSystem a phantom Kind type parameter
+            # (DeviceViews.jl) plus a DeviceSystem{T,ND,FluidParticleSystem}
+            # twin of the method (PairwiseFunctors.jl). This is the first
+            # real-hardware exercise of that fix.
             CUDA.allowscalar(false)
             rng = MersenneTwister(205)
             h = 0.08
             kernel = CubicSplineKernel(h; ndims=2)
             cutoff = kernel.interaction_length
 
-            for pfn in (_ReverseOnlyTestPfn(), _MutualTestPfn())
+            for pfn in (_ReverseOnlyTestPfn(), _MutualTestPfn(), FluidPfn(0.03, 0.0, h))
                 a_cpu = _gpucuda_random_fluid(rng, 800, 2; L=2.0)
                 b_cpu = _gpucuda_random_fluid(rng, 600, 2; L=2.0)
                 a_gpu = adapt(CUDABackend(), deepcopy(a_cpu))

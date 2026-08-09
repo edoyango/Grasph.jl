@@ -18,9 +18,23 @@ export device_view
 # method (which dispatches on AbstractParticleSystem{T,ND} or a concrete
 # system type) works against it unchanged — no changes needed anywhere in
 # PairwiseFunctors.jl or StateUpdaters.jl.
+#
+# `Kind` records *which concrete host struct* produced the view (e.g.
+# `FluidParticleSystem`, the bare UnionAll — not a field, so it costs nothing
+# at runtime and doesn't affect isbits-ness). Every "bare" system type
+# (Basic/Fluid/Stress/ElastoPlastic) collapses to this same generic
+# DeviceSystem otherwise, which is fine for the common case (most
+# pfn_contribution methods are typed loosely enough not to care), but a pfn
+# whose pfn_contribution/_onesided_zero_coupled is narrowly typed on a
+# concrete host struct on BOTH sides of a coupled interaction — to
+# disambiguate it from that same pfn's OTHER coupled methods, which key off a
+# specific wrapper type on ps_b instead — needs its `ka=true` twin written
+# against `DeviceSystem{T,ND,ThatConcreteType}` rather than plain
+# `DeviceSystem{T,ND}`. See FluidPfn's fluid-fluid section in
+# PairwiseFunctors.jl for the pattern.
 # ---------------------------------------------------------------------------
 
-struct DeviceSystem{T, ND, NT<:NamedTuple} <: AbstractParticleSystem{T, ND}
+struct DeviceSystem{T, ND, Kind, NT<:NamedTuple} <: AbstractParticleSystem{T, ND}
     _f::NT
 end
 
@@ -32,9 +46,9 @@ end
 # Lets cudaconvert rewrite CuArray -> CuDeviceArray inside the NamedTuple.
 # Adapt already recurses into NamedTuple/Tuple; only the struct-level wrapping
 # needs a method here.
-function Adapt.adapt_structure(to, ds::DeviceSystem{T,ND}) where {T,ND}
+function Adapt.adapt_structure(to, ds::DeviceSystem{T,ND,Kind}) where {T,ND,Kind}
     nt = Adapt.adapt(to, getfield(ds, :_f))
-    DeviceSystem{T, ND, typeof(nt)}(nt)
+    DeviceSystem{T, ND, Kind, typeof(nt)}(nt)
 end
 
 # One method per system type, listing exactly the fields pairwise functors and
@@ -65,7 +79,8 @@ end
 
 @inline function device_view(ps::AbstractParticleSystem{T,ND}) where {T,ND}
     nt = _device_fields(ps)
-    return DeviceSystem{T, ND, typeof(nt)}(nt)
+    Kind = Base.typename(typeof(ps)).wrapper
+    return DeviceSystem{T, ND, Kind, typeof(nt)}(nt)
 end
 
 # Boundary wrappers rebuild around the viewed inner system, preserving the
