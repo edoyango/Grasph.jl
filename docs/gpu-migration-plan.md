@@ -32,6 +32,17 @@ _an adversarial review pass. `FluidSolidPfn`'s identical, separately-tracked_
 _gap (item 8) is not fixed by this but now has a two-line-signature pattern_
 _to follow. See item 6's rewritten note, below, for the full story._
 
+_2026-08-09 update #5: `FluidSolidPfn`'s gap (item 8, `DambreakWall.jl`'s_
+_fluid/wall coupling) is also fixed now, same session, reusing the `Kind`_
+_mechanism from update #4 — two `DeviceSystem{T,ND,Kind}` methods instead of_
+_one, since this pfn's physics is asymmetric (the fluid's own pressure_
+_drives both sides' pressure term, unlike `FluidPfn` fluid-fluid's symmetric_
+_case). See item 8's rewritten note, below (commit `0fac396`). This update_
+_also corrects a stale suite count this doc previously cited for item 6:_
+_"1475/1475" predated that item's own last test addition (the adversarial_
+_review's 3D-coverage-gap fix); the correct figure, already used in that_
+_fix's commit message, was 1479/1479. It's now 1496/1496 after this item._
+
 ## Why this migration, and why not an octree
 
 The original ask was to get GraSPH.jl (a Julia SPH code) running on GPUs via
@@ -663,15 +674,20 @@ to coloured for all 13 scripts, and no script's behavior changed.
    working under `ka=true` on real CUDA hardware too — see
    `test/test_gpu_cuda.jl`.
 
-   `FluidSolidPfn`'s identical gap (`DambreakWall.jl`) is **not** fixed by
-   this — see item 8's note — but the `Kind` mechanism now exists as the
-   pattern to reuse: just two more method signatures typed on
+   `FluidSolidPfn`'s identical gap (`DambreakWall.jl`) was **not** fixed by
+   this at the time — the `Kind` mechanism was left as the pattern to reuse,
+   just two more method signatures typed on
    `DeviceSystem{T,ND,FluidParticleSystem}`/
    `DeviceSystem{T,ND,ElastoPlasticParticleSystem}` (mirroring both slot
-   orders), no new struct or abstract type needed.
+   orders), no new struct or abstract type needed — and was fixed exactly
+   that way as a same-session follow-up; see item 8's note.
 
-   Suite: 1475/1475 (up from 1433 before this item; 1466 after the reverse-sweep
-   kernel twin alone, 1475 after also fixing the `FluidPfn` fluid-fluid gap).
+   Suite: 1479/1479 (up from 1433 before this item; 1466 after the reverse-sweep
+   kernel twin alone, 1475 after also fixing the `FluidPfn` fluid-fluid gap, 1479
+   after the adversarial review's 3D-coverage-gap finding added a 3D sibling
+   test for that fix). This corrects a stale "1475/1475" this doc previously
+   cited here and in Practical Notes, which predated that last test addition —
+   see update #5.
 7. **Ghosts on GPU** — the hardest remaining piece, and gates 7 of the 13
    scripts. `generate_ghosts!`'s two-pass count-then-cursor logic doesn't
    port by direct translation; needs a GPU-compatible rewrite (flag +
@@ -684,20 +700,42 @@ to coloured for all 13 scripts, and no script's behavior changed.
    by items 5-7 plus Phase C's integration harnesses (`test/
    test_onesided_integration_*.jl`), which give a per-shape correctness
    oracle to validate each script's GPU wiring against before trusting it.
-   `DambreakWall.jl` specifically also needs `FluidSolidPfn`'s two
+   ~~`DambreakWall.jl` specifically also needs `FluidSolidPfn`'s two
    `pfn_contribution` methods widened off the concrete `FluidParticleSystem`/
    `ElastoPlasticParticleSystem` pair to something `device_view` can
-   dispatch into before it can try `ka=true` at all — `FluidPfn`'s identical
-   gap (`bubble*.jl`'s fluid-fluid coupling) is already fixed (see item 6's
-   note): `DeviceSystem` now carries a phantom `Kind` type parameter
-   recording which concrete host struct produced a device view, so
-   `FluidSolidPfn`'s fix is now "just" two more `pfn_contribution`/
-   `_onesided_zero_coupled` method pairs typed on
-   `DeviceSystem{T,ND,FluidParticleSystem}`/
-   `DeviceSystem{T,ND,ElastoPlasticParticleSystem}` (both slot orders),
-   mirroring `FluidPfn`'s fix exactly — no new struct or abstract type
-   needed, unlike what would have been required under an earlier
-   dedicated-device-struct-per-type design that was considered and rejected.
+   dispatch into before it can try `ka=true` at all~~ — **done** (commit
+   `0fac396`), same session, as a direct follow-up to item 6's `FluidPfn`
+   fix. Unlike `FluidPfn` fluid-fluid, `FluidSolidPfn`'s physics is
+   asymmetric under relabeling — the fluid's own pressure drives both
+   sides' pressure term, never the solid's (that's the entire point of the
+   functor: a continuous pressure field across the fluid-solid interface) —
+   so a single shared `DeviceSystem`-typed method, the pattern that worked
+   for `FluidPfn`, would silently use the wrong side's pressure whenever the
+   reverse sweep put the solid in the `ps_a` slot. Two distinct methods
+   instead, exactly mirroring the two host-typed CPU methods that already
+   existed (from Phase C):
+   `pfn_contribution(f, ps_a::DeviceSystem{T,ND,FluidParticleSystem},
+   ps_b::DeviceSystem{T,ND,ElastoPlasticParticleSystem}, ...)` and its mirror
+   with the slots swapped, each calling a shared, untyped helper function
+   together with its host-typed counterpart so the arithmetic isn't
+   duplicated (`PairwiseFunctors.jl`) — no new struct or abstract type
+   needed, exactly as this item's earlier note predicted. Verified via
+   `KA.CPU()` (2D and 3D onesided-vs-`ka=true` equivalence, a
+   mismatched-pairing `MethodError` regression test covering both new
+   methods) and real CUDA hardware (`test/test_ka_cpu.jl`,
+   `test/test_gpu_cuda.jl`), plus a dedicated regression test asserting the
+   solid-as-target method reads the fluid's pressure from `ps_b.p` and never
+   touches `ps_a.p` — the specific failure mode the two-method split exists
+   to prevent, which a swap-antisymmetry check alone can't catch (it only
+   compares a call against itself in one orientation). An adversarial review
+   pass (dispatch-safety/correctness/test-coverage, 3 independent reviewers)
+   found no confirmed issues. Suite: 1496/1496 (up from 1479 after item 6).
+
+   This item's remaining scope — actually wiring `onesided=true`/`ka=true`
+   into the 12 non-dambreak scripts' `SystemInteraction` calls — is
+   unstarted; every pfn those scripts use now has a working `ka=true`
+   dispatch path, but none of the scripts themselves opt into it yet (all
+   still default to the coloured sweep).
 9. Virtual particle systems, probes, and the RK4 integrator have no GPU
    sweep path at all yet, independent of pfn support — `VirtualParticleSystem`
    position/state advance, `_measure_probes!`, and RK4's multi-stage
@@ -730,13 +768,15 @@ to coloured for all 13 scripts, and no script's behavior changed.
 ## Practical notes for picking this back up
 
 - Branch: `onesided-sweep-gpu-prep`, based on `main` at commit `37e9a5a`, now
-  21 commits ahead of it (`12ac526`..`92036c3`). Nothing on this branch has
+  25 commits ahead of it (`12ac526`..`0fac396`). Nothing on this branch has
   been pushed to any remote.
 - Run the full suite with `julia --project -e 'using Pkg; Pkg.test()'` —
-  should show `1475/1475` (834 through Phase B1, up to 935 after Phase B2's
+  should show `1496/1496` (834 through Phase B1, up to 935 after Phase B2's
   3D work, up to 1371 after Phase C, up to 1433 after item 5's `device_view`
   extension, up to 1466 after item 6's reverse-sweep KA kernel twin, up to
-  1475 after also fixing the `FluidPfn` fluid-fluid `ka=true` dispatch gap).
+  1479 after also fixing the `FluidPfn` fluid-fluid `ka=true` dispatch gap
+  (this doc previously miscited this figure as 1475 — see update #5), up to
+  1496 after also fixing `FluidSolidPfn`'s identical gap (item 8).
 - `test/test_onesided_sweep.jl` (Phase A/C, ~1100 lines by now — one section
   per pfn/shape, including the `XSPHPfn` ghost-aliasing regression test) and
   `test/test_adapt.jl` (Phase B1) are the two long-running test files that
@@ -754,7 +794,10 @@ to coloured for all 13 scripts, and no script's behavior changed.
   `test_ka_cpu.jl` (reverse/`WritesBoth` sweep, `KA.CPU()`-vs-Polyester
   equivalence, 2D and 3D, plus a `DeviceSystem` `Kind`-mismatch regression
   test) and `test_gpu_cuda.jl` (the same shapes, including a real `FluidPfn`
-  fluid-fluid entry, against real `CUDABackend()`).
+  fluid-fluid entry, against real `CUDABackend()`). Item 8's `FluidSolidPfn`
+  fix added the same shape of tests again (2D/3D equivalence, mismatched-
+  pairing regression, real-CUDA entry), plus a fluid-vs-solid-pressure
+  regression test specific to that pfn's asymmetric physics.
 - `CUDA.jl` is now confirmed to install and run correctly on a real GPU from
   this repo's dependency graph (see environment notes above) — the earlier
   "no GPU in the dev environment this was built in" caveat throughout Phase
