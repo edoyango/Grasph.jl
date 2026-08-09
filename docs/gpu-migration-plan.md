@@ -21,8 +21,16 @@ _4060 Laptop GPU machine from Phase B2 (confirmed via `nvidia-smi`/_
 _`CUDA.functional()`, both true this session — Phase C and item 5 were done_
 _CPU-only in between), so this is the first item validated against real CUDA_
 _hardware since Phase B2's own crossover benchmark. Testing it found a real,_
-_previously-unreachable dispatch gap in `FluidPfn`'s fluid-fluid method — see_
-_the item for what it is and why it's deliberately left unfixed here._
+_previously-unreachable dispatch gap in `FluidPfn`'s fluid-fluid method,_
+_fixed as a direct follow-up — see update #4._
+
+_2026-08-09 update #4: the `FluidPfn` fluid-fluid dispatch gap from update #3_
+_is fixed — `DeviceSystem` (`src/DeviceViews.jl`) gained a phantom `Kind`_
+_type parameter so `device_view` no longer erases which concrete system_
+_produced a view. Chosen via an independent 3-way design panel, landed after_
+_an adversarial review pass. `FluidSolidPfn`'s identical, separately-tracked_
+_gap (item 8) is not fixed by this but now has a two-line-signature pattern_
+_to follow. See item 6's rewritten note, below, for the full story._
 
 ## Why this migration, and why not an octree
 
@@ -607,33 +615,63 @@ to coloured for all 13 scripts, and no script's behavior changed.
    both via `KA.CPU()` (bit-reproducible, no GPU needed) and, for the first
    time since Phase B2's crossover benchmark, on real CUDA hardware (RTX
    4060 Laptop GPU) — this machine had a functional GPU again this session,
-   unlike Phase C/item 5. Suite: 1466/1466 (up from 1433).
+   unlike Phase C/item 5.
 
-   **A real, previously-unreachable dispatch gap found and left unfixed,
-   scoped together with the existing `FluidSolidPfn` gap (item 8's note)**:
-   `FluidPfn`'s fluid-fluid `pfn_contribution`/`_onesided_zero_coupled`
-   methods (`PairwiseFunctors.jl`) are typed on the *concrete*
-   `FluidParticleSystem{T,ND}` on **both** sides — needed to disambiguate
-   them from `FluidPfn`'s other coupled methods, which all key off a
-   specific wrapper type (`StaticBoundarySystem`, `DynamicBoundarySystem`,
-   `Union{Ghost,Virtual}`) on `ps_b` instead. `device_view` erases that
-   concrete identity: a device-viewed `FluidParticleSystem` and a
-   device-viewed `BasicParticleSystem`/`StressParticleSystem` are the exact
-   same `DeviceSystem` type, indistinguishable to the dispatcher. This means
-   `ka=true` was *never* reachable for `FluidPfn` fluid-fluid — not a
-   regression from this item, but a latent gap this item's tests are what
-   first exercised it (nothing called `FluidPfn` fluid-fluid under `ka=true`
-   before, forward or reverse). `MethodError`s loudly rather than computing
-   with the wrong dispatch — verified directly and pinned down by a
-   regression test (`test/test_ka_cpu.jl`, "ka=true not yet reachable (known
-   gap)"). Left unfixed here on purpose: safely widening it needs
-   `device_view` to preserve *which* concrete system a view came from
-   (exactly what `FluidSolidPfn`'s already-documented gap needs too — see
-   item 8), which is a shared prerequisite for both, not a one-off patch.
+   ~~**A real, previously-unreachable dispatch gap found and left unfixed,
+   scoped together with the existing `FluidSolidPfn` gap**~~ — **also fixed,
+   same session, as a direct follow-up.** `FluidPfn`'s fluid-fluid
+   `pfn_contribution`/`_onesided_zero_coupled` methods (`PairwiseFunctors.jl`)
+   are typed on the *concrete* `FluidParticleSystem{T,ND}` on **both**
+   sides — needed to disambiguate them from `FluidPfn`'s other coupled
+   methods, which all key off a specific wrapper type (`StaticBoundarySystem`,
+   `DynamicBoundarySystem`, `Union{Ghost,Virtual}`) on `ps_b` instead.
+   `device_view` used to erase that concrete identity entirely (a
+   device-viewed `FluidParticleSystem` and a device-viewed
+   `BasicParticleSystem`/`StressParticleSystem` produced the exact same
+   `DeviceSystem` type, indistinguishable to the dispatcher), so `ka=true`
+   was never reachable for `FluidPfn` fluid-fluid — not a regression from
+   this item, but a latent gap this item's tests were what first exercised
+   (nothing called `FluidPfn` fluid-fluid under `ka=true` before, forward or
+   reverse). `MethodError`d loudly rather than computing with the wrong
+   dispatch, pinned down by a regression test before the fix.
+
+   **The fix**: a 3-way independent design panel (phantom type parameter on
+   `DeviceSystem` vs. a dedicated struct per source type mirroring
+   `DeviceVirtualSystem` vs. a host-resolved tag threaded through the
+   kernel) converged on the first option, verified against a standalone
+   Julia repro before being trusted. `DeviceSystem` gained a phantom `Kind`
+   type parameter (`src/DeviceViews.jl`), set at `device_view` construction
+   time via `Base.typename(typeof(ps)).wrapper` (the bare, unparameterized
+   type of whatever concrete struct produced the view — costs nothing at
+   runtime, doesn't affect `isbits`-ness). `FluidPfn`'s fluid-fluid method
+   got a `DeviceSystem{T,ND,FluidParticleSystem}`-typed twin
+   (`PairwiseFunctors.jl`) sharing one extracted helper with the host-typed
+   method, so the physics formula isn't duplicated. An unrelated
+   device-viewed pairing (e.g. a device-viewed `BasicParticleSystem` next to
+   a device-viewed `FluidParticleSystem`) still `MethodError`s — verified
+   directly, not just asserted, both by a dedicated regression test and by
+   an adversarial review pass specifically hunting for a way the new method
+   could accidentally widen to match something it shouldn't (none found).
+   `test/test_ka_cpu.jl`'s gap-pinning test was rewritten into a real
+   `onesided` vs `ka=true` equivalence check (2D and 3D), plus
+   `test/test_gpu_cuda.jl` gained a real `FluidPfn` fluid-fluid entry
+   alongside the test-only pfns already validating the reverse-sweep
+   infrastructure, both passing on real CUDA hardware.
    `InterpolateFieldFn`'s `WritesB()` method onto a `VirtualParticleSystem`
-   target has no such problem (item 5 gave `AbstractVirtualParticleSystem`
-   its own device view) and is confirmed working under `ka=true` on real
-   CUDA hardware — see `test/test_gpu_cuda.jl`.
+   target had no such problem to begin with (item 5 gave
+   `AbstractVirtualParticleSystem` its own device view) and is confirmed
+   working under `ka=true` on real CUDA hardware too — see
+   `test/test_gpu_cuda.jl`.
+
+   `FluidSolidPfn`'s identical gap (`DambreakWall.jl`) is **not** fixed by
+   this — see item 8's note — but the `Kind` mechanism now exists as the
+   pattern to reuse: just two more method signatures typed on
+   `DeviceSystem{T,ND,FluidParticleSystem}`/
+   `DeviceSystem{T,ND,ElastoPlasticParticleSystem}` (mirroring both slot
+   orders), no new struct or abstract type needed.
+
+   Suite: 1475/1475 (up from 1433 before this item; 1466 after the reverse-sweep
+   kernel twin alone, 1475 after also fixing the `FluidPfn` fluid-fluid gap).
 7. **Ghosts on GPU** — the hardest remaining piece, and gates 7 of the 13
    scripts. `generate_ghosts!`'s two-pass count-then-cursor logic doesn't
    port by direct translation; needs a GPU-compatible rewrite (flag +
@@ -649,14 +687,17 @@ to coloured for all 13 scripts, and no script's behavior changed.
    `DambreakWall.jl` specifically also needs `FluidSolidPfn`'s two
    `pfn_contribution` methods widened off the concrete `FluidParticleSystem`/
    `ElastoPlasticParticleSystem` pair to something `device_view` can
-   dispatch into (see item 5's note) before it can try `ka=true` at all —
-   and the `bubble*.jl` scripts need the identical fix for `FluidPfn`'s
-   fluid-fluid method (see item 6's note) for the same reason. Both need
-   `device_view` to start preserving *which* concrete system a view came
-   from (today it doesn't: `FluidParticleSystem`, `BasicParticleSystem`,
-   `StressParticleSystem`, and `ElastoPlasticParticleSystem` all erase to the
-   same `DeviceSystem` type) — worth solving once, shared by both, rather
-   than as two separate patches.
+   dispatch into before it can try `ka=true` at all — `FluidPfn`'s identical
+   gap (`bubble*.jl`'s fluid-fluid coupling) is already fixed (see item 6's
+   note): `DeviceSystem` now carries a phantom `Kind` type parameter
+   recording which concrete host struct produced a device view, so
+   `FluidSolidPfn`'s fix is now "just" two more `pfn_contribution`/
+   `_onesided_zero_coupled` method pairs typed on
+   `DeviceSystem{T,ND,FluidParticleSystem}`/
+   `DeviceSystem{T,ND,ElastoPlasticParticleSystem}` (both slot orders),
+   mirroring `FluidPfn`'s fix exactly — no new struct or abstract type
+   needed, unlike what would have been required under an earlier
+   dedicated-device-struct-per-type design that was considered and rejected.
 9. Virtual particle systems, probes, and the RK4 integrator have no GPU
    sweep path at all yet, independent of pfn support — `VirtualParticleSystem`
    position/state advance, `_measure_probes!`, and RK4's multi-stage
@@ -689,12 +730,13 @@ to coloured for all 13 scripts, and no script's behavior changed.
 ## Practical notes for picking this back up
 
 - Branch: `onesided-sweep-gpu-prep`, based on `main` at commit `37e9a5a`, now
-  20 commits ahead of it (`12ac526`..`0f18e35`). Nothing on this branch has
+  21 commits ahead of it (`12ac526`..`92036c3`). Nothing on this branch has
   been pushed to any remote.
 - Run the full suite with `julia --project -e 'using Pkg; Pkg.test()'` —
-  should show `1466/1466` (834 through Phase B1, up to 935 after Phase B2's
+  should show `1475/1475` (834 through Phase B1, up to 935 after Phase B2's
   3D work, up to 1371 after Phase C, up to 1433 after item 5's `device_view`
-  extension, up to 1466 after item 6's reverse-sweep KA kernel twin).
+  extension, up to 1466 after item 6's reverse-sweep KA kernel twin, up to
+  1475 after also fixing the `FluidPfn` fluid-fluid `ka=true` dispatch gap).
 - `test/test_onesided_sweep.jl` (Phase A/C, ~1100 lines by now — one section
   per pfn/shape, including the `XSPHPfn` ghost-aliasing regression test) and
   `test/test_adapt.jl` (Phase B1) are the two long-running test files that
@@ -710,8 +752,9 @@ to coloured for all 13 scripts, and no script's behavior changed.
   (`test_ka_cpu.jl`, `test_gpu_cuda.jl`, `test_gpu_dambreak.jl`) — see next
   steps item 1 for what's still ad hoc there vs. checked in. Item 6 extended
   `test_ka_cpu.jl` (reverse/`WritesBoth` sweep, `KA.CPU()`-vs-Polyester
-  equivalence, plus the `FluidPfn` fluid-fluid known-gap regression test) and
-  `test_gpu_cuda.jl` (the same shapes against real `CUDABackend()`).
+  equivalence, 2D and 3D, plus a `DeviceSystem` `Kind`-mismatch regression
+  test) and `test_gpu_cuda.jl` (the same shapes, including a real `FluidPfn`
+  fluid-fluid entry, against real `CUDABackend()`).
 - `CUDA.jl` is now confirmed to install and run correctly on a real GPU from
   this repo's dependency graph (see environment notes above) — the earlier
   "no GPU in the dev environment this was built in" caveat throughout Phase
