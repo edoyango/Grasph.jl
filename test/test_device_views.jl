@@ -10,11 +10,22 @@ using Random
 # ElastoPlasticParticleSystem, DynamicBoundarySystem, and
 # VirtualParticleSystem.
 #
-# ProbeParticleSystem/GhostParticleSystem are deliberately NOT covered here
-# — both hardcode `Vector` for their per-particle arrays (not the
-# array-type-generic parameter every other system uses), which blocks Adapt
-# entirely regardless of device_view; that is a separate, deeper problem
-# already tracked as its own item in docs/gpu-migration-plan.md.
+# ProbeParticleSystem is deliberately NOT covered here — it still hardcodes
+# `Vector` for its per-particle arrays, which blocks Adapt entirely
+# regardless of device_view (see docs/gpu-migration-plan.md, item 9).
+#
+# GhostParticleSystem (item 7, docs/gpu-migration-plan.md) IS covered below:
+# its array fields are now generic (VA/SA/IA, GhostParticles.jl), so it gets
+# the same DeviceVirtualSystem-shaped treatment — a dedicated
+# `DeviceGhostSystem` subtyping `AbstractGhostParticleSystem` so every
+# ghost-coupled pfn_contribution method (already narrowly typed on that
+# abstraction, never on bare `AbstractParticleSystem`) dispatches into it
+# unmodified. Ghost fixtures below reuse `_xsph_ghost_fluid`/
+# `_xsph_ghost_setup!` (test_onesided_sweep.jl's XSPHPfn ghost-aliasing
+# regression section, in scope here via runtests.jl's shared top-level
+# @testset) — a REAL self-referencing ghost (`ghost.source === fluid`), not a
+# synthetic standalone one, since that's the only shape this codebase's
+# scripts ever construct.
 #
 # VirtualParticleSystem is a concrete struct that owns a non-isbits `name`
 # field directly, so (unlike Static/DynamicBoundarySystem) its own type can't
@@ -91,6 +102,19 @@ end
     @test :name           ∉ inner_names
     @test :state_updater  ∉ inner_names
     @test :source         ∉ inner_names   # flattened away, not carried as a sub-object
+
+    ghost = _xsph_ghost_setup!(_xsph_ghost_fluid(rng, 4, 4, 0.1), 0.1, 0.3, 0.4, 0.4)
+    dvg = Grasph.device_view(ghost)
+    @test dvg isa Grasph.AbstractGhostParticleSystem{Float64,2}
+    for f in (:n, :x, :v, :rho, :p, :mass, :c)
+        @test getproperty(dvg, f) == getproperty(ghost, f)
+    end
+    ghost_inner_names = keys(getfield(dvg, :_f))
+    @test :name          ∉ ghost_inner_names
+    @test :idx_original  ∉ ghost_inner_names   # ghost-generation bookkeeping, never read by a pfn
+    @test :idx_boundary  ∉ ghost_inner_names
+    @test :normals       ∉ ghost_inner_names
+    @test :source        ∉ ghost_inner_names   # flattened away, not carried as a sub-object
 end
 
 @testset "pfn_contribution: device_view(ps_b) matches host ps_b exactly" begin
@@ -172,6 +196,26 @@ end
         dx, gx, w = _dv_pair_dx_gx_w(kernel, h, ps_a.x[1], virt.x[2])
         @test pfn_contribution(pfn, ps_a, virt, 1, 2, dx, gx, w) ==
               pfn_contribution(pfn, ps_a, Grasph.device_view(virt), 1, 2, dx, gx, w)
+    end
+
+    @testset "GhostParticleSystem (item 7): FluidPfn and XSPHPfn against a REAL ghost" begin
+        # A real self-referencing ghost (ghost.source === fluid), the only
+        # shape this codebase's scripts ever construct — unlike every test
+        # above, which uses a synthetic virtual system as the ghost/virtual
+        # Union's stand-in. ps_a is a separate, unrelated fluid: this tests
+        # the dispatch mechanism itself, not the physical self-coupling.
+        ghost = _xsph_ghost_setup!(_xsph_ghost_fluid(rng, 4, 4, 0.1), 0.1, 0.3, 0.4, 0.4)
+        @test ghost.n > 0
+        ps_a = _random_fluid(rng, 2, 2; L=0.05)
+
+        pfn = FluidPfn(0.03, 0.0, h)
+        dx, gx, w = _dv_pair_dx_gx_w(kernel, h, ps_a.x[1], ghost.x[1])
+        @test pfn_contribution(pfn, ps_a, ghost, 1, 1, dx, gx, w) ==
+              pfn_contribution(pfn, ps_a, Grasph.device_view(ghost), 1, 1, dx, gx, w)
+
+        pfn2 = XSPHPfn(0.5)
+        @test pfn_contribution(pfn2, ps_a, ghost, 1, 1, dx, gx, w) ==
+              pfn_contribution(pfn2, ps_a, Grasph.device_view(ghost), 1, 1, dx, gx, w)
     end
 end
 

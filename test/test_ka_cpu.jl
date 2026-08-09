@@ -593,6 +593,38 @@ end
         @test maximum(abs.(virt_ref.w_sum .- virt_ka.w_sum)) < 1e-9 * max(maximum(abs.(virt_ref.w_sum)), 1.0)
     end
 
+    @testset "coupled sweep (fluid<->GhostParticleSystem, item 7): onesided vs ka=true" begin
+        # GhostParticleSystem's dispatch surface (pfn_contribution methods
+        # narrowly typed on AbstractGhostParticleSystem) predates item 7, but
+        # `device_view(ghost)` did not — before item 7, `ka=true` on any
+        # ghost-coupled interaction was an unconditional MethodError. This is
+        # the first KA test to exercise it. Uses a REAL self-referencing
+        # ghost (ghost.source === fluid, mirroring bubble3.jl's
+        # boundary_ghost) via test_onesided_sweep.jl's
+        # _xsph_ghost_fluid/_xsph_ghost_setup! fixtures — two independent
+        # fluid+ghost pairs (deepcopy before either is touched further), one
+        # run through the Polyester onesided sweep, one through ka=true.
+        rng = MersenneTwister(113)
+        h = 0.08
+        kernel = CubicSplineKernel(h; ndims=2)
+        pfn = FluidPfn(0.03, 0.0, h)
+        for (nx, ny, dx, boundary_cutoff, L) in ((6, 6, h, 3h, 6h), (10, 10, h, 3h, 40h))
+            fluid_ref = _xsph_ghost_fluid(rng, nx, ny, dx)
+            fluid_ka  = deepcopy(fluid_ref)
+            ghost_ref = _xsph_ghost_setup!(fluid_ref, kernel.interaction_length, boundary_cutoff, L, L)
+            ghost_ka  = _xsph_ghost_setup!(fluid_ka,  kernel.interaction_length, boundary_cutoff, L, L)
+            @test ghost_ref.n == ghost_ka.n   # sanity: identical starting state -> identical ghost count
+
+            si_ref = SystemInteraction(kernel, pfn, fluid_ref, ghost_ref; onesided=true)
+            si_ka  = SystemInteraction(kernel, pfn, fluid_ka,  ghost_ka;  onesided=true, ka=true)
+            create_grid!(si_ref); sweep!(si_ref)
+            create_grid!(si_ka);  sweep!(si_ka)
+
+            _kacpu_assert_dvdt_close(fluid_ref.dvdt, fluid_ka.dvdt)
+            _kacpu_assert_drhodt_close(fluid_ref.drhodt, fluid_ka.drhodt)
+        end
+    end
+
     @testset "device_view is a faithful proxy (self and coupled)" begin
         # Running the existing Polyester one-sided sweep against a
         # device_view-wrapped host system must reproduce the un-wrapped

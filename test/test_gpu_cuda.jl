@@ -94,6 +94,14 @@ else
             static_bnd = StaticBoundarySystem(adapt(CUDABackend(), boundary), 0.03)
             dvb = Grasph.device_view(static_bnd)
             @test isbitstype(typeof(cudaconvert(dvb)))
+
+            ghost_src = FluidParticleSystem("ghost_src", 10, 2, 1.0, 10.0)
+            ghost = GhostParticleSystem(ghost_src, GhostCopier(:p); name="ghost")
+            entry = GhostEntry(ghost, 0.1, (SVector(1.0, 0.0), SVector(0.0, 0.0)))
+            generate_ghosts!(entry)
+            ghost_gpu = adapt(CUDABackend(), entry).ghost
+            dvg = Grasph.device_view(ghost_gpu)
+            @test isbitstype(typeof(cudaconvert(dvg)))
         end
 
         @testset "full pipeline (sort+grid+sweep), self: CPU oracle vs CUDA" begin
@@ -340,6 +348,298 @@ else
             @test maximum(norm.(virt_cpu.v[ov] .- virt_gpu_h.v[ovg])) < 1e-10 * v_scale
             @test maximum(abs.(virt_cpu.rho[ov] .- virt_gpu_h.rho[ovg])) < 1e-10 * rho_scale
             @test maximum(abs.(virt_cpu.w_sum[ov] .- virt_gpu_h.w_sum[ovg])) < 1e-10 * max(maximum(abs.(virt_cpu.w_sum)), 1.0)
+        end
+
+        @testset "generate_ghosts!/update_ghost_kinematics!/GhostCopier GPU vs CPU oracle (item 7)" begin
+            # The core new machinery item 7 adds: generate_ghosts!'s GPU path
+            # (flag + cumsum exclusive-scan + compaction into
+            # capacity-preallocated buffers, GhostParticles.jl/KAKernels.jl)
+            # replacing the CPU count-then-cursor algorithm, which cannot
+            # port to a CuArray directly (a per-step resize! to the exact
+            # count is a full reallocation every step). Also exercises the
+            # GPU kernel twins of update_ghost_kinematics! and GhostCopier's
+            # field-copy, which are new scalar-loop-on-GPU hazards item 7
+            # introduces (both would violate CUDA.allowscalar(false) if left
+            # as the original CPU-only loops).
+            CUDA.allowscalar(false)
+            rng = MersenneTwister(208)
+
+            boundaries = (
+                (SVector(1.0, 0.0), SVector(0.0, 0.0)),
+                (SVector(-1.0, 0.0), SVector(0.4, 0.0)),
+                (SVector(0.0, 1.0), SVector(0.0, 0.0)),
+                (SVector(0.0, -1.0), SVector(0.0, 0.4)),
+            )
+            _build_ghost(fluid) = begin
+                ghost = GhostParticleSystem(fluid, GhostCopier(:p); name="ghost[$(fluid.name)]")
+                GhostEntry(ghost, 0.15, boundaries...)
+            end
+
+            fluid_cpu = _gpucuda_random_fluid(rng, 500, 2; L=0.4)
+            entry_cpu = _build_ghost(fluid_cpu)
+
+            entry_gpu = adapt(CUDABackend(), entry_cpu)
+            ghost_gpu = entry_gpu.ghost
+            fluid_gpu = getfield(ghost_gpu, :source)
+            ghost_cpu = entry_cpu.ghost
+
+            function _compare_ghosts()
+                n = ghost_cpu.n
+                @test ghost_gpu.n == n
+                cap = length(getfield(ghost_gpu, :x))
+                @test n <= cap
+                x_h   = Array(view(getfield(ghost_gpu, :x), 1:n))
+                io_h  = Array(view(getfield(ghost_gpu, :idx_original), 1:n))
+                ib_h  = Array(view(getfield(ghost_gpu, :idx_boundary), 1:n))
+                nrm_h = Array(view(getfield(ghost_gpu, :normals), 1:n))
+                @test x_h   == getfield(ghost_cpu, :x)[1:n]
+                @test io_h  == getfield(ghost_cpu, :idx_original)[1:n]
+                @test ib_h  == getfield(ghost_cpu, :idx_boundary)[1:n]
+                @test nrm_h == getfield(ghost_cpu, :normals)[1:n]
+                return cap
+            end
+
+            generate_ghosts!(entry_cpu)
+            generate_ghosts!(entry_gpu)
+            _compare_ghosts()
+
+            update_ghost_kinematics!(entry_cpu)
+            update_ghost_kinematics!(entry_gpu)
+            update_ghost!(entry_cpu, 1)
+            update_ghost!(entry_gpu, 1)
+            n0 = ghost_cpu.n
+            v_h   = Array(view(getfield(ghost_gpu, :v), 1:n0))
+            rho_h = Array(view(getfield(ghost_gpu, :rho), 1:n0))
+            p_h   = Array(view(ghost_gpu.p, 1:n0))
+            @test maximum(norm.(v_h .- getfield(ghost_cpu, :v)[1:n0])) < 1e-10
+            @test maximum(abs.(rho_h .- getfield(ghost_cpu, :rho)[1:n0])) < 1e-10
+            @test maximum(abs.(p_h .- ghost_cpu.p[1:n0])) < 1e-10
+
+            # Grow: pull particles toward every wall at once -> more ghosts
+            # qualify -> capacity must grow (both the owned arrays AND the
+            # :p extras array, which starts at length 0 independently of
+            # x/v/rho/etc. — the exact bug the capacity-growth fix here
+            # covers).
+            for i in 1:fluid_cpu.n
+                fluid_cpu.x[i] = SVector(0.2, 0.2) .+ (fluid_cpu.x[i] .- SVector(0.2, 0.2)) .* 0.3
+            end
+            copyto!(getfield(fluid_gpu, :x), CuArray(fluid_cpu.x))
+            generate_ghosts!(entry_cpu)
+            generate_ghosts!(entry_gpu)
+            cap_grown = _compare_ghosts()
+            @test cap_grown >= ghost_cpu.n
+
+            # Shrink: push particles toward the interior, away from every
+            # wall -> fewer ghosts qualify, but capacity (grow-only) must NOT
+            # shrink -> ghost.n < capacity from here on, the exact
+            # capacity-vs-logical-count regime this item's _bbox/
+            # _populate_cells_sorted! explicit-`n` fix (Interaction.jl)
+            # exists for (an earlier version of this fix, keyed only off
+            # length(ghost.x), silently missed the :p extras array's smaller
+            # starting capacity here and corrupted GPU memory).
+            for i in 1:fluid_cpu.n
+                fluid_cpu.x[i] = SVector(0.2, 0.2) .+ (fluid_cpu.x[i] .- SVector(0.2, 0.2)) .* 20.0 .+ SVector(0.15, 0.0)
+            end
+            copyto!(getfield(fluid_gpu, :x), CuArray(fluid_cpu.x))
+            generate_ghosts!(entry_cpu)
+            generate_ghosts!(entry_gpu)
+            cap_after_shrink = _compare_ghosts()
+            @test cap_after_shrink == cap_grown          # capacity never shrinks
+            @test ghost_cpu.n < cap_after_shrink          # genuinely in the capacity > n regime
+        end
+
+        @testset "GhostCopier HouseholderReflect mode: GPU vs CPU oracle (item 7)" begin
+            # _ghost_copy_field_kernel! is launched identically regardless of
+            # `mode` (GhostParticles.jl's _copy_fields_ka!), so `mode = nothing`
+            # (every other ghost GPU test above) and `mode =
+            # HouseholderReflect()` are two distinct kernel specializations —
+            # the reflection arithmetic runs entirely inside the kernel body
+            # via _apply_mode, unlike the flag/scatter kernels' simpler
+            # dot-product predicate. This is the first real-hardware exercise
+            # of that specialization.
+            CUDA.allowscalar(false)
+            rng = MersenneTwister(211)
+            ep_cpu = _gpucuda_random_elastoplastic(rng, 60, 2; L=0.4)
+            ep_cpu.stress .= [SVector(1.0 + 0.1i, 2.0 - 0.05i, 0.3, 0.7 + 0.02i) for i in 1:60]
+
+            ghost_cpu = GhostParticleSystem(ep_cpu, GhostCopier(:stress => HouseholderReflect()); name="ghost[ep]")
+            entry_cpu = GhostEntry(ghost_cpu, 0.15, (SVector(1.0, 0.0), SVector(0.0, 0.0)))
+            entry_gpu = adapt(CUDABackend(), entry_cpu)
+            ghost_gpu = entry_gpu.ghost
+
+            generate_ghosts!(entry_cpu)
+            generate_ghosts!(entry_gpu)
+            n = ghost_cpu.n
+            @test n > 0
+            @test ghost_gpu.n == n
+
+            update_ghost!(entry_cpu, 1)
+            update_ghost!(entry_gpu, 1)
+
+            stress_cpu = ghost_cpu.stress[1:n]
+            stress_gpu_h = Array(view(ghost_gpu.stress, 1:n))
+            @test maximum(norm.(stress_cpu .- stress_gpu_h)) < 1e-10
+        end
+
+        @testset "generate_ghosts! 3D: GPU vs CPU oracle (item 7)" begin
+            # Every other ghost GPU test above is 2D-only; the flag/scatter/
+            # kinematics kernels are dimension-generic via SVector{ND,T}, but
+            # ND=3 kernel compilation had never actually run on hardware.
+            CUDA.allowscalar(false)
+            rng = MersenneTwister(212)
+            fluid_cpu = _gpucuda_random_fluid(rng, 400, 3; L=0.4)
+            ghost_cpu = GhostParticleSystem(fluid_cpu, GhostCopier(:p); name="ghost3d[fluid]")
+            entry_cpu = GhostEntry(ghost_cpu, 0.1,
+                (SVector(1.0, 0.0, 0.0), SVector(0.0, 0.0, 0.0)),
+                (SVector(0.0, 1.0, 0.0), SVector(0.0, 0.0, 0.0)),
+                (SVector(0.0, 0.0, 1.0), SVector(0.0, 0.0, 0.0)),
+            )
+            entry_gpu = adapt(CUDABackend(), entry_cpu)
+            ghost_gpu = entry_gpu.ghost
+
+            generate_ghosts!(entry_cpu)
+            generate_ghosts!(entry_gpu)
+            n = ghost_cpu.n
+            @test n > 0
+            @test ghost_gpu.n == n
+            @test Array(view(getfield(ghost_gpu, :x), 1:n)) == getfield(ghost_cpu, :x)[1:n]
+            @test Array(view(getfield(ghost_gpu, :idx_original), 1:n)) == getfield(ghost_cpu, :idx_original)[1:n]
+
+            update_ghost_kinematics!(entry_cpu)
+            update_ghost_kinematics!(entry_gpu)
+            update_ghost!(entry_cpu, 1)
+            update_ghost!(entry_gpu, 1)
+            @test maximum(norm.(Array(view(getfield(ghost_gpu, :v), 1:n)) .- getfield(ghost_cpu, :v)[1:n])) < 1e-10
+            @test maximum(abs.(Array(view(ghost_gpu.p, 1:n)) .- ghost_cpu.p[1:n])) < 1e-10
+        end
+
+        @testset "generate_ghosts! NB=8 (bubble3.jl's real wall+corner shape): GPU vs CPU oracle (item 7)" begin
+            # Every other ghost GPU test above uses NB<=4; the actual
+            # production shape (bubble3.jl's boundary_ghost, mirrored by
+            # test_onesided_sweep.jl's _xsph_ghost_fluid/_xsph_ghost_setup!)
+            # uses 4 walls + 4 corners = NB=8. The flattened (boundary,
+            # particle) linear-index arithmetic in _ghost_flag_kernel!/
+            # _ghost_scatter_kernel! is NB-generic, but this is the first
+            # real-hardware exercise at the actual NB this codebase uses.
+            CUDA.allowscalar(false)
+            rng = MersenneTwister(213)
+            fluid_cpu = _xsph_ghost_fluid(rng, 8, 8, 0.05)
+            Lx = Ly = 0.4
+            boundary_cutoff = 3 * 0.05
+            ghost_cpu = GhostParticleSystem(fluid_cpu, GhostCopier(:p); name="ghost8[fluid]")
+            entry_cpu = GhostEntry(ghost_cpu, boundary_cutoff,
+                (SVector( 1.0,  0.0),            SVector(0.0, 0.0)),
+                (SVector(-1.0,  0.0),            SVector(Lx,  0.0)),
+                (SVector( 0.0,  1.0),            SVector(0.0, 0.0)),
+                (SVector( 0.0, -1.0),            SVector(0.0, Ly)),
+                (SVector( 1.0,  1.0)/sqrt(2.0),  SVector(0.0, 0.0)),
+                (SVector(-1.0,  1.0)/sqrt(2.0),  SVector(Lx,  0.0)),
+                (SVector( 1.0, -1.0)/sqrt(2.0),  SVector(0.0, Ly)),
+                (SVector(-1.0, -1.0)/sqrt(2.0),  SVector(Lx,  Ly)),
+            )
+            entry_gpu = adapt(CUDABackend(), entry_cpu)
+            ghost_gpu = entry_gpu.ghost
+
+            generate_ghosts!(entry_cpu)
+            generate_ghosts!(entry_gpu)
+            n = ghost_cpu.n
+            @test n > 0
+            @test ghost_gpu.n == n
+            # x uses a relative tolerance, not ==: the 4 corner boundaries'
+            # diagonal normals (SVector(±1,±1)/sqrt(2)) involve genuine
+            # floating-point products where NVPTX's FMA contraction can
+            # differ from the host by 1 ulp — the same well-documented
+            # CPU/GPU float noise this codebase tolerances everywhere else
+            # (the 4 axis-aligned wall normals above have no such risk,
+            # which is why every other ghost GPU test above safely uses ==).
+            # idx_original/idx_boundary stay ==: integer, no rounding.
+            x_cpu = getfield(ghost_cpu, :x)[1:n]
+            x_gpu_h = Array(view(getfield(ghost_gpu, :x), 1:n))
+            @test maximum(norm.(x_cpu .- x_gpu_h)) < 1e-12 * max(maximum(norm.(x_cpu)), 1.0)
+            @test Array(view(getfield(ghost_gpu, :idx_original), 1:n)) == getfield(ghost_cpu, :idx_original)[1:n]
+            @test Array(view(getfield(ghost_gpu, :idx_boundary), 1:n)) == getfield(ghost_cpu, :idx_boundary)[1:n]
+            @test extrema(Array(view(getfield(ghost_gpu, :idx_boundary), 1:n))) == extrema(getfield(ghost_cpu, :idx_boundary)[1:n])
+        end
+
+        @testset "full pipeline (sort+grid+sweep), fluid<->GhostParticleSystem (item 7): CPU oracle vs CUDA" begin
+            # End-to-end version of the testset above: sort + grid + sweep
+            # with a real ghost, deliberately run AFTER the ghost count has
+            # shrunk below a previously-grown capacity — the scenario that
+            # would silently pull stale capacity-slot data into the CSR grid
+            # if _bbox/_populate_cells_sorted! (Interaction.jl) still derived
+            # their particle count from `length(x)` instead of an explicit
+            # `n`. FluidPfn's ghost-coupled pfn_contribution method
+            # (PairwiseFunctors.jl) predates item 7; only device_view(ghost)
+            # is new, making `ka=true` reachable here for the first time.
+            CUDA.allowscalar(false)
+            rng = MersenneTwister(209)
+            h = 0.04
+            kernel = CubicSplineKernel(h; ndims=2)
+            cutoff = kernel.interaction_length
+            pfn = FluidPfn(0.03, 0.0, h)
+
+            boundaries = (
+                (SVector(1.0, 0.0), SVector(0.0, 0.0)),
+                (SVector(-1.0, 0.0), SVector(0.4, 0.0)),
+                (SVector(0.0, 1.0), SVector(0.0, 0.0)),
+                (SVector(0.0, -1.0), SVector(0.0, 0.4)),
+            )
+            _build_ghost2(fluid) = begin
+                ghost = GhostParticleSystem(fluid, GhostCopier(:p); name="ghost[$(fluid.name)]")
+                GhostEntry(ghost, 3h, boundaries...)
+            end
+
+            fluid_cpu = _gpucuda_random_fluid(rng, 500, 2; L=0.4)
+            entry_cpu = _build_ghost2(fluid_cpu)
+            entry_gpu = adapt(CUDABackend(), entry_cpu)
+            ghost_gpu = entry_gpu.ghost
+            fluid_gpu = getfield(ghost_gpu, :source)
+            ghost_cpu = entry_cpu.ghost
+
+            # Grow then shrink (same recipe as above) so both sides enter the
+            # sweep with ghost.n < capacity on the GPU.
+            for i in 1:fluid_cpu.n
+                fluid_cpu.x[i] = SVector(0.2, 0.2) .+ (fluid_cpu.x[i] .- SVector(0.2, 0.2)) .* 0.3
+            end
+            copyto!(getfield(fluid_gpu, :x), CuArray(fluid_cpu.x))
+            generate_ghosts!(entry_cpu); generate_ghosts!(entry_gpu)
+            grown_cap = length(getfield(ghost_gpu, :x))
+
+            for i in 1:fluid_cpu.n
+                fluid_cpu.x[i] = SVector(0.2, 0.2) .+ (fluid_cpu.x[i] .- SVector(0.2, 0.2)) .* 20.0 .+ SVector(0.15, 0.0)
+            end
+            copyto!(getfield(fluid_gpu, :x), CuArray(fluid_cpu.x))
+
+            si_cpu = SystemInteraction(kernel, pfn, fluid_cpu, ghost_cpu; onesided=true)
+            pb, kb, sc = _gpucuda_sortbufs_cpu(fluid_cpu)
+            sort_particles!(fluid_cpu, cutoff, pb, kb, sc)
+            generate_ghosts!(entry_cpu)
+            gpb, gkb, gsc = _gpucuda_sortbufs_cpu(ghost_cpu)
+            sort_particles!(ghost_cpu, cutoff, gpb, gkb, gsc)
+            update_ghost_kinematics!(entry_cpu)
+            update_ghost!(entry_cpu, 1)
+            create_grid!(si_cpu)
+            sweep!(si_cpu)
+
+            si_gpu = SystemInteraction(kernel, pfn, fluid_gpu, ghost_gpu; onesided=true, ka=true)
+            pbg, kbg, scg = _gpucuda_sortbufs_gpu(fluid_gpu)
+            sort_particles!(fluid_gpu, cutoff, pbg, kbg, scg)
+            generate_ghosts!(entry_gpu)
+            @test length(getfield(ghost_gpu, :x)) == grown_cap   # still in the capacity > n regime
+            @test ghost_gpu.n < grown_cap
+            gpbg, gkbg, gscg = _gpucuda_sortbufs_gpu(ghost_gpu)
+            sort_particles!(ghost_gpu, cutoff, gpbg, gkbg, gscg)
+            update_ghost_kinematics!(entry_gpu)
+            update_ghost!(entry_gpu, 1)
+            create_grid!(si_gpu)
+            sweep!(si_gpu)
+
+            fluid_gpu_h = adapt(Array, fluid_gpu)
+            oc, og = _byid(fluid_cpu), _byid(fluid_gpu_h)
+            dvdt_scale = max(maximum(norm.(fluid_cpu.dvdt)), 1.0)
+            drhodt_scale = max(maximum(abs.(fluid_cpu.drhodt)), 1.0)
+            @test maximum(norm.(fluid_cpu.dvdt[oc] .- fluid_gpu_h.dvdt[og])) < 1e-9 * dvdt_scale
+            @test maximum(abs.(fluid_cpu.drhodt[oc] .- fluid_gpu_h.drhodt[og])) < 1e-9 * drhodt_scale
         end
 
         @testset "state update (TaitEOSUpdater): CPU vs CUDA" begin

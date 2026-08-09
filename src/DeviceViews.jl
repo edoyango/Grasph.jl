@@ -130,3 +130,49 @@ end
     nt = _device_fields(vps)
     return DeviceVirtualSystem{T, ND, typeof(nt)}(nt)
 end
+
+# ---------------------------------------------------------------------------
+# GhostParticleSystem — same shape as DeviceVirtualSystem above: subtypes
+# AbstractGhostParticleSystem so every pfn_contribution/_onesided_zero_coupled
+# method already narrowly typed on that abstraction (ghosts are always a
+# read-only ps_b, never a write target — see item 8's Kind-parameter note for
+# why narrow typing matters here too) dispatches into the device view
+# unmodified.
+#
+# Only the fields pfn_contribution/the sweep kernel actually read off a
+# ghost-as-ps_b are captured: `x`/`v`/`rho` (owned, first-class),
+# `mass`/`c` (scalars, forwarded from source), plus whatever `extras` fields
+# (`p`, `stress`, …) the specific coupling reads. `idx_original`/
+# `idx_boundary`/`normals` are pure ghost-generation bookkeeping — consumed
+# by generate_ghosts!/update_ghost_kinematics!/GhostCopier, never by a pfn —
+# so they're deliberately left out of the device view.
+#
+# `n` is captured as a concrete Int at view-construction time (ghost.n reads
+# the `count` Ref then), same as every other _device_fields method — the
+# kernel that launches with this view uses it only for `ndrange`/loop bounds,
+# never mutates it, so a stale snapshot is exactly what's wanted.
+# ---------------------------------------------------------------------------
+
+struct DeviceGhostSystem{T, ND, NT<:NamedTuple} <: AbstractGhostParticleSystem{T, ND}
+    _f::NT
+end
+
+@inline function Base.getproperty(ds::DeviceGhostSystem{T,ND}, s::Symbol) where {T,ND}
+    s === :ndims && return ND
+    return getfield(getfield(ds, :_f), s)
+end
+
+function Adapt.adapt_structure(to, ds::DeviceGhostSystem{T,ND}) where {T,ND}
+    nt = Adapt.adapt(to, getfield(ds, :_f))
+    DeviceGhostSystem{T, ND, typeof(nt)}(nt)
+end
+
+@inline _device_fields(ghost::GhostParticleSystem) =
+    merge((n = ghost.n, x = getfield(ghost, :x), v = getfield(ghost, :v), rho = getfield(ghost, :rho),
+           mass = ghost.mass, c = ghost.c),
+          getfield(ghost, :extras))
+
+@inline function device_view(ghost::GhostParticleSystem{T,ND}) where {T,ND}
+    nt = _device_fields(ghost)
+    return DeviceGhostSystem{T, ND, typeof(nt)}(nt)
+end

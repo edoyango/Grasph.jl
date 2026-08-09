@@ -154,14 +154,20 @@ end
 # method — and mapreduce with `init` works identically on Vector and CuArray).
 # min/max have no rounding error, so this is bit-identical to a scalar
 # incremental loop regardless of reduction order.
-@inline function _bbox(xa::AbstractVector{SVector{ND,T}}) where {ND,T}
+#
+# Takes `n` explicitly rather than deriving it from `length(xa)`: every
+# particle-system type today happens to have `length(x) == n`, but a ghost
+# system backed by a capacity-preallocated buffer (see GhostParticles.jl's
+# GPU generate_ghosts! path) can have `length(x) > n` — unused capacity
+# beyond index n holds stale data from a previous step, not real particles.
+@inline function _bbox(xa::AbstractVector{SVector{ND,T}}, n::Int) where {ND,T}
     z = SVector{ND,T}(ntuple(_ -> typemax(T), Val(ND)))
     o = SVector{ND,T}(ntuple(_ -> typemin(T), Val(ND)))
-    mapreduce(v -> (v, v), (a, b) -> (min.(a[1], b[1]), max.(a[2], b[2])), xa; init = (z, o))
+    mapreduce(v -> (v, v), (a, b) -> (min.(a[1], b[1]), max.(a[2], b[2])), view(xa, 1:n); init = (z, o))
 end
 
 function _create_grid_impl!(si::SystemInteraction{T}, ::Nothing, cutoff::T) where {T}
-    mn, mx = _bbox(si.system_a.x)
+    mn, mx = _bbox(si.system_a.x, si.system_a.n)
     # Snap mingridx down to the nearest multiple of cutoff below the padded minimum.
     # Since cutoff is identical for all interactions, every snapped origin is an integer
     # multiple of cutoff from 0, so cell boundaries align across all grids in the
@@ -175,8 +181,8 @@ end
 # --- coupled interaction ---
 
 function _create_grid_impl!(si::SystemInteraction{T}, system_b, cutoff::T) where {T}
-    mn_a, mx_a = _bbox(si.system_a.x)
-    mn_b, mx_b = _bbox(system_b.x)
+    mn_a, mx_a = _bbox(si.system_a.x, si.system_a.n)
+    mn_b, mx_b = _bbox(system_b.x, system_b.n)
     mn = min.(mn_a, mn_b)
     mx = max.(mx_a, mx_b)
     mingridx = _snap_to_grid(mn .- 2*cutoff, cutoff)
@@ -227,16 +233,19 @@ end
 # After the call:
 #   cell_start[c] .. cell_start[c+1]-1  is the (inclusive) range of particles in cell c.
 #   Empty cells satisfy cell_start[c] == cell_start[c+1].
-@inline _populate_cells_sorted!(cell_start::AbstractVector{Int}, x, mingridx, cutoff, ngridx, vnd) =
-    _populate_cells_sorted!(KA.get_backend(cell_start), cell_start, x, mingridx, cutoff, ngridx, vnd)
+#
+# `n` is passed explicitly rather than derived from `length(x)` for the same
+# reason as `_bbox` above: a capacity-preallocated ghost system's `x` can be
+# longer than its logical particle count.
+@inline _populate_cells_sorted!(cell_start::AbstractVector{Int}, x, mingridx, cutoff, ngridx, n::Int, vnd) =
+    _populate_cells_sorted!(KA.get_backend(cell_start), cell_start, x, mingridx, cutoff, ngridx, n, vnd)
 
 function _populate_cells_sorted!(::KA.CPU, cell_start::AbstractVector{Int},
-                                  x, mingridx, cutoff, ngridx, vnd)
+                                  x, mingridx, cutoff, ngridx, n::Int, vnd)
     ncells = length(cell_start) - 1
-    n      = length(x)
     # Forward pass: record the first particle index for each non-empty cell.
     prev_cell = 0
-    @inbounds for i in eachindex(x)
+    @inbounds for i in 1:n
         cell = _cell_1idx(x[i], mingridx, cutoff, ngridx, vnd)
         if cell != prev_cell
             cell_start[cell] = i
@@ -263,9 +272,8 @@ end
 # snapshotted from SystemInteraction's mutable MVector fields to immutable
 # SVectors here, since MVector cannot cross the kernel boundary.
 function _populate_cells_sorted!(backend::KA.GPU, cell_start::AbstractVector{Int},
-                                  x, mingridx, cutoff, ngridx, ::Val{2})
+                                  x, mingridx, cutoff, ngridx, n::Int, ::Val{2})
     fill!(cell_start, 0)
-    n = length(x)
     if n > 0
         _cell_histogram_kernel_2d!(backend, _KA_WORKGROUP)(
             cell_start, x, SVector(mingridx), cutoff, SVector(ngridx); ndrange = n)
@@ -277,9 +285,8 @@ function _populate_cells_sorted!(backend::KA.GPU, cell_start::AbstractVector{Int
 end
 
 function _populate_cells_sorted!(backend::KA.GPU, cell_start::AbstractVector{Int},
-                                  x, mingridx, cutoff, ngridx, ::Val{3})
+                                  x, mingridx, cutoff, ngridx, n::Int, ::Val{3})
     fill!(cell_start, 0)
-    n = length(x)
     if n > 0
         _cell_histogram_kernel_3d!(backend, _KA_WORKGROUP)(
             cell_start, x, SVector(mingridx), cutoff, SVector(ngridx); ndrange = n)
@@ -292,17 +299,17 @@ end
 
 function _populate_cells_self!(si::SystemInteraction{T,ND}, cutoff::T) where {T,ND}
     _populate_cells_sorted!(si._cell_start,
-                            si.system_a.x, si._mingridx, cutoff, si._ngridx, Val{ND}())
+                            si.system_a.x, si._mingridx, cutoff, si._ngridx, si.system_a.n, Val{ND}())
 end
 
 function _populate_cells_a!(si::SystemInteraction{T,ND}, cutoff::T) where {T,ND}
     _populate_cells_sorted!(si._cell_start_a,
-                            si.system_a.x, si._mingridx, cutoff, si._ngridx, Val{ND}())
+                            si.system_a.x, si._mingridx, cutoff, si._ngridx, si.system_a.n, Val{ND}())
 end
 
 function _populate_cells_b!(si::SystemInteraction{T,ND}, cutoff::T) where {T,ND}
     _populate_cells_sorted!(si._cell_start,
-                            si.system_b.x, si._mingridx, cutoff, si._ngridx, Val{ND}())
+                            si.system_b.x, si._mingridx, cutoff, si._ngridx, si.system_b.n, Val{ND}())
 end
 
 # ---------------------------------------------------------------------------

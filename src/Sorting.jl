@@ -217,8 +217,14 @@ end
 # sort_particles! typically sees after the first few timesteps); dropped on
 # non-CPU backends, where CUDA.jl's sortperm! is the only option and is
 # verified stable (bit-identical permutation to Base's stable sort on ties).
-# Ghost systems stay on Base's default sortperm! unconditionally — ghosts are
-# not GPU-resident in this migration (see docs/gpu-migration-plan.md).
+# Ghost systems always skip the InsertionSort fast path, regardless of
+# backend: plain `sortperm!(perm_view, key_view)` (no `alg=`) already
+# dispatches to CUDA.jl's own sortperm! when perm_view/key_view are
+# CuArray-backed (ghosts can be GPU-resident since item 7 — see
+# GhostParticleSystem, GhostParticles.jl), exactly like the generic path
+# below does for a GPU backend. This is a deliberate, minor simplification
+# (ghost positions shift continuously step-to-step too, so InsertionSort
+# could in principle help there as well), not a correctness gap.
 @inline _sortperm_by_key!(::AbstractParticleSystem, perm_view, key_view) =
     _sortperm_by_key_backend!(KA.get_backend(perm_view), perm_view, key_view)
 

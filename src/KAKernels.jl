@@ -290,3 +290,77 @@ function _sweep_coupled_ka_dispatch!(::WritesBoth, si, system_b, pfn)
     _sweep_coupled_ka_reverse!(si, system_b, pfn)
     nothing
 end
+
+# ---------------------------------------------------------------------------
+# Ghost kernels — GPU (item 7). GhostParticleSystem's owned arrays are
+# capacity-preallocated (see GhostParticles.jl's generate_ghosts! GPU path),
+# so every kernel below is bounded by an explicit `n`/`ndrange` argument
+# rather than the arrays' own `length`, exactly like every non-CPU kernel
+# elsewhere in this file.
+# ---------------------------------------------------------------------------
+
+# --- generate_ghosts!: flag + compaction ---
+#
+# The (boundary, particle) pair space is flattened to one linear index,
+# boundary-major then particle-minor (`lin = (b-1)*ps_n + i`), matching the
+# CPU version's nested-loop order exactly — so a ghost's k-th slot maps to
+# the same source particle/boundary on both backends. `boundaries` is a
+# small NTuple of isbits GhostBoundary structs passed by value (not a device
+# array) — cheap to broadcast to every thread, and `boundaries[b]` with a
+# runtime `b` compiles to ordinary unrolled-select code since NB is a
+# compile-time constant (part of the tuple's type). The qualification
+# predicate itself (`_ghost_qualifies`, GhostParticles.jl) is shared with the
+# CPU generate_ghosts! path so the two backends can never silently drift
+# apart on which particles qualify as ghosts.
+
+@kernel function _ghost_flag_kernel!(flags, @Const(x), boundaries, cutoff, ps_n)
+    lin = @index(Global, Linear)
+    @inbounds begin
+        b = (lin - 1) ÷ ps_n + 1
+        i = (lin - 1) % ps_n + 1
+        qualifies, _ = _ghost_qualifies(boundaries[b], x[i], cutoff)
+        flags[lin] = qualifies ? 1 : 0
+    end
+end
+
+# `offsets` holds the inclusive prefix sum of the same predicate (computed by
+# the caller via `cumsum!` on the flags this kernel's sibling produced) — for
+# a qualifying pair, `offsets[lin]` IS its final 1-based destination index.
+@kernel function _ghost_scatter_kernel!(dst_x, dst_idx_orig, dst_idx_bnd, dst_normals,
+                                         @Const(offsets), @Const(x), boundaries, cutoff, ps_n)
+    lin = @index(Global, Linear)
+    @inbounds begin
+        b = (lin - 1) ÷ ps_n + 1
+        i = (lin - 1) % ps_n + 1
+        bnd = boundaries[b]
+        qualifies, da = _ghost_qualifies(bnd, x[i], cutoff)
+        if qualifies
+            dst               = offsets[lin]
+            dst_x[dst]        = x[i] - (2 * da) * bnd.normal
+            dst_idx_orig[dst] = i
+            dst_idx_bnd[dst]  = b
+            dst_normals[dst]  = bnd.normal
+        end
+    end
+end
+
+# --- update_ghost_kinematics!: one thread per ghost ---
+
+@kernel function _ghost_kinematics_kernel!(v_ghost, rho_ghost, @Const(idx_orig), @Const(normals),
+                                            @Const(v_real), @Const(rho_real))
+    k = @index(Global, Linear)
+    @inbounds begin
+        normal       = normals[k]
+        io           = idx_orig[k]
+        v_r          = v_real[io]
+        v_ghost[k]   = v_r - 2 * dot(v_r, normal) * normal
+        rho_ghost[k] = rho_real[io]
+    end
+end
+
+# --- GhostCopier field copy: one thread per ghost, one launch per field ---
+
+@kernel function _ghost_copy_field_kernel!(arr, @Const(src_arr), @Const(idx), @Const(normals), mode)
+    k = @index(Global, Linear)
+    @inbounds arr[k] = _apply_mode(src_arr[idx[k]], mode, normals[k])
+end

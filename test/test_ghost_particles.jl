@@ -2,6 +2,7 @@ using Test
 using Grasph
 using StaticArrays
 using LinearAlgebra
+using HDF5
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -44,6 +45,18 @@ end
     @test ghost.n           == 4
     @test length(ghost.x)   == 4
     @test length(ghost.v)   == 4
+end
+
+@testset "GhostParticleSystem cannot wrap another ghost (item 7)" begin
+    # A ghost's particle count changes every generate_ghosts! call; nesting
+    # would invalidate the wrapping GhostEntry's fixed-size _flags scratch
+    # buffer (sized once from source.n at construction, on the assumption
+    # that source.n never changes — true for every real particle-system
+    # type, false for a ghost). Guarded at construction rather than left as
+    # a silent GPU out-of-bounds write.
+    ps    = _make_fluid(n=4)
+    ghost = GhostParticleSystem(ps)
+    @test_throws ArgumentError GhostParticleSystem(ghost)
 end
 
 # ---------------------------------------------------------------------------
@@ -190,6 +203,64 @@ end
     generate_ghosts!(entry)
     @test ghost.n == 3
     @test length(ghost.x)  == 3
+end
+
+@testset "write_h5(ghost, ...) slices to n, not full array length (item 7)" begin
+    # write_h5 was rewritten (item 7) to explicitly view(..., 1:n) every
+    # owned/extras array instead of writing the raw array, since GPU-resident
+    # ghosts can have length(array) > n (capacity-preallocated, see
+    # GhostParticleSystem's docstring). CPU generate_ghosts! always keeps
+    # capacity == n exactly, so this scenario is constructed by hand here
+    # (resize!ing every owned array plus the :p extras past n, filling the
+    # extra slots with a sentinel that must NOT appear in the file) to
+    # exercise the slicing logic without needing a GPU.
+    ps = _make_fluid(n=4)
+    ps.x[1] = SVector(0.1, 0.05); ps.x[2] = SVector(0.2, 0.05)
+    ps.x[3] = SVector(0.3, 0.05); ps.x[4] = SVector(0.4, 0.5)
+    ps.p .= [1.0, 2.0, 3.0, 4.0]
+    ghost = GhostParticleSystem(ps, GhostCopier(:p); name="ghost[fluid]")
+    entry = GhostEntry(ghost, 0.15, (SVector(0.0, 1.0), SVector(0.0, 0.0)))
+    generate_ghosts!(entry)
+    update_ghost_kinematics!(entry)
+    update_ghost!(entry, 1)
+    n = ghost.n
+    @test n == 3   # sanity: particles 1-3 qualify, particle 4 doesn't
+
+    sentinel = SVector(-999.0, -999.0)
+    cap = n + 5
+    resize!(getfield(ghost, :x), cap);            getfield(ghost, :x)[n+1:cap]            .= Ref(sentinel)
+    resize!(getfield(ghost, :v), cap);            getfield(ghost, :v)[n+1:cap]            .= Ref(sentinel)
+    resize!(getfield(ghost, :rho), cap);          getfield(ghost, :rho)[n+1:cap]          .= -999.0
+    resize!(getfield(ghost, :idx_original), cap); getfield(ghost, :idx_original)[n+1:cap] .= -999
+    resize!(getfield(ghost, :idx_boundary), cap); getfield(ghost, :idx_boundary)[n+1:cap] .= -999
+    resize!(getfield(ghost, :normals), cap);      getfield(ghost, :normals)[n+1:cap]      .= Ref(sentinel)
+    resize!(getproperty(getfield(ghost, :extras), :p), cap)
+    getproperty(getfield(ghost, :extras), :p)[n+1:cap] .= -999.0
+
+    mktempdir() do dir
+        path = joinpath(dir, "ghost.h5")
+        h5open(path, "w") do f
+            write_h5(ghost, create_group(f, "ghost"))
+        end
+        h5open(path, "r") do f
+            g = f["ghost"]
+            @test HDF5.attrs(g)["n"][] == n
+            @test size(g["x"]) == (2, n)
+            @test size(g["v"]) == (2, n)
+            @test length(g["rho"][])          == n
+            @test length(g["idx_original"][]) == n
+            @test length(g["idx_boundary"][]) == n
+            @test length(g["p"][])            == n
+            @test vec(g["x"][]) == vec(reinterpret(reshape, Float64, getfield(ghost, :x)[1:n]))
+            @test g["rho"][]          == getfield(ghost, :rho)[1:n]
+            @test g["idx_original"][] == getfield(ghost, :idx_original)[1:n]
+            @test g["p"][]            == getproperty(getfield(ghost, :extras), :p)[1:n]
+            # None of the sentinel values leaked into the file.
+            @test !any(==(-999.0), g["rho"][])
+            @test !any(==(-999.0), g["p"][])
+            @test !any(==(-999), g["idx_original"][])
+        end
+    end
 end
 
 # ---------------------------------------------------------------------------
