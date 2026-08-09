@@ -69,6 +69,20 @@ _`ProbeParticleSystem`, none of which have GPU-resident orchestration yet,_
 _confirmed directly this session rather than assumed. See item 8's own note_
 _for the full breakdown. No new tests; suite stays 1600/1600._
 
+_2026-08-09 update #8: item 9 (Virtual/probe/RK4 GPU-orchestration gaps) is_
+_done — see the item itself, below. All three gaps turned out to be small,_
+_targeted fixes once traced to source, not the "no GPU sweep path at all"_
+_scope the item's original wording suggested — RK4's was a 2-line buffer-type_
+_fix, Virtual's was one scalar loop, and `ProbeParticleSystem` got the same_
+_array-type-generic + `device_view` treatment items 5/7 already gave_
+_Virtual/Ghost. A real bug (a broken `Ref`-less broadcast in the new_
+_`_axpy_const_ip!` primitive) was caught only by real CUDA hardware — no_
+_`KA.CPU()` test can distinguish this class of bug, since position-advance_
+_backend-dispatches on the array's own type, not on `ka=true`. The 6 scripts_
+_item 8 found blocked by this item are now unblocked at the infrastructure_
+_level but still not wired — that remains a follow-up to item 8. Suite:_
+_1651/1651 (up from 1600)._
+
 ## Why this migration, and why not an octree
 
 The original ask was to get GraSPH.jl (a Julia SPH code) running on GPUs via
@@ -977,7 +991,7 @@ to coloured for all 13 scripts, and no script's behavior changed.
    not a CPU-side optimization, so shipping it alone on these 6 scripts
    would be a pure regression with no offsetting benefit until item 9 makes
    `ka=true` reachable for them too.
-9. Virtual particle systems, probes, and the RK4 integrator have no GPU
+9. ~~Virtual particle systems, probes, and the RK4 integrator have no GPU
    sweep path at all yet, independent of pfn support — `VirtualParticleSystem`
    position/state advance, `_measure_probes!`, and RK4's multi-stage
    bookkeeping are all still CPU-`for`-loop or Polyester code. Confirmed
@@ -985,29 +999,125 @@ to coloured for all 13 scripts, and no script's behavior changed.
    6 of the remaining 11 scripts (`bubble.jl`/`bubble2.jl`/`bubble3.jl`,
    `EP_ColumnCollapse2.jl`, `Trapdoor.jl`, `CantileverBeam.jl`) are blocked
    here rather than by any pfn or `device_view` gap — see item 8's own note
-   for exactly which gap blocks which script.
+   for exactly which gap blocks which script.~~ — **done** (commit
+   `9182bd8`). All three named gaps turned out to be much narrower than "no
+   GPU sweep path at all," once traced to source:
+
+   - **RK4's own gap** (`src/TimeIntegration.jl`): its `time_integrate!`
+     hardcoded `sort_perm_buf = Vector{Int}(undef, ...)`/`sort_key_buf =
+     Vector{UInt64}(undef, ...)` regardless of the systems' actual array
+     type — `LeapFrogTimeIntegrator`'s own loop already derived them via
+     `similar(first(sys).x, Int, sort_max_n)`, RK4's just never got the same
+     treatment. A 2-line fix (mirror LeapFrog exactly). This is invisible to
+     any `KA.CPU()` test — `Vector` and `similar(x,...)` are the same type
+     when `x` is itself a `Vector` — so it could only be caught (and only
+     matters) on a real non-CPU backend.
+   - **`VirtualParticleSystem`'s gap**: `_update_virtual_positions!` was a
+     raw `@inbounds for i in 1:vps.n; vps.x[i] += pv * dt; end` loop. Fixed
+     with a new backend-dispatched primitive, `_axpy_const_ip!` (`src/Utils.jl`,
+     same shape as the existing `_axpy_ip!`/`_axpy_oop!`): a `@batch` loop on
+     `KA.CPU()`, `q .+= Ref(a * c)` elsewhere. `_advance_probe_positions!`
+     (the equivalent scalar loop for probes) got the same fix. **A real bug
+     here, caught only by real CUDA hardware**: the first version of the
+     non-CPU branch wrote `@. q += a * $c`, using `$c` inside `@.` to try to
+     stop `c` (a constant `SVector`) from being dot-broadcast — that doesn't
+     work, since an `SVector` is itself a genuine `AbstractArray` and
+     broadcasts shape-checked against `q` regardless, throwing
+     `DimensionMismatch` the instant `length(q) != length(c)`. No `KA.CPU()`
+     test could have caught this either: position-advance backend-dispatches
+     on the array's own type (`KA.get_backend(vps.x)`), not on whether
+     `ka=true` was set on some unrelated `SystemInteraction` — so this branch
+     is only reachable with a real `CuArray`. Fixed by wrapping in `Ref(...)`
+     instead, the standard idiom for broadcasting a constant struct across an
+     array.
+   - **`ProbeParticleSystem`'s gap** (the largest piece — this is the system
+     item 5 explicitly deferred): it hardcoded `Vector` for `x`/`id`/`w_sum`,
+     which blocked `Adapt.jl` entirely regardless of `device_view`, same as
+     `VirtualParticleSystem`/`GhostParticleSystem` before items 5/7. Given
+     the exact same array-type-generic treatment (`VA`/`SA`/`IA` type
+     params, a fully-generic positional constructor mirroring
+     `BasicParticleSystem`'s, `Adapt.adapt_structure`), plus a new
+     `AbstractProbeParticleSystem` supertype and `DeviceProbeSystem`
+     (`src/DeviceViews.jl`) mirroring `DeviceVirtualSystem`/`DeviceGhostSystem`
+     exactly — needed because `InterpolateFieldFn`/`NeighborCountFn`'s
+     one-sided `pfn_contribution`/`_onesided_zero_coupled`/`_onesided_shape`
+     methods were typed on the concrete `ProbeParticleSystem{T,ND}`, which a
+     separate flattened device-view struct can't match without the
+     abstraction; widened to `AbstractProbeParticleSystem{T,ND}`, mirroring
+     item 5's identical `AbstractVirtualParticleSystem` widening precisely.
+     Like every other system in this codebase, the keyword constructors
+     always build plain `Vector`s regardless of any argument's own array
+     type — documented directly in `ProbeParticleSystem`'s docstring
+     (mirroring `GhostParticleSystem`'s self-referencing-source caveat) since
+     it's a real trap: `mirror_target`'s array type doesn't propagate to
+     `id`/`w_sum`, so constructing a probe directly from an already-adapted
+     GPU system gives a broken mixed-backend object — the correct idiom is
+     build CPU-side, then `adapt(CUDABackend(), probe)` as one unit and pull
+     `mirror_target` back out via `getfield`, same as ghosts.
+   - **`_measure_probes!`'s mirror step** (`x[src_id[i]] = src_x[i]` for
+     `i in 1:probe.n`) is a scatter, not an elementwise op — no broadcast
+     expresses it. Given a dedicated KA kernel (`_probe_mirror_kernel!`,
+     `src/KAKernels.jl`) rather than a `Base` fancy-indexing scatter
+     (`dst_x[src_id] = src_x`, which would work for CUDA specifically but
+     isn't guaranteed across arbitrary `KernelAbstractions.jl` backends) —
+     same reasoning `_apply_perms!`'s existing gather/copyback kernels
+     already use. `src_id` is always a permutation of `1:n` (every system's
+     sort-tracking invariant), so every thread writes a distinct destination
+     slot and no atomics are needed, identical to `_ghost_scatter_kernel!`'s
+     stream-compaction case.
+
+   **Verified**: `KA.CPU()` equivalence (`test/test_ka_cpu.jl`, extending the
+   existing `InterpolateFieldFn`/`NeighborCountFn` WritesB reverse-sweep
+   pattern to a probe target) plus real CUDA hardware
+   (`test/test_gpu_cuda.jl`) covering exactly the three fixes above: an
+   `RK4TimeIntegrator` run reusing `test_onesided_integration_bubble.jl`'s
+   `_bubble_like`/`_bubble_integrator` fixtures (`bubble.jl`'s real shape —
+   RK4 plus a self-referencing ghost) against a CPU oracle; a
+   `VirtualParticleSystem` with nonzero `prescribed_v` (Trapdoor.jl's
+   `trapdoor_moving_virt` shape) checked against the exact expected constant
+   translation, id-gather-based so it's permutation-safe across re-sorts; and
+   a `ProbeParticleSystem` with a self-referencing `mirror_target` plus
+   `NeighborCountFn` (CantileverBeam.jl's shape), CPU vs GPU neighbour counts
+   compared exactly after a real `time_integrate!` run. All three exist
+   specifically because they can't be validated any other way — none of
+   these bugs are reachable through `KA.CPU()` alone. `test/test_adapt.jl`
+   and `test/test_device_views.jl` got the same round-trip/device_view-proxy/
+   narrow-typing treatment items 5 and 7 gave Virtual and Ghost.
+
+   A pre-existing, unrelated flaky test was found and fixed along the way
+   (not introduced by this item): `test_adapt.jl`'s Ghost/GhostEntry
+   adapt-round-trip fixture never initialised `fluid.v` before use, leaving
+   it `undef` — `update_ghost_kinematics!` propagates that garbage into
+   `ghost.v`, and this run happened to land on a NaN bit pattern, failing the
+   `==` comparison (`NaN != NaN`, even printed identically on both sides).
+   Fixed with a `fill!`.
+
+   Suite: 1651/1651 (up from 1600 after item 8).
+
+   **What's still not done**: the 6 scripts item 8 identified as blocked here
+   (`bubble.jl`/`bubble2.jl`/`bubble3.jl`, `EP_ColumnCollapse2.jl`,
+   `Trapdoor.jl`, `CantileverBeam.jl`) are now unblocked at the
+   infrastructure level — every piece they need has a working `ka=true` path
+   — but none of them have actually been wired with the `GRASPH_BACKEND`
+   switch yet. That's a follow-up to item 8's script-wiring pass, not part of
+   this item's scope, mirroring how item 7 unblocked item 8's ghost-using
+   scripts without wiring them itself.
 
 ## Explicitly deferred (not started, not part of the current scope)
 
-- **GPU (`ka=true`) support for any pfn converted in Phase C** — see items
-  5-9 just above; this is now the actual next-steps list, not a deferred
-  afterthought, but it's still true that none of it has started.
-- Virtual particle systems, probes, RK4 integrator, stress/elasto-plastic
-  systems — none have GPU-resident *sweep-orchestration* support yet (Phase C
-  gave them CPU one-sided support and proved it correct in-context; GPU
-  residency for the sweep itself is a separate, unstarted piece — see item 9
-  above). Ghost particles are the one exception: item 7 gave
-  `GhostParticleSystem` full GPU residency (generation, kinematics, field
-  copy, `device_view`, `Adapt.jl`) — `StressParticleSystem`/
-  `ElastoPlasticParticleSystem` themselves already had `device_view`/`Adapt`
-  support since item 5, it's specifically their *position/state-advance
-  orchestration* (mirrored by Virtual/probes/RK4 above) that's still
-  CPU-only.
-- Extending `onesided=true`/`ka=true` support to the remaining 6 experiment
-  scripts blocked on item 9 (`bubble.jl`/`bubble2.jl`/`bubble3.jl`,
-  `EP_ColumnCollapse2.jl`, `Trapdoor.jl`, `CantileverBeam.jl` — still on the
-  coloured sweep by default; see item 8 above). The other 5 non-dambreak
-  scripts are done.
+- ~~**GPU (`ka=true`) support for any pfn converted in Phase C**~~ — items
+  5-9 above are all done now; nothing left deferred here.
+- ~~Virtual particle systems, probes, RK4 integrator... none have GPU-resident
+  *sweep-orchestration* support yet~~ — **done, item 9.** Ghost particles
+  (item 7), Virtual/probe/RK4 orchestration (item 9), and
+  `StressParticleSystem`/`ElastoPlasticParticleSystem`'s `device_view`/`Adapt`
+  support (item 5) are all in place now; nothing in this category remains
+  unstarted.
+- Wiring `GRASPH_BACKEND` into the 6 experiment scripts item 9 unblocked
+  (`bubble.jl`/`bubble2.jl`/`bubble3.jl`, `EP_ColumnCollapse2.jl`,
+  `Trapdoor.jl`, `CantileverBeam.jl` — still on the coloured sweep by
+  default; see item 9's own note above). The other 5 non-dambreak scripts
+  are done (item 8).
 - Persistent/cached grid, Verlet-skin rebuild cadence, and fusing the sort's
   gather+copyback into a single `Ref`-swap — all flagged during Phase B2 as
   follow-ups once the crossover benchmark shows whether launch count is
@@ -1023,17 +1133,23 @@ to coloured for all 13 scripts, and no script's behavior changed.
 ## Practical notes for picking this back up
 
 - Branch: `onesided-sweep-gpu-prep`, based on `main` at commit `37e9a5a`, now
-  29 commits ahead of it (`12ac526`..`f8f7498`). Nothing on this branch has
+  31 commits ahead of it (`12ac526`..`9182bd8`). Nothing on this branch has
   been pushed to any remote.
 - Run the full suite with `julia --project -e 'using Pkg; Pkg.test()'` —
-  should show `1600/1600` (834 through Phase B1, up to 935 after Phase B2's
+  should show `1651/1651` (834 through Phase B1, up to 935 after Phase B2's
   3D work, up to 1371 after Phase C, up to 1433 after item 5's `device_view`
   extension, up to 1466 after item 6's reverse-sweep KA kernel twin, up to
   1479 after also fixing the `FluidPfn` fluid-fluid `ka=true` dispatch gap
   (this doc previously miscited this figure as 1475 — see update #5), up to
   1496 after also fixing `FluidSolidPfn`'s identical gap (item 8), up to
   1600 after item 7 (`GhostParticleSystem` GPU residency plus its
-  adversarial-review test additions).
+  adversarial-review test additions), up to 1651 after item 9
+  (`ProbeParticleSystem`'s `device_view`/`Adapt` extension plus real-CUDA
+  tests for the RK4/Virtual/Probe fixes). `Pkg.test()` resolves its own CUDA
+  from `test/Project.toml` and picks up real hardware automatically when
+  present (confirmed again this item) — no merged-throwaway-environment
+  workaround needed for the test suite itself, only for running a top-level
+  driver script directly (see "Environment notes" above).
 - `test/test_onesided_sweep.jl` (Phase A/C, ~1100 lines by now — one section
   per pfn/shape, including the `XSPHPfn` ghost-aliasing regression test) and
   `test/test_adapt.jl` (Phase B1) are the two long-running test files that
@@ -1066,6 +1182,17 @@ to coloured for all 13 scripts, and no script's behavior changed.
   to `test/test_ghost_particles.jl` (the nested-ghost constructor guard, and
   `write_h5(ghost, ...)`'s new `1:n`-slicing behaviour, which had zero prior
   coverage before this item).
+  Item 9 extended `test/test_adapt.jl`/`test/test_device_views.jl` with
+  `ProbeParticleSystem` sections mirroring Virtual's exactly (adapt
+  round-trip including the `mirror_target` aliasing caveat, `device_view`
+  proxy/dispatch equivalence, a `getproperty`-vs-`getfield` state-updater
+  regression test, narrow-typing checks), extended `test/test_ka_cpu.jl` with
+  a probe-target `InterpolateFieldFn`/`NeighborCountFn` reverse-sweep
+  equivalence pair, and added three new real-CUDA testsets to
+  `test/test_gpu_cuda.jl` (RK4+ghost via the bubble-like fixtures, Virtual
+  with nonzero `prescribed_v`, Probe with a self-referencing `mirror_target`)
+  — the only tier that could actually catch this item's real bug (the
+  `Ref`-less `_axpy_const_ip!` broadcast), since it's invisible on `KA.CPU()`.
 - `CUDA.jl` is now confirmed to install and run correctly on a real GPU from
   this repo's dependency graph (see environment notes above) — the earlier
   "no GPU in the dev environment this was built in" caveat throughout Phase
