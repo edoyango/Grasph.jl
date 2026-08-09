@@ -43,6 +43,20 @@ _"1475/1475" predated that item's own last test addition (the adversarial_
 _review's 3D-coverage-gap fix); the correct figure, already used in that_
 _fix's commit message, was 1479/1479. It's now 1496/1496 after this item._
 
+_2026-08-09 update #6: item 7 ("Ghosts on GPU," previously the last_
+_completely-unstarted item and this doc's own "hardest remaining piece") is_
+_done — see the item itself, below (commit `eda4234`). `GhostParticleSystem`_
+_gained array-type-generic owned fields, a capacity-vs-logical-count split_
+_for the GPU backend, `Adapt.jl`/`device_view` support, and real GPU kernels_
+_for `generate_ghosts!`/`update_ghost_kinematics!`/`GhostCopier`. A real bug_
+_(a capacity-growth check that missed the `extras` arrays' independent_
+_starting size) was found and fixed via real-CUDA-hardware testing, and a_
+_load-bearing fix outside `GhostParticles.jl` itself was needed too: grid_
+_building used to derive its particle count from `length(x)`, silently wrong_
+_once a ghost's capacity can exceed its count — see the item's own note for_
+_the full story, including what a 3-reviewer adversarial pass found and_
+_closed. Suite: 1600/1600 (up from 1496)._
+
 ## Why this migration, and why not an octree
 
 The original ask was to get GraSPH.jl (a Julia SPH code) running on GPUs via
@@ -575,16 +589,19 @@ to coloured for all 13 scripts, and no script's behavior changed.
    methods are untouched, since that sweep is CPU-only forever and never
    constructs a `device_view`.
 
-   `ProbeParticleSystem`/ghost systems (`GhostParticleSystem`) are **not**
-   covered and were deliberately dropped from this item's scope: both
-   hardcode `Vector` for their per-particle arrays (`x`, `id`, `w_sum`/`v`/
+   `ProbeParticleSystem`/ghost systems (`GhostParticleSystem`) were **not**
+   covered here and were deliberately dropped from this item's scope: both
+   hardcoded `Vector` for their per-particle arrays (`x`, `id`, `w_sum`/`v`/
    `rho`, etc.) rather than the array-type-generic parameter every other
    system type uses, which blocks `Adapt.jl` entirely regardless of
    `device_view` — a deeper struct change than "add a device_view method",
-   and ghosts specifically are already covered by item 7 below (their
-   `resize!`-based generation is the harder problem anyway, not the missing
-   proxy). Revisit `ProbeParticleSystem`'s array-type genericity whenever
-   probes get their own GPU story (item 9).
+   and ghosts specifically were already covered by item 7 below (their
+   `resize!`-based generation was the harder problem anyway, not the missing
+   proxy). **`GhostParticleSystem`'s side of this is now done — see item 7's
+   own entry, done in a later session; the sentence above describes its state
+   only up to that point.** `ProbeParticleSystem` is still hardcoded-`Vector`;
+   revisit its array-type genericity whenever probes get their own GPU story
+   (item 9).
 
    An adversarial review of this change caught a real, reproducible bug it
    exposed rather than introduced: `VirtualNormUpdater`/
@@ -688,13 +705,150 @@ to coloured for all 13 scripts, and no script's behavior changed.
    test for that fix). This corrects a stale "1475/1475" this doc previously
    cited here and in Practical Notes, which predated that last test addition —
    see update #5.
-7. **Ghosts on GPU** — the hardest remaining piece, and gates 7 of the 13
+7. ~~**Ghosts on GPU** — the hardest remaining piece, and gates 7 of the 13
    scripts. `generate_ghosts!`'s two-pass count-then-cursor logic doesn't
    port by direct translation; needs a GPU-compatible rewrite (flag +
    exclusive-scan + compaction into capacity-preallocated buffers, since
    per-step `resize!` — while it does work on `CuVector` — isn't the right
-   growth strategy for a count that changes every step). Unchanged from
-   every earlier revision of this doc; still not started.
+   growth strategy for a count that changes every step).~~ — **done**
+   (`src/GhostParticles.jl`, `src/KAKernels.jl`, `src/DeviceViews.jl`,
+   `src/Interaction.jl`, `src/Sorting.jl`).
+
+   **Struct change first**: `GhostParticleSystem`'s six owned arrays (`x`,
+   `v`, `rho`, `idx_original`, `idx_boundary`, `normals`) went from hardcoded
+   `Vector` to the same `VA`/`SA`/`IA` array-type-generic parameterization
+   every other system uses (item 5 had explicitly deferred this — see the
+   correction just above). A new `count::Base.RefValue{Int}` field was added
+   because ghosts are the *one* particle-system type whose logical count
+   isn't `length(x)`: on a GPU backend, owned arrays now grow to a
+   **capacity** that only ever increases (never shrinks) — `_resize_scratches!`
+   (already existed, `Sorting.jl`, used unchanged) grows each array
+   independently, no-op if already big enough — while `ghost.n` reads
+   `count[]` for the exact logical count regardless of backend. On CPU the
+   original exact-`resize!`-every-step behaviour is unchanged (capacity == n
+   always there), so this is a genuine zero-behaviour-change for the 7
+   ghost-using scripts, none of which have opted into `ka=true` yet.
+
+   **GPU `generate_ghosts!`**: flag + inclusive-cumsum-scan + compaction, per
+   the plan above. The `(boundary, particle)` pair space flattens to one
+   linear index (boundary-major, particle-minor, matching the CPU nested-loop
+   order exactly); a flag kernel (`_ghost_flag_kernel!`) marks which pairs
+   qualify, `cumsum!` turns that into each qualifying pair's final 1-based
+   destination index in place (no atomics needed — unlike the cell-histogram
+   CSR build, this is a genuine 1-to-1 stream compaction, not a many-to-one
+   histogram), then a scatter kernel (`_ghost_scatter_kernel!`) writes
+   directly into the (now sufficiently large) owned arrays. `GhostEntry`
+   gained a `_flags::FA` scratch field for this — fixed length `NB *
+   source.n`, allocated once at construction (a ghost's *source* particle
+   count never changes over a run, only how many currently qualify).
+   `update_ghost_kinematics!` and `GhostCopier`'s per-field copy (previously
+   CPU-only scalar loops — harmless before this item since a ghost's arrays
+   could never be anything but `Vector`) also gained real GPU kernel twins
+   (`_ghost_kinematics_kernel!`, `_ghost_copy_field_kernel!`), backend-
+   dispatched the same way as everywhere else in this codebase
+   (`KA.get_backend(...)` → `::KA.CPU`/`::KA.GPU` methods).
+
+   **`device_view`/`Adapt.jl`**: `DeviceGhostSystem` mirrors item 5's
+   `DeviceVirtualSystem` pattern exactly — subtypes `AbstractGhostParticleSystem`
+   so every ghost-coupled `pfn_contribution` method (already narrowly typed on
+   that abstraction) dispatches into it unmodified, flattening only the
+   fields a pfn actually reads (`x`, `v`, `rho`, `mass`, `c`, plus `extras`)
+   — `idx_original`/`idx_boundary`/`normals` are pure ghost-generation
+   bookkeeping, never read by a pfn, so they're left out. `Adapt.adapt_structure`
+   for `GhostParticleSystem`/`GhostEntry` follows the same recursive-rebuild
+   pattern as `VirtualParticleSystem`.
+
+   **A load-bearing correctness fix outside `GhostParticles.jl` itself**: grid
+   building (`_bbox`/`_populate_cells_sorted!`, `Interaction.jl`) used to
+   derive its particle count from `length(x)` — true for every system type
+   *until this item*, since a GPU-resident ghost's owned arrays can now be
+   longer than its logical count. Both functions were changed to take an
+   explicit `n` parameter instead (a no-op for every non-ghost system, since
+   `length(x) == n` still holds for those); without this, stale data in a
+   ghost's unused capacity slots would silently leak into the CSR cell grid
+   as phantom particles.
+
+   **A real bug found and fixed during development** (not from the
+   adversarial review below — from testing on real CUDA hardware): the first
+   version of the GPU capacity-growth check compared the new count only
+   against `length(getfield(ghost, :x))`. `extras` arrays (`p`, `stress`, …)
+   start at length 0 independently of whatever capacity `x`/`v`/etc. start
+   at (`_build_extras`), so a step where `x` already had enough room but
+   `extras` didn't skipped growing `extras` entirely — the next
+   `GhostCopier` GPU kernel launch wrote out of bounds into a length-0 array,
+   reproduced directly as a CUDA "illegal memory access". Fixed by growing
+   every owned array (including `extras`) unconditionally via
+   `_resize_scratches!(_particle_arrays(ghost), total)` rather than gating on
+   one array's length.
+
+   **Adversarial review** (3 independent reviewers — capacity/count-invariant
+   correctness, GPU dispatch/kernel safety, test-coverage/doc-accuracy) found
+   no other instance of that bug class, but did surface real, actionable
+   gaps, all acted on:
+   - A latent, unenforced assumption: `GhostEntry._flags`'s fixed size (`NB *
+     source.n`) silently breaks if `source` were itself a `GhostParticleSystem`
+     (the one type whose `n` isn't constant) — nothing in the codebase does
+     this today, but nothing stopped it either. Fixed by rejecting it at
+     construction (`GhostParticleSystem`'s constructor now throws
+     `ArgumentError` if `ps isa AbstractGhostParticleSystem`), converting a
+     hypothetical silent GPU out-of-bounds write into a loud, immediate error.
+   - `GhostCopier`'s callable decided its backend from `ghost.idx_original`
+     while `generate_ghosts!`/`update_ghost_kinematics!` decided from
+     `ghost.x` — harmless today (construction/adapt always keep a ghost's
+     owned arrays backend-consistent) but needlessly inconsistent; unified to
+     `ghost.x` everywhere.
+   - Test-coverage gaps: `HouseholderReflect` mode (vs. the no-op `nothing`
+     mode every other ghost GPU test used) had never run through the GPU
+     field-copy kernel; no ghost GPU test used 3D; no ghost GPU test used the
+     real `NB=8` (4 walls + 4 corners) shape `bubble3.jl` actually needs;
+     `write_h5(ghost, ...)` — itself rewritten by this item to explicitly
+     slice every array to `1:n` — had zero test coverage before or after.
+     All four added (`test/test_gpu_cuda.jl`, `test/test_ghost_particles.jl`).
+     The `NB=8` test's diagonal corner normals (`SVector(±1,±1)/sqrt(2)`)
+     surfaced the same ~1 ulp CPU/GPU FMA-contraction noise this codebase
+     already tolerances everywhere else for float comparisons — not a bug,
+     just the first ghost test to hit non-axis-aligned reflection arithmetic;
+     switched that one assertion from `==` to a relative-tolerance check.
+   - Two findings judged *not* bugs introduced by this item, documented
+     instead of "fixed": `GhostParticleSystem`'s convenience constructor
+     always builds `Vector` arrays regardless of `ps`'s own array type
+     (identical to `VirtualParticleSystem`'s pre-existing convention,
+     unchanged by this item) — constructing directly from an
+     already-GPU-resident source gives a mixed-backend object; the fix is to
+     build CPU-first as usual, then `adapt(CUDABackend(), ge::GhostEntry)`
+     the whole entry as one call. And `Adapt.adapt_structure` doesn't
+     preserve object identity across separate `adapt()` calls (inherent to
+     how every wrapper type in this codebase — Virtual, boundary, now Ghost —
+     rebuilds itself from adapted fields), which matters specifically for
+     ghosts because they're always self-referencing
+     (`ghost.source === fluid`): a driver that separately adapts its own
+     `fluid` and a `GhostEntry` wrapping the same `fluid` ends up with two
+     independent GPU copies, not aliases. Both documented directly in
+     `GhostParticleSystem`'s docstring for whoever picks up item 8's
+     ghost-script wiring next.
+
+   Verified via `KA.CPU()` (backend-dispatch and kernel logic, no GPU needed)
+   and real CUDA hardware (RTX 4060 Laptop) — the flag/scatter/kinematics/
+   copy-field kernels, capacity growth *and* the capacity-stays-above-a-
+   shrunk-count regime (deliberately constructed in
+   `test/test_gpu_cuda.jl` by growing then shrinking the ghost count before
+   sweeping, to exercise the `_bbox`/`_populate_cells_sorted!` fix above under
+   the exact condition it exists for), a full fluid↔ghost `onesided=true` vs
+   `ka=true` sweep-equivalence test (`test/test_ka_cpu.jl`, `KA.CPU()`) and a
+   full sort+grid+sweep pipeline test against real CUDA
+   (`test/test_gpu_cuda.jl`), plus `Adapt.jl` round-trips
+   (`test/test_adapt.jl`) and `device_view` dispatch equivalence
+   (`test/test_device_views.jl`). Suite: 1600/1600 (up from 1496 after item
+   8).
+
+   **What's still not done**: none of the 7 ghost-using scripts
+   (`EP_ColumnCollapse.jl`, `GranularColumnCollapse.jl`,
+   `GranularColumnCollapse3D.jl`, `Trapdoor.jl`, `bubble.jl`, `bubble2.jl`,
+   `bubble3.jl`) have been touched — every pfn and every piece of
+   infrastructure they need now has a working `ka=true` path, but wiring
+   `onesided=true`/`ka=true` into their actual `SystemInteraction`/
+   `GhostEntry` calls is still item 8's job (see item 8's own remaining-scope
+   note below, now further unblocked).
 8. **Wire `onesided=true`/`ka=true` into the other 12 scripts**, one at a
    time, mirroring `dambreak.jl`'s `GRASPH_BACKEND` switch — now unblocked
    by items 5-7 plus Phase C's integration harnesses (`test/
@@ -735,7 +889,11 @@ to coloured for all 13 scripts, and no script's behavior changed.
    into the 12 non-dambreak scripts' `SystemInteraction` calls — is
    unstarted; every pfn those scripts use now has a working `ka=true`
    dispatch path, but none of the scripts themselves opt into it yet (all
-   still default to the coloured sweep).
+   still default to the coloured sweep). Item 7 (below) closes the last
+   remaining gap for the 7 of those 12 that use ghosts — `GhostParticleSystem`
+   now has a working `ka=true` path too, so nothing pfn- or
+   infrastructure-side blocks any of the 12 scripts anymore; it's purely
+   script-wiring work from here.
 9. Virtual particle systems, probes, and the RK4 integrator have no GPU
    sweep path at all yet, independent of pfn support — `VirtualParticleSystem`
    position/state advance, `_measure_probes!`, and RK4's multi-stage
@@ -746,11 +904,17 @@ to coloured for all 13 scripts, and no script's behavior changed.
 - **GPU (`ka=true`) support for any pfn converted in Phase C** — see items
   5-9 just above; this is now the actual next-steps list, not a deferred
   afterthought, but it's still true that none of it has started.
-- Ghost particles, virtual particle systems, probes, RK4 integrator,
-  stress/elasto-plastic systems — none have GPU-resident sweep support yet
-  (Phase C gave them CPU one-sided support and proved it correct in-context;
-  GPU residency is a separate, unstarted piece — see item 7 above for why
-  ghosts specifically are the hard part).
+- Virtual particle systems, probes, RK4 integrator, stress/elasto-plastic
+  systems — none have GPU-resident *sweep-orchestration* support yet (Phase C
+  gave them CPU one-sided support and proved it correct in-context; GPU
+  residency for the sweep itself is a separate, unstarted piece — see item 9
+  above). Ghost particles are the one exception: item 7 gave
+  `GhostParticleSystem` full GPU residency (generation, kinematics, field
+  copy, `device_view`, `Adapt.jl`) — `StressParticleSystem`/
+  `ElastoPlasticParticleSystem` themselves already had `device_view`/`Adapt`
+  support since item 5, it's specifically their *position/state-advance
+  orchestration* (mirrored by Virtual/probes/RK4 above) that's still
+  CPU-only.
 - Extending `onesided=true`/`ka=true` support to the other 12 experiment
   scripts (all still on the coloured sweep by default; see item 8 above).
 - Persistent/cached grid, Verlet-skin rebuild cadence, and fusing the sort's
@@ -768,15 +932,17 @@ to coloured for all 13 scripts, and no script's behavior changed.
 ## Practical notes for picking this back up
 
 - Branch: `onesided-sweep-gpu-prep`, based on `main` at commit `37e9a5a`, now
-  25 commits ahead of it (`12ac526`..`0fac396`). Nothing on this branch has
+  27 commits ahead of it (`12ac526`..`eda4234`). Nothing on this branch has
   been pushed to any remote.
 - Run the full suite with `julia --project -e 'using Pkg; Pkg.test()'` —
-  should show `1496/1496` (834 through Phase B1, up to 935 after Phase B2's
+  should show `1600/1600` (834 through Phase B1, up to 935 after Phase B2's
   3D work, up to 1371 after Phase C, up to 1433 after item 5's `device_view`
   extension, up to 1466 after item 6's reverse-sweep KA kernel twin, up to
   1479 after also fixing the `FluidPfn` fluid-fluid `ka=true` dispatch gap
   (this doc previously miscited this figure as 1475 — see update #5), up to
-  1496 after also fixing `FluidSolidPfn`'s identical gap (item 8).
+  1496 after also fixing `FluidSolidPfn`'s identical gap (item 8), up to
+  1600 after item 7 (`GhostParticleSystem` GPU residency plus its
+  adversarial-review test additions).
 - `test/test_onesided_sweep.jl` (Phase A/C, ~1100 lines by now — one section
   per pfn/shape, including the `XSPHPfn` ghost-aliasing regression test) and
   `test/test_adapt.jl` (Phase B1) are the two long-running test files that
@@ -797,7 +963,18 @@ to coloured for all 13 scripts, and no script's behavior changed.
   fluid-fluid entry, against real `CUDABackend()`). Item 8's `FluidSolidPfn`
   fix added the same shape of tests again (2D/3D equivalence, mismatched-
   pairing regression, real-CUDA entry), plus a fluid-vs-solid-pressure
-  regression test specific to that pfn's asymmetric physics.
+  regression test specific to that pfn's asymmetric physics. Item 7 extended
+  `test_adapt.jl`/`test_device_views.jl`/`test_ka_cpu.jl`/`test_gpu_cuda.jl`
+  with ghost-specific sections (adapt round-trip including a live
+  post-adapt `generate_ghosts!` call, `device_view` proxy/dispatch
+  equivalence, a full `KA.CPU()` sweep-equivalence test, and real-CUDA tests
+  for `generate_ghosts!`/`update_ghost_kinematics!`/`GhostCopier` — including
+  `HouseholderReflect` mode, 3D, the real `NB=8` wall+corner shape, and a
+  deliberately-constructed capacity-above-a-shrunk-count regime — plus a full
+  sort+grid+sweep pipeline test), and added two new CPU-only regression tests
+  to `test/test_ghost_particles.jl` (the nested-ghost constructor guard, and
+  `write_h5(ghost, ...)`'s new `1:n`-slicing behaviour, which had zero prior
+  coverage before this item).
 - `CUDA.jl` is now confirmed to install and run correctly on a real GPU from
   this repo's dependency graph (see environment notes above) — the earlier
   "no GPU in the dev environment this was built in" caveat throughout Phase
