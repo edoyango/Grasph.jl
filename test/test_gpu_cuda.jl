@@ -162,6 +162,120 @@ else
             @test maximum(norm.(fluid_cpu.dvdt[oc] .- fluid_gpu_h.dvdt[og])) < 1e-10 * dvdt_scale
         end
 
+        @testset "full pipeline (sort+grid+sweep), coupled reverse/WritesBoth: CPU oracle vs CUDA" begin
+            # gpu-migration-plan.md "Next steps" item 6: KA kernel twin for
+            # the reverse/WritesBoth sweep (_sweep_coupled_ka_reverse!/
+            # _sweep_coupled_ka_dispatch!, KAKernels.jl). Uses the same
+            # test-only, generically-dispatched _MutualTestPfn/
+            # _ReverseOnlyTestPfn as test_onesided_sweep.jl's CPU-side
+            # reverse-sweep tests — in scope here via runtests.jl's shared
+            # top-level @testset (same reuse convention test_device_views.jl
+            # documents) — rather than a real production WritesBoth pfn:
+            # FluidPfn's fluid-fluid method is typed on the concrete
+            # FluidParticleSystem{T,ND} on both sides, which device_view
+            # can't dispatch into yet (a known, separately-tracked gap; see
+            # test_ka_cpu.jl's "ka=true not yet reachable" regression test).
+            # _MutualTestPfn/_ReverseOnlyTestPfn are typed generically
+            # (::Any), so they validate the new sweep infrastructure itself
+            # on real CUDA hardware, independent of that gap.
+            CUDA.allowscalar(false)
+            rng = MersenneTwister(205)
+            h = 0.08
+            kernel = CubicSplineKernel(h; ndims=2)
+            cutoff = kernel.interaction_length
+
+            for pfn in (_ReverseOnlyTestPfn(), _MutualTestPfn())
+                a_cpu = _gpucuda_random_fluid(rng, 800, 2; L=2.0)
+                b_cpu = _gpucuda_random_fluid(rng, 600, 2; L=2.0)
+                a_gpu = adapt(CUDABackend(), deepcopy(a_cpu))
+                b_gpu = adapt(CUDABackend(), deepcopy(b_cpu))
+
+                si_cpu = SystemInteraction(kernel, pfn, a_cpu, b_cpu; onesided=true)
+                pa, ka_, sa = _gpucuda_sortbufs_cpu(a_cpu)
+                sort_particles!(a_cpu, cutoff, pa, ka_, sa)
+                pb, kb, sb = _gpucuda_sortbufs_cpu(b_cpu)
+                sort_particles!(b_cpu, cutoff, pb, kb, sb)
+                create_grid!(si_cpu)
+                sweep!(si_cpu)
+
+                si_gpu = SystemInteraction(kernel, pfn, a_gpu, b_gpu; onesided=true, ka=true)
+                pag, kag, sag = _gpucuda_sortbufs_gpu(a_gpu)
+                sort_particles!(a_gpu, cutoff, pag, kag, sag)
+                pbg, kbg, sbg = _gpucuda_sortbufs_gpu(b_gpu)
+                sort_particles!(b_gpu, cutoff, pbg, kbg, sbg)
+                create_grid!(si_gpu)
+                sweep!(si_gpu)
+
+                a_gpu_h = adapt(Array, a_gpu)
+                b_gpu_h = adapt(Array, b_gpu)
+                oa, oag = _byid(a_cpu), _byid(a_gpu_h)
+                ob, obg = _byid(b_cpu), _byid(b_gpu_h)
+
+                a_dvdt_scale = max(maximum(norm.(a_cpu.dvdt)), 1.0)
+                b_dvdt_scale = max(maximum(norm.(b_cpu.dvdt)), 1.0)
+                @test maximum(norm.(a_cpu.dvdt[oa] .- a_gpu_h.dvdt[oag])) < 1e-10 * a_dvdt_scale
+                @test maximum(norm.(b_cpu.dvdt[ob] .- b_gpu_h.dvdt[obg])) < 1e-10 * b_dvdt_scale
+                a_drho_scale = max(maximum(abs.(a_cpu.drhodt)), 1.0)
+                b_drho_scale = max(maximum(abs.(b_cpu.drhodt)), 1.0)
+                @test maximum(abs.(a_cpu.drhodt[oa] .- a_gpu_h.drhodt[oag])) < 1e-10 * a_drho_scale
+                @test maximum(abs.(b_cpu.drhodt[ob] .- b_gpu_h.drhodt[obg])) < 1e-10 * b_drho_scale
+
+                if pfn isa _ReverseOnlyTestPfn
+                    # A pure WritesB() pfn must leave system_a untouched on the GPU path too.
+                    @test all(==(zero(SVector{2,Float64})), a_gpu_h.dvdt)
+                    @test all(==(0.0), a_gpu_h.drhodt)
+                end
+            end
+        end
+
+        @testset "full pipeline (sort+grid+sweep), InterpolateFieldFn WritesB virtual target: CPU oracle vs CUDA" begin
+            # Virtual is device_view-ready since item 5 (DeviceVirtualSystem)
+            # — this is the first CUDA-hardware exercise of that path.
+            CUDA.allowscalar(false)
+            rng = MersenneTwister(206)
+            h = 0.08
+            kernel = CubicSplineKernel(h; ndims=2)
+            cutoff = kernel.interaction_length
+            pfn = InterpolateFieldFn(:v, :rho; accumulate_wsum=true)
+
+            src_cpu  = _gpucuda_random_fluid(rng, 800, 2; L=2.0)
+            virt_src = _gpucuda_random_fluid(rng, 600, 2; L=2.0)
+            virt_cpu = VirtualParticleSystem(virt_src, "virt", virt_src.n, 2, virt_src.mass, virt_src.c)
+            _zero_interp_target!(virt_cpu, (:v, :rho))
+
+            src_gpu  = adapt(CUDABackend(), deepcopy(src_cpu))
+            virt_gpu = adapt(CUDABackend(), deepcopy(virt_cpu))
+
+            si_cpu = SystemInteraction(kernel, pfn, src_cpu, virt_cpu; onesided=true)
+            pa, ka_, sa = _gpucuda_sortbufs_cpu(src_cpu)
+            sort_particles!(src_cpu, cutoff, pa, ka_, sa)
+            pb, kb, sb = _gpucuda_sortbufs_cpu(virt_cpu)
+            sort_particles!(virt_cpu, cutoff, pb, kb, sb)
+            create_grid!(si_cpu)
+            sweep!(si_cpu)
+
+            si_gpu = SystemInteraction(kernel, pfn, src_gpu, virt_gpu; onesided=true, ka=true)
+            pag, kag, sag = _gpucuda_sortbufs_gpu(src_gpu)
+            sort_particles!(src_gpu, cutoff, pag, kag, sag)
+            pbg, kbg, sbg = _gpucuda_sortbufs_gpu(virt_gpu)
+            sort_particles!(virt_gpu, cutoff, pbg, kbg, sbg)
+            create_grid!(si_gpu)
+            sweep!(si_gpu)
+
+            virt_gpu_h = adapt(Array, virt_gpu)
+            # Not _byid(): that reads `id` via raw getfield, which works on a
+            # bare FluidParticleSystem but VirtualParticleSystem doesn't own
+            # an `id` field directly — it forwards to its wrapped `source`
+            # via getproperty (Particles.jl), so getfield here throws
+            # FieldError. Use getproperty (`.id`) instead.
+            ov, ovg = sortperm(virt_cpu.id), sortperm(virt_gpu_h.id)
+            v_scale = max(maximum(norm.(virt_cpu.v)), 1.0)
+            rho_scale = max(maximum(abs.(virt_cpu.rho)), 1.0)
+            @test maximum(norm.(virt_cpu.v[ov] .- virt_gpu_h.v[ovg])) < 1e-10 * v_scale
+            @test maximum(abs.(virt_cpu.rho[ov] .- virt_gpu_h.rho[ovg])) < 1e-10 * rho_scale
+            @test maximum(abs.(virt_cpu.w_sum[ov] .- virt_gpu_h.w_sum[ovg])) < 1e-10 * max(maximum(abs.(virt_cpu.w_sum)), 1.0)
+        end
+
         @testset "state update (TaitEOSUpdater): CPU vs CUDA" begin
             CUDA.allowscalar(false)
             rng = MersenneTwister(203)

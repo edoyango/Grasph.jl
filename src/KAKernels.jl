@@ -237,3 +237,56 @@ function _sweep_coupled_ka!(si::SystemInteraction{T,3}, ps_b, pfn::PFN) where {T
     KA.synchronize(backend)
     return nothing
 end
+
+# --- coupled interaction, reverse pass (writes into system_b) ---
+#
+# KA twin of _sweep_coupled_onesided_reverse! (Interaction.jl). Reuses the
+# *same* _sweep_coupled_onesided_kernel_2d!/_3d! kernels the forward pass
+# uses above — the kernel body only ever refers to its arguments as "ps_a"
+# (self/write-target, iterated over) and "ps_b" (read-only neighbour), so
+# launching it with system_b/system_a's device views swapped and
+# si._cell_start_a (system_a's cell list, already built unconditionally for
+# every coupled interaction — see _create_grid_impl!) in place of
+# si._cell_start reproduces the reverse pass exactly, with no new kernel
+# needed. Mirrors the CPU reverse sweep's own role-swap comment in
+# Interaction.jl. ndrange/backend come from ps_b (the iteration domain and
+# write target here), matching the forward launcher's convention of driving
+# both from the "self" system.
+
+_sweep_coupled_ka_reverse!(si::SystemInteraction{T,2}, ps_b, ::Nothing) where {T} = nothing
+_sweep_coupled_ka_reverse!(si::SystemInteraction{T,3}, ps_b, ::Nothing) where {T} = nothing
+
+function _sweep_coupled_ka_reverse!(si::SystemInteraction{T,2}, ps_b, pfn::PFN) where {T,PFN}
+    ps_a    = si.system_a
+    backend = KA.get_backend(ps_b.x)
+    _sweep_coupled_onesided_kernel_2d!(backend, _KA_WORKGROUP)(
+        device_view(ps_b), device_view(ps_a), pfn, si.kernel, T(si.kernel.h), si._cell_size,
+        si._cell_start_a, SVector(si._mingridx), SVector(si._ngridx);
+        ndrange = ps_b.n)
+    KA.synchronize(backend)
+    return nothing
+end
+
+function _sweep_coupled_ka_reverse!(si::SystemInteraction{T,3}, ps_b, pfn::PFN) where {T,PFN}
+    ps_a    = si.system_a
+    backend = KA.get_backend(ps_b.x)
+    _sweep_coupled_onesided_kernel_3d!(backend, _KA_WORKGROUP)(
+        device_view(ps_b), device_view(ps_a), pfn, si.kernel, T(si.kernel.h), si._cell_size,
+        si._cell_start_a, SVector(si._mingridx), SVector(si._ngridx);
+        ndrange = ps_b.n)
+    KA.synchronize(backend)
+    return nothing
+end
+
+# --- write-direction dispatch ---
+#
+# KA twin of _sweep_coupled_onesided_dispatch! (Interaction.jl, where
+# WritesA/WritesB/WritesBoth and _onesided_shape are defined).
+
+_sweep_coupled_ka_dispatch!(::WritesA, si, system_b, pfn) = _sweep_coupled_ka!(si, system_b, pfn)
+_sweep_coupled_ka_dispatch!(::WritesB, si, system_b, pfn) = _sweep_coupled_ka_reverse!(si, system_b, pfn)
+function _sweep_coupled_ka_dispatch!(::WritesBoth, si, system_b, pfn)
+    _sweep_coupled_ka!(si, system_b, pfn)
+    _sweep_coupled_ka_reverse!(si, system_b, pfn)
+    nothing
+end

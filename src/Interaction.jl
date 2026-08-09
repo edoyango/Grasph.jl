@@ -369,7 +369,7 @@ _sweep_mode!(::ColouredCPU, si, system_b, pfn)  = _sweep_coupled!(si, system_b, 
 _sweep_mode!(::OnesidedCPU, si, ::Nothing, pfn) = _sweep_self_onesided!(si, pfn)
 _sweep_mode!(::OnesidedCPU, si, system_b, pfn)  = _sweep_coupled_onesided_dispatch!(_onesided_shape(pfn, si.system_a, system_b), si, system_b, pfn)
 _sweep_mode!(::OnesidedKA,  si, ::Nothing, pfn) = _sweep_self_ka!(si, pfn)
-_sweep_mode!(::OnesidedKA,  si, system_b, pfn)  = _sweep_coupled_ka!(si, system_b, pfn)
+_sweep_mode!(::OnesidedKA,  si, system_b, pfn)  = _sweep_coupled_ka_dispatch!(_onesided_shape(pfn, si.system_a, system_b), si, system_b, pfn)
 
 # ---------------------------------------------------------------------------
 # One-sided coupled write-direction trait
