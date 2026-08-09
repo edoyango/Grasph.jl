@@ -10,6 +10,7 @@ using Grasph
     include("test_interaction_sweep.jl")
     include("test_interaction_sweep_3d.jl")
     include("test_onesided_sweep.jl")
+    include("test_device_views.jl")
     include("test_onesided_integration_soil2d.jl")
     include("test_onesided_integration_soil3d.jl")
     include("test_onesided_integration_virtual.jl")

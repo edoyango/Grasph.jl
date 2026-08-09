@@ -1,6 +1,6 @@
 export AbstractParticleSystem,
        BasicParticleSystem, FluidParticleSystem, StressParticleSystem,
-       ElastoPlasticParticleSystem, VirtualParticleSystem,
+       AbstractVirtualParticleSystem, ElastoPlasticParticleSystem, VirtualParticleSystem,
        update_state!, write_h5, read_h5!, print_summary,
        add_print_field!, remove_print_field!
 
@@ -542,8 +542,13 @@ zeroing accumulated arrays before a sweep or normalising by `w_sum` after one.
 
 `n`, `ndims`, `mass`, and `c` are validated against the source system.
 """
+# Abstract supertype (mirrors AbstractGhostParticleSystem) so DeviceViews.jl's
+# isbits device-view counterpart can share every pfn_contribution dispatch
+# written against VirtualParticleSystem without touching those signatures.
+abstract type AbstractVirtualParticleSystem{T<:AbstractFloat, ND} <: AbstractParticleSystem{T, ND} end
+
 struct VirtualParticleSystem{T<:AbstractFloat, ND, PS<:AbstractParticleSystem{T,ND}, UPD<:Tuple, ZF,
-                              SA<:AbstractVector{T}} <: AbstractParticleSystem{T, ND}
+                              SA<:AbstractVector{T}} <: AbstractVirtualParticleSystem{T, ND}
     name::String
     source::PS
     w_sum::SA

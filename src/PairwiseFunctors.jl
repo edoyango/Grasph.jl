@@ -89,7 +89,7 @@ end
 # (not `::AbstractParticleSystem`) for the same reason as FluidPfn's
 # equivalent method: every actual call site (grep-verified) targets a ghost
 # or virtual system_b, never a second genuinely-real dynamic system.
-@inline @Base.propagate_inbounds function pfn_contribution(f::StrainRatePfn, ps_a::AbstractParticleSystem{T,ND}, ps_b::Union{AbstractGhostParticleSystem{T,ND},VirtualParticleSystem{T,ND}}, i::Int, j::Int, dx::SVector{ND,T}, gx::SVector{ND,T}, w::T) where {ND,T<:AbstractFloat}
+@inline @Base.propagate_inbounds function pfn_contribution(f::StrainRatePfn, ps_a::AbstractParticleSystem{T,ND}, ps_b::Union{AbstractGhostParticleSystem{T,ND},AbstractVirtualParticleSystem{T,ND}}, i::Int, j::Int, dx::SVector{ND,T}, gx::SVector{ND,T}, w::T) where {ND,T<:AbstractFloat}
     N = length(eltype(ps_a.strain_rate))
     rho_j = ps_b.rho[j]
     mass  = ps_b.mass
@@ -100,7 +100,7 @@ end
     return (strain_rate = sr * (mass / rho_j),)
 end
 
-@inline _onesided_zero_coupled(::StrainRatePfn, ps_a::AbstractParticleSystem{T,ND}, ::Union{AbstractGhostParticleSystem{T,ND},VirtualParticleSystem{T,ND}}, i) where {T,ND} =
+@inline _onesided_zero_coupled(::StrainRatePfn, ps_a::AbstractParticleSystem{T,ND}, ::Union{AbstractGhostParticleSystem{T,ND},AbstractVirtualParticleSystem{T,ND}}, i) where {T,ND} =
     (strain_rate = zero(eltype(ps_a.strain_rate)),)
 
 # Coupled dynamic boundary — derives velocity from distance ratio
@@ -197,7 +197,7 @@ end
 
 # Coupled generic (one-sided) — ghosts and virtual systems (see StrainRatePfn's
 # equivalent method for why this is narrowly typed).
-@inline @Base.propagate_inbounds function pfn_contribution(f::StrainRateVorticityPfn, ps_a::AbstractParticleSystem{T,ND}, ps_b::Union{AbstractGhostParticleSystem{T,ND},VirtualParticleSystem{T,ND}}, i::Int, j::Int, dx::SVector{ND,T}, gx::SVector{ND,T}, w::T) where {ND,T<:AbstractFloat}
+@inline @Base.propagate_inbounds function pfn_contribution(f::StrainRateVorticityPfn, ps_a::AbstractParticleSystem{T,ND}, ps_b::Union{AbstractGhostParticleSystem{T,ND},AbstractVirtualParticleSystem{T,ND}}, i::Int, j::Int, dx::SVector{ND,T}, gx::SVector{ND,T}, w::T) where {ND,T<:AbstractFloat}
     N = length(eltype(ps_a.strain_rate))
     rho_j = ps_b.rho[j]
     mass  = ps_b.mass
@@ -209,7 +209,7 @@ end
     return (strain_rate = sr * (mass / rho_j), vorticity = vor * (mass / rho_j))
 end
 
-@inline _onesided_zero_coupled(::StrainRateVorticityPfn, ps_a::AbstractParticleSystem{T,ND}, ::Union{AbstractGhostParticleSystem{T,ND},VirtualParticleSystem{T,ND}}, i) where {T,ND} =
+@inline _onesided_zero_coupled(::StrainRateVorticityPfn, ps_a::AbstractParticleSystem{T,ND}, ::Union{AbstractGhostParticleSystem{T,ND},AbstractVirtualParticleSystem{T,ND}}, i) where {T,ND} =
     (strain_rate = zero(eltype(ps_a.strain_rate)), vorticity = zero(eltype(ps_a.vorticity)))
 
 # Coupled dynamic boundary
@@ -400,7 +400,7 @@ end
 # (not `::AbstractParticleSystem`) on purpose: once a reverse-pass sweep
 # exists (see Interaction.jl), a bare `(Abstract,Abstract)` method here would
 # silently absorb any mistyped reverse call instead of throwing MethodError.
-@inline @Base.propagate_inbounds function pfn_contribution(f::FluidPfn{S,D,E,T}, ps_a::AbstractParticleSystem{T,ND}, ps_b::Union{AbstractGhostParticleSystem{T,ND},VirtualParticleSystem{T,ND}}, i::Int, j::Int, dx::SVector{ND,T}, gx::SVector{ND,T}, w::T) where {S,D,E,ND,T<:AbstractFloat}
+@inline @Base.propagate_inbounds function pfn_contribution(f::FluidPfn{S,D,E,T}, ps_a::AbstractParticleSystem{T,ND}, ps_b::Union{AbstractGhostParticleSystem{T,ND},AbstractVirtualParticleSystem{T,ND}}, i::Int, j::Int, dx::SVector{ND,T}, gx::SVector{ND,T}, w::T) where {S,D,E,ND,T<:AbstractFloat}
     vi, vj       = ps_a.v[i], ps_b.v[j]
     rho_i, rho_j = ps_a.rho[i], ps_b.rho[j]
     p_i, p_j     = ps_a.p[i], ps_b.p[j]
@@ -418,7 +418,7 @@ end
     return (dvdt = dv_tmp, drhodt = drho)
 end
 
-@inline _onesided_zero_coupled(::FluidPfn{S,D,E,T}, ::AbstractParticleSystem{T,ND}, ::Union{AbstractGhostParticleSystem{T,ND},VirtualParticleSystem{T,ND}}, i) where {S,D,E,ND,T} =
+@inline _onesided_zero_coupled(::FluidPfn{S,D,E,T}, ::AbstractParticleSystem{T,ND}, ::Union{AbstractGhostParticleSystem{T,ND},AbstractVirtualParticleSystem{T,ND}}, i) where {S,D,E,ND,T} =
     (dvdt = zero(SVector{ND,T}), drhodt = zero(T))
 
 # Coupled dynamic boundary (derives velocity, pressure-based)
@@ -649,7 +649,7 @@ end
 # Coupled generic (one-sided) — virtual or ghost ps_b. Narrowly typed on
 # purpose (not `::AbstractParticleSystem`) — see the note on FluidPfn's
 # equivalent method above for why.
-@inline @Base.propagate_inbounds function pfn_contribution(f::CauchyFluidPfn{D,T}, ps_a::AbstractParticleSystem{T,ND}, ps_b::Union{VirtualParticleSystem{T,ND}, AbstractGhostParticleSystem{T,ND}}, i::Int, j::Int, dx::SVector{ND,T}, gx::SVector{ND,T}, w::T) where {D,ND,T<:AbstractFloat}
+@inline @Base.propagate_inbounds function pfn_contribution(f::CauchyFluidPfn{D,T}, ps_a::AbstractParticleSystem{T,ND}, ps_b::Union{AbstractVirtualParticleSystem{T,ND}, AbstractGhostParticleSystem{T,ND}}, i::Int, j::Int, dx::SVector{ND,T}, gx::SVector{ND,T}, w::T) where {D,ND,T<:AbstractFloat}
     vi, vj             = ps_a.v[i], ps_b.v[j]
     rho_i, rho_j       = ps_a.rho[i], ps_b.rho[j]
     stress_i, stress_j = ps_a.stress[i], ps_b.stress[j]
@@ -667,7 +667,7 @@ end
     return (dvdt = dv_tmp, drhodt = drho)
 end
 
-@inline _onesided_zero_coupled(::CauchyFluidPfn{D,T}, ::AbstractParticleSystem{T,ND}, ::Union{VirtualParticleSystem{T,ND}, AbstractGhostParticleSystem{T,ND}}, i) where {D,ND,T} =
+@inline _onesided_zero_coupled(::CauchyFluidPfn{D,T}, ::AbstractParticleSystem{T,ND}, ::Union{AbstractVirtualParticleSystem{T,ND}, AbstractGhostParticleSystem{T,ND}}, i) where {D,ND,T} =
     (dvdt = zero(SVector{ND,T}), drhodt = zero(T))
 
 # Coupled dynamic boundary (derives velocity, stress-based)
@@ -809,7 +809,7 @@ end
 # mutating method of the same signature above (see its comment for the
 # aliasing bug this narrow typing avoids); `_onesided_shape` is left at its
 # default `WritesA()` since this, too, only ever writes ps_a.
-@inline @Base.propagate_inbounds function pfn_contribution(f::XSPHPfn{T}, ps_a::AbstractParticleSystem, ps_b::Union{AbstractGhostParticleSystem{T,ND},VirtualParticleSystem{T,ND}}, i::Int, j::Int, dx::SVector{ND,T}, gx::SVector{ND,T}, w::T) where {ND, T<:AbstractFloat}
+@inline @Base.propagate_inbounds function pfn_contribution(f::XSPHPfn{T}, ps_a::AbstractParticleSystem, ps_b::Union{AbstractGhostParticleSystem{T,ND},AbstractVirtualParticleSystem{T,ND}}, i::Int, j::Int, dx::SVector{ND,T}, gx::SVector{ND,T}, w::T) where {ND, T<:AbstractFloat}
     vi, vj       = ps_a.v[i], ps_b.v[j]
     rho_i, rho_j = ps_a.rho[i], ps_b.rho[j]
     mass_j       = ps_b.mass
@@ -821,7 +821,7 @@ end
     return (v_adjustment = du * mass_j,)
 end
 
-@inline _onesided_zero_coupled(::XSPHPfn{T}, ps_a::AbstractParticleSystem{T,ND}, ::Union{AbstractGhostParticleSystem{T,ND},VirtualParticleSystem{T,ND}}, i) where {T,ND} =
+@inline _onesided_zero_coupled(::XSPHPfn{T}, ps_a::AbstractParticleSystem{T,ND}, ::Union{AbstractGhostParticleSystem{T,ND},AbstractVirtualParticleSystem{T,ND}}, i) where {T,ND} =
     (v_adjustment = zero(SVector{ND,T}),)
 
 """
@@ -903,9 +903,9 @@ _interp_zeros(::Tuple{}, ps) = ()
     return (zero(eltype(getproperty(ps, fname))), _interp_zeros(Base.tail(fields), ps)...)
 end
 
-_onesided_shape(::InterpolateFieldFn, ::AbstractParticleSystem, ::Union{VirtualParticleSystem,ProbeParticleSystem}) = WritesB()
+_onesided_shape(::InterpolateFieldFn, ::AbstractParticleSystem, ::Union{AbstractVirtualParticleSystem,ProbeParticleSystem}) = WritesB()
 
-@inline @Base.propagate_inbounds function pfn_contribution(::InterpolateFieldFn{fields, ACC_WSUM}, ps_a::Union{VirtualParticleSystem{T,ND},ProbeParticleSystem{T,ND}}, ps_b::AbstractParticleSystem{T,ND}, i::Int, j::Int, dx::SVector{ND,T}, gx::SVector{ND,T}, w::T) where {fields, ACC_WSUM, ND, T<:AbstractFloat}
+@inline @Base.propagate_inbounds function pfn_contribution(::InterpolateFieldFn{fields, ACC_WSUM}, ps_a::Union{AbstractVirtualParticleSystem{T,ND},ProbeParticleSystem{T,ND}}, ps_b::AbstractParticleSystem{T,ND}, i::Int, j::Int, dx::SVector{ND,T}, gx::SVector{ND,T}, w::T) where {fields, ACC_WSUM, ND, T<:AbstractFloat}
     kw = w * (ps_b.mass / ps_b.rho[j])
     vals = _interp_values(fields, ps_b, j, kw)
     if ACC_WSUM
@@ -915,7 +915,7 @@ _onesided_shape(::InterpolateFieldFn, ::AbstractParticleSystem, ::Union{VirtualP
     end
 end
 
-@inline function _onesided_zero_coupled(::InterpolateFieldFn{fields, ACC_WSUM}, ps_a::Union{VirtualParticleSystem{T,ND},ProbeParticleSystem{T,ND}}, ::AbstractParticleSystem{T,ND}, i) where {fields, ACC_WSUM, ND, T<:AbstractFloat}
+@inline function _onesided_zero_coupled(::InterpolateFieldFn{fields, ACC_WSUM}, ps_a::Union{AbstractVirtualParticleSystem{T,ND},ProbeParticleSystem{T,ND}}, ::AbstractParticleSystem{T,ND}, i) where {fields, ACC_WSUM, ND, T<:AbstractFloat}
     zeros_ = _interp_zeros(fields, ps_a)
     if ACC_WSUM
         return NamedTuple{(fields..., :w_sum)}((zeros_..., zero(T)))

@@ -63,7 +63,7 @@ VirtualNormUpdater(v_mult::SVector{ND,T}, fields::Symbol...) where {ND,T<:Abstra
     VirtualNormUpdater{fields, ND, T}(v_mult)
 
 @inline @Base.propagate_inbounds function (u::VirtualNormUpdater{Syms,ND,T})(ps, i::Int, dt=nothing) where {Syms,ND,T}
-    _normalize_fields!(ps, i, ps.w_sum[i], u.v_mult, getfield(ps, :prescribed_v), Syms)
+    _normalize_fields!(ps, i, ps.w_sum[i], u.v_mult, ps.prescribed_v, Syms)
 end
 
 @inline _normalize_fields!(ps, i, w, v_mult, prescribed_v, ::Tuple{}) = nothing
@@ -89,7 +89,7 @@ not bleed in.
 struct PrescribedVelocityUpdater <: StateUpdater end
 
 @inline @Base.propagate_inbounds function (::PrescribedVelocityUpdater)(ps, i::Int, dt=nothing)
-    ps.v[i] = ps.v[i] + getfield(ps, :prescribed_v)
+    ps.v[i] = ps.v[i] + ps.prescribed_v
 end
 
 abstract type EOSUpdater <: StateUpdater end

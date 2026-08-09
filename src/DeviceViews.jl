@@ -52,6 +52,17 @@ end
      dvdt = ps.dvdt, drhodt = ps.drhodt, p = ps.p, mass = ps.mass, c = ps.c,
      source_v = ps.source_v, source_rho = ps.source_rho)
 
+@inline _device_fields(ps::StressParticleSystem) =
+    (n = ps.n, x = ps.x, v = ps.v, v_adjustment = ps.v_adjustment, rho = ps.rho,
+     dvdt = ps.dvdt, drhodt = ps.drhodt, p = ps.p, stress = ps.stress, strain_rate = ps.strain_rate,
+     mass = ps.mass, c = ps.c, source_v = ps.source_v, source_rho = ps.source_rho)
+
+@inline _device_fields(ps::ElastoPlasticParticleSystem) =
+    (n = ps.n, x = ps.x, v = ps.v, v_adjustment = ps.v_adjustment, rho = ps.rho,
+     dvdt = ps.dvdt, drhodt = ps.drhodt, p = ps.p, stress = ps.stress, strain_rate = ps.strain_rate,
+     vorticity = ps.vorticity, strain = ps.strain, strain_p = ps.strain_p,
+     mass = ps.mass, c = ps.c, source_v = ps.source_v, source_rho = ps.source_rho)
+
 @inline function device_view(ps::AbstractParticleSystem{T,ND}) where {T,ND}
     nt = _device_fields(ps)
     return DeviceSystem{T, ND, typeof(nt)}(nt)
@@ -62,3 +73,45 @@ end
 # method dispatches on.
 @inline device_view(bs::StaticBoundarySystem) =
     StaticBoundarySystem(device_view(getfield(bs, :inner)), getfield(bs, :lj_cutoff))
+
+@inline device_view(bs::DynamicBoundarySystem) =
+    DynamicBoundarySystem(device_view(getfield(bs, :inner)), getfield(bs, :boundary_normal),
+                           getfield(bs, :boundary_point), getfield(bs, :boundary_beta))
+
+# ---------------------------------------------------------------------------
+# VirtualParticleSystem — owns a non-isbits `name::String` directly (unlike
+# Static/DynamicBoundarySystem, which own no host-only fields at all), so its
+# own concrete type can't be rebuilt around a device-viewed inner system the
+# way the boundary wrappers are. Flatten into a dedicated isbits device view
+# that subtypes AbstractVirtualParticleSystem (see Particles.jl), so every
+# pfn_contribution method written against that abstract type still dispatches
+# without modification.
+# ---------------------------------------------------------------------------
+
+struct DeviceVirtualSystem{T, ND, NT<:NamedTuple} <: AbstractVirtualParticleSystem{T, ND}
+    _f::NT
+end
+
+@inline function Base.getproperty(ds::DeviceVirtualSystem{T,ND}, s::Symbol) where {T,ND}
+    s === :ndims && return ND
+    return getfield(getfield(ds, :_f), s)
+end
+
+function Adapt.adapt_structure(to, ds::DeviceVirtualSystem{T,ND}) where {T,ND}
+    nt = Adapt.adapt(to, getfield(ds, :_f))
+    DeviceVirtualSystem{T, ND, typeof(nt)}(nt)
+end
+
+# Merges the wrapped source's device fields with Virtual's own w_sum/
+# prescribed_v — `vps.mass`/`vps.c`/etc. resolve through VirtualParticleSystem's
+# real getproperty forwarding here, at view-construction time, not inside the
+# kernel, so the flattened NamedTuple carries concrete values regardless of
+# that forwarding.
+@inline _device_fields(vps::VirtualParticleSystem) =
+    merge(_device_fields(getfield(vps, :source)),
+          (w_sum = getfield(vps, :w_sum), prescribed_v = getfield(vps, :prescribed_v)))
+
+@inline function device_view(vps::VirtualParticleSystem{T,ND}) where {T,ND}
+    nt = _device_fields(vps)
+    return DeviceVirtualSystem{T, ND, typeof(nt)}(nt)
+end
