@@ -1,6 +1,6 @@
 # GraSPH.jl → GPU (CUDA.jl) migration: status and plan
 
-_Last updated: 2026-08-09. Branch: `onesided-sweep-gpu-prep` (off `main`). Written
+_Last updated: 2026-08-10. Branch: `onesided-sweep-gpu-prep` (off `main`). Written
 because this work is moving from a CPU-only dev machine to one with an NVIDIA
 GPU — everything needed to pick the work back up should be in this file._
 
@@ -82,6 +82,21 @@ _backend-dispatches on the array's own type, not on `ka=true`. The 6 scripts_
 _item 8 found blocked by this item are now unblocked at the infrastructure_
 _level but still not wired — that remains a follow-up to item 8. Suite:_
 _1651/1651 (up from 1600)._
+
+_2026-08-10 update #9: item 10 (wiring the last 6 experiment scripts) is_
+_done — see the item itself, below (commit `149c238`). All 13 experiment_
+_scripts now support `GRASPH_BACKEND=cuda`. Two aliasing idioms already_
+_established by items 7-9 (adapt a self-referencing wrapper as one unit,_
+_pull the canonical GPU-resident source back out via `getfield`) covered_
+_most of it; `Trapdoor.jl`'s two virtual systems sharing one physical source_
+_across a two-stage run needed a third idiom (rebuild the second wrapper_
+_directly around the first's already-adapted source) that surfaced a real,_
+_previously-unreachable bug — `VirtualParticleSystem`'s keyword constructor_
+_hardcoded `Vector` for `w_sum` regardless of the source's own array type,_
+_the same buffer-type bug class item 9 already fixed once for RK4. Fixed,_
+_with a regression test. `CantileverBeam.jl` also needed two pre-existing,_
+_unrelated broken calls (documented but never fixed back in Phase C) fixed_
+_to actually run. Suite: 1653/1653 (up from 1651)._
 
 ## Why this migration, and why not an octree
 
@@ -1094,14 +1109,97 @@ to coloured for all 13 scripts, and no script's behavior changed.
 
    Suite: 1651/1651 (up from 1600 after item 8).
 
-   **What's still not done**: the 6 scripts item 8 identified as blocked here
-   (`bubble.jl`/`bubble2.jl`/`bubble3.jl`, `EP_ColumnCollapse2.jl`,
+   ~~**What's still not done**: the 6 scripts item 8 identified as blocked
+   here (`bubble.jl`/`bubble2.jl`/`bubble3.jl`, `EP_ColumnCollapse2.jl`,
    `Trapdoor.jl`, `CantileverBeam.jl`) are now unblocked at the
    infrastructure level — every piece they need has a working `ka=true` path
    — but none of them have actually been wired with the `GRASPH_BACKEND`
    switch yet. That's a follow-up to item 8's script-wiring pass, not part of
    this item's scope, mirroring how item 7 unblocked item 8's ghost-using
-   scripts without wiring them itself.
+   scripts without wiring them itself.~~ — **done, item 10, below.**
+10. **Wire `GRASPH_BACKEND` into the last 6 experiment scripts** — **done**
+   (commit `149c238`). `bubble.jl`, `bubble2.jl`, `bubble3.jl`,
+   `EP_ColumnCollapse2.jl`, `Trapdoor.jl`, and `CantileverBeam.jl` now carry
+   the same `GRASPH_BACKEND` switch as the other 7 scripts — all 13
+   experiment scripts support `GRASPH_BACKEND=cuda` now. Purely script-level
+   wiring; item 9 had already closed every infrastructure gap these needed.
+
+   Most of it followed the two aliasing idioms items 7-9 already
+   established for a system that self-references another (adapt the wrapper
+   as one unit, pull the canonical GPU-resident source back out via
+   `getfield`): the ghost in `bubble.jl`/`bubble2.jl`/`bubble3.jl`/
+   `Trapdoor.jl` (self-referencing its fluid/soil source), and the probe in
+   `CantileverBeam.jl` (`beam_probe.mirror_target === beam`) — the latter
+   also required reordering the script slightly, constructing the probe
+   *before* the interactions that need `beam` rather than after, since the
+   correct adapted `beam` only exists once pulled back out of the adapted
+   probe.
+
+   `Trapdoor.jl` needed a third idiom: `trapdoor_static_virt` and
+   `trapdoor_moving_virt` both wrap the *same* `trapdoor_source`, so the two
+   run phases (static settling, then moving) share live position/stress
+   state across the stage boundary — adapting both independently would
+   silently give each phase its own disconnected copy of the trapdoor. The
+   fix is to adapt one, then rebuild the other directly around the same
+   already-adapted source (`VirtualParticleSystem(trapdoor_source_gpu, ...)`).
+
+   **That reconstruction pattern surfaced a real, previously-unreachable
+   bug**: `VirtualParticleSystem`'s keyword constructor
+   (`src/Particles.jl`) hardcoded `w_sum = zeros(T, n)` regardless of the
+   source's own array type. Every prior GPU-resident virtual system reached
+   `w_sum`'s correct type via `Adapt.adapt_structure` adapting `source` and
+   `w_sum` together — this was the first time anything constructed a
+   *fresh* `VirtualParticleSystem` directly around an already GPU-resident
+   source. The result was a mixed-backend struct (source on `CuArray`,
+   `w_sum` on `Vector`) that isn't `isbits`, so `device_view` builds fine
+   and `cudaconvert` even succeeds (it only converts the `CuArray`s it
+   finds), but the actual `@kernel` launch fails to *compile* the first
+   time that struct reaches one — a GPU-compilation error, not a caught
+   type mismatch or a soft runtime one, and it only surfaces the first time
+   the affected interaction actually sweeps (`Trapdoor.jl`'s moving-phase
+   stage, past the point where the static phase alone would have caught
+   it). Fixed by deriving `w_sum`'s array type from the source via
+   `similar` (`w_sum = fill!(similar(ps.x, T, n), zero(T))`), the same
+   buffer-type-follows-the-system idiom RK4's sort scratch buffers were
+   already fixed to use in item 9. Zero behaviour change for the CPU case
+   (`similar` on a `Vector` gives a `Vector`, `fill!`ed to the same zeros
+   `zeros(T,n)` already produced).
+
+   `CantileverBeam.jl` also needed two pre-existing, unrelated broken calls
+   fixed before it would even run on CPU: `CubicSplineKernel(; ndims=2)`
+   (missing its required positional `h`) and `SystemInteraction(...; h=h_sph)`
+   (`h` isn't a keyword `SystemInteraction` accepts at all). Phase C's own
+   integration harness had already found and documented both — "confirmed
+   `CantileverBeam.jl` is broken as committed... its harness reconstructs
+   the intended shape with corrected calls instead" — but left the script
+   itself unfixed, since fixing it wasn't in that item's scope. This item
+   needed the actual script runnable to verify its GPU wiring, so it applied
+   the same corrected calls the harness already used.
+
+   **Verified per script** on real CUDA hardware (RTX 4060 Laptop), via the
+   merged-throwaway-environment technique (see "Environment notes" above):
+   every script ran cleanly for several thousand steps (`bubble.jl`'s 6000
+   steps to full completion) with no `MethodError`, no `scalar indexing
+   disabled` violation, and no `NaN`. `Trapdoor.jl` was additionally run at
+   full production particle scale (26,400 soil / 2,340 bottom / 400
+   trapdoor particles — only the two stages' step counts were reduced, to
+   300 each) specifically to cross the static-to-moving phase boundary,
+   confirming the shared-source reconstruction survives a real phase
+   transition end to end, not just the static phase alone.
+
+   New regression test (`test/test_gpu_cuda.jl`, "device_view is isbits
+   after cudaconvert"): builds a second `VirtualParticleSystem` directly
+   around a first virtual's already-adapted source (mirroring `Trapdoor.jl`'s
+   shape exactly) and asserts `w_sum isa CuArray` plus
+   `isbitstype(typeof(cudaconvert(device_view(...))))` — confirmed to fail
+   with the pre-fix code (`w_sum` comes back `Vector`) and pass with the fix,
+   via direct mutation testing (temporarily reverted the fix, re-ran, saw the
+   predicted failure, restored it, saw green). This bug class is invisible to
+   any `KA.CPU()` test, same reasoning as item 9's `_axpy_const_ip!` bug —
+   `similar`/`zeros` are identical when `ps.x` is itself a `Vector`, so it
+   only manifests with a real non-CPU backend.
+
+   Suite: 1653/1653 (up from 1651 after item 9).
 
 ## Explicitly deferred (not started, not part of the current scope)
 
@@ -1113,11 +1211,9 @@ to coloured for all 13 scripts, and no script's behavior changed.
   `StressParticleSystem`/`ElastoPlasticParticleSystem`'s `device_view`/`Adapt`
   support (item 5) are all in place now; nothing in this category remains
   unstarted.
-- Wiring `GRASPH_BACKEND` into the 6 experiment scripts item 9 unblocked
-  (`bubble.jl`/`bubble2.jl`/`bubble3.jl`, `EP_ColumnCollapse2.jl`,
-  `Trapdoor.jl`, `CantileverBeam.jl` — still on the coloured sweep by
-  default; see item 9's own note above). The other 5 non-dambreak scripts
-  are done (item 8).
+- ~~Wiring `GRASPH_BACKEND` into the 6 experiment scripts item 9 unblocked~~
+  — **done, item 10.** All 13 experiment scripts now support
+  `GRASPH_BACKEND=cuda`; nothing left deferred in this category.
 - Persistent/cached grid, Verlet-skin rebuild cadence, and fusing the sort's
   gather+copyback into a single `Ref`-swap — all flagged during Phase B2 as
   follow-ups once the crossover benchmark shows whether launch count is
@@ -1133,10 +1229,10 @@ to coloured for all 13 scripts, and no script's behavior changed.
 ## Practical notes for picking this back up
 
 - Branch: `onesided-sweep-gpu-prep`, based on `main` at commit `37e9a5a`, now
-  31 commits ahead of it (`12ac526`..`9182bd8`). Nothing on this branch has
+  32 commits ahead of it (`12ac526`..`149c238`). Nothing on this branch has
   been pushed to any remote.
 - Run the full suite with `julia --project -e 'using Pkg; Pkg.test()'` —
-  should show `1651/1651` (834 through Phase B1, up to 935 after Phase B2's
+  should show `1653/1653` (834 through Phase B1, up to 935 after Phase B2's
   3D work, up to 1371 after Phase C, up to 1433 after item 5's `device_view`
   extension, up to 1466 after item 6's reverse-sweep KA kernel twin, up to
   1479 after also fixing the `FluidPfn` fluid-fluid `ka=true` dispatch gap
@@ -1145,7 +1241,9 @@ to coloured for all 13 scripts, and no script's behavior changed.
   1600 after item 7 (`GhostParticleSystem` GPU residency plus its
   adversarial-review test additions), up to 1651 after item 9
   (`ProbeParticleSystem`'s `device_view`/`Adapt` extension plus real-CUDA
-  tests for the RK4/Virtual/Probe fixes). `Pkg.test()` resolves its own CUDA
+  tests for the RK4/Virtual/Probe fixes), up to 1653 after item 10 (the
+  `VirtualParticleSystem` `w_sum` buffer-type regression test). `Pkg.test()`
+  resolves its own CUDA
   from `test/Project.toml` and picks up real hardware automatically when
   present (confirmed again this item) — no merged-throwaway-environment
   workaround needed for the test suite itself, only for running a top-level
@@ -1193,6 +1291,11 @@ to coloured for all 13 scripts, and no script's behavior changed.
   with nonzero `prescribed_v`, Probe with a self-referencing `mirror_target`)
   — the only tier that could actually catch this item's real bug (the
   `Ref`-less `_axpy_const_ip!` broadcast), since it's invisible on `KA.CPU()`.
+  Item 10 added one more regression case to the same "device_view is isbits
+  after cudaconvert" testset in `test/test_gpu_cuda.jl` (a second
+  `VirtualParticleSystem` built directly around a first one's already-adapted
+  source), for the same reason: the `w_sum` buffer-type bug it caught is only
+  reachable on a real (or `cudaconvert`-checked) non-CPU backend.
 - `CUDA.jl` is now confirmed to install and run correctly on a real GPU from
   this repo's dependency graph (see environment notes above) — the earlier
   "no GPU in the dev environment this was built in" caveat throughout Phase
