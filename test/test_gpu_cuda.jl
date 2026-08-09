@@ -42,6 +42,18 @@ function _gpucuda_random_fluid(rng, n, ndims; L=1.0)
     return ps
 end
 
+function _gpucuda_random_elastoplastic(rng, n, ndims; L=1.0, ns=(ndims == 2 ? 4 : 6))
+    ps = ElastoPlasticParticleSystem("wall", n, ndims, ns, 1.0, 10.0; source_v = zeros(ndims))
+    for i in 1:n
+        ps.x[i] = SVector(ntuple(_ -> L * rand(rng), ndims)...)
+        ps.v[i] = SVector(ntuple(_ -> 0.2 * (rand(rng) - 0.5), ndims)...)
+    end
+    # Constructor already zero-fills p/stress/strain*/dvdt/drhodt; FluidSolidPfn
+    # never reads the solid's own p/stress, only its v/rho/mass/c.
+    ps.rho .= 2400.0 .+ 20 .* (rand(rng, n) .- 0.5)
+    return ps
+end
+
 function _gpucuda_random_boundary(rng, n, ndims; L=1.0)
     inner = BasicParticleSystem("bnd", n, ndims, 1.0, 10.0)
     for i in 1:n
@@ -229,6 +241,57 @@ else
                     @test all(==(0.0), a_gpu_h.drhodt)
                 end
             end
+        end
+
+        @testset "full pipeline (sort+grid+sweep), FluidSolidPfn WritesBoth (fluid-solid): CPU oracle vs CUDA" begin
+            # DambreakWall.jl's fluid/wall coupling shape. Same Kind-based
+            # fix as the FluidPfn fluid-fluid case above, but FluidSolidPfn's
+            # physics is asymmetric (fluid's own pressure used on both
+            # sides), so it needed two distinct DeviceSystem{T,ND,Kind}
+            # methods rather than one shared one — see PairwiseFunctors.jl.
+            # A separate testset from the loop above since the fluid/solid
+            # pairing needs two different system types, not two fluids.
+            CUDA.allowscalar(false)
+            rng = MersenneTwister(207)
+            h = 0.08
+            kernel = CubicSplineKernel(h; ndims=2)
+            cutoff = kernel.interaction_length
+            pfn = FluidSolidPfn(0.03, 0.0, h)
+
+            a_cpu = _gpucuda_random_fluid(rng, 800, 2; L=2.0)
+            b_cpu = _gpucuda_random_elastoplastic(rng, 600, 2; L=2.0)
+            a_gpu = adapt(CUDABackend(), deepcopy(a_cpu))
+            b_gpu = adapt(CUDABackend(), deepcopy(b_cpu))
+
+            si_cpu = SystemInteraction(kernel, pfn, a_cpu, b_cpu; onesided=true)
+            pa, ka_, sa = _gpucuda_sortbufs_cpu(a_cpu)
+            sort_particles!(a_cpu, cutoff, pa, ka_, sa)
+            pb, kb, sb = _gpucuda_sortbufs_cpu(b_cpu)
+            sort_particles!(b_cpu, cutoff, pb, kb, sb)
+            create_grid!(si_cpu)
+            sweep!(si_cpu)
+
+            si_gpu = SystemInteraction(kernel, pfn, a_gpu, b_gpu; onesided=true, ka=true)
+            pag, kag, sag = _gpucuda_sortbufs_gpu(a_gpu)
+            sort_particles!(a_gpu, cutoff, pag, kag, sag)
+            pbg, kbg, sbg = _gpucuda_sortbufs_gpu(b_gpu)
+            sort_particles!(b_gpu, cutoff, pbg, kbg, sbg)
+            create_grid!(si_gpu)
+            sweep!(si_gpu)
+
+            a_gpu_h = adapt(Array, a_gpu)
+            b_gpu_h = adapt(Array, b_gpu)
+            oa, oag = _byid(a_cpu), _byid(a_gpu_h)
+            ob, obg = _byid(b_cpu), _byid(b_gpu_h)
+
+            a_dvdt_scale = max(maximum(norm.(a_cpu.dvdt)), 1.0)
+            b_dvdt_scale = max(maximum(norm.(b_cpu.dvdt)), 1.0)
+            @test maximum(norm.(a_cpu.dvdt[oa] .- a_gpu_h.dvdt[oag])) < 1e-10 * a_dvdt_scale
+            @test maximum(norm.(b_cpu.dvdt[ob] .- b_gpu_h.dvdt[obg])) < 1e-10 * b_dvdt_scale
+            a_drho_scale = max(maximum(abs.(a_cpu.drhodt)), 1.0)
+            b_drho_scale = max(maximum(abs.(b_cpu.drhodt)), 1.0)
+            @test maximum(abs.(a_cpu.drhodt[oa] .- a_gpu_h.drhodt[oag])) < 1e-10 * a_drho_scale
+            @test maximum(abs.(b_cpu.drhodt[ob] .- b_gpu_h.drhodt[obg])) < 1e-10 * b_drho_scale
         end
 
         @testset "full pipeline (sort+grid+sweep), InterpolateFieldFn WritesB virtual target: CPU oracle vs CUDA" begin

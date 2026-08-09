@@ -1055,14 +1055,21 @@ end
 # each explicitly reading the fluid's pressure from wherever the fluid
 # actually is. No generic fallback is provided on purpose: a missing or
 # mistyped call must throw MethodError rather than silently compute with the
-# wrong side's pressure.
+# wrong side's pressure. Each host-typed method has a device_view-typed
+# (`DeviceSystem{T,ND,Kind}`) twin below it for the same reason FluidPfn's
+# fluid-fluid method needed one (see DeviceViews.jl's Kind parameter) — here
+# it also happens to be what disambiguates the two asymmetric directions from
+# each other once device_view is involved, not just from unrelated pairings.
 # ---------------------------------------------------------------------------
 
 _onesided_shape(::FluidSolidPfn, ::FluidParticleSystem, ::ElastoPlasticParticleSystem) = WritesBoth()
 _onesided_shape(::FluidSolidPfn, ::ElastoPlasticParticleSystem, ::FluidParticleSystem) = WritesBoth()
 
+# Shared by the host-typed and device_view-typed methods below — same
+# reasoning as FluidPfn's fluid-fluid twin above: ps_a/ps_b left untyped so
+# Julia specializes per call site, letting one body serve both entry points.
 # Fluid is the target (ps_a): p_i is the fluid's own pressure, read directly.
-@inline @Base.propagate_inbounds function pfn_contribution(f::FluidSolidPfn{S,D,T}, ps_a::FluidParticleSystem{T,ND}, ps_b::ElastoPlasticParticleSystem{T,ND}, i::Int, j::Int, dx::SVector{ND,T}, gx::SVector{ND,T}, w::T) where {S,D,ND,T<:AbstractFloat}
+@inline @Base.propagate_inbounds function _fluidsolidpfn_fluid_a_contribution(f::FluidSolidPfn{S,D,T}, ps_a, ps_b, i::Int, j::Int, dx::SVector{ND,T}, gx::SVector{ND,T}, w::T) where {S,D,ND,T<:AbstractFloat}
     vi, vj       = ps_a.v[i], ps_b.v[j]
     rho_i, rho_j = ps_a.rho[i], ps_b.rho[j]
     p_i          = ps_a.p[i]       # fluid pressure used for both sides
@@ -1080,13 +1087,29 @@ _onesided_shape(::FluidSolidPfn, ::ElastoPlasticParticleSystem, ::FluidParticleS
     return (dvdt = dv_tmp, drhodt = drho)
 end
 
+@inline @Base.propagate_inbounds pfn_contribution(f::FluidSolidPfn{S,D,T}, ps_a::FluidParticleSystem{T,ND}, ps_b::ElastoPlasticParticleSystem{T,ND}, i::Int, j::Int, dx::SVector{ND,T}, gx::SVector{ND,T}, w::T) where {S,D,ND,T<:AbstractFloat} =
+    _fluidsolidpfn_fluid_a_contribution(f, ps_a, ps_b, i, j, dx, gx, w)
+
 @inline _onesided_zero_coupled(::FluidSolidPfn{S,D,T}, ::FluidParticleSystem{T,ND}, ::ElastoPlasticParticleSystem{T,ND}, i) where {S,D,ND,T} =
+    (dvdt = zero(SVector{ND,T}), drhodt = zero(T))
+
+# ka=true twin: device_view erases concrete-type identity on bare system
+# types (DeviceViews.jl), so — exactly like FluidPfn's fluid-fluid twin —
+# this must be typed on the specific DeviceSystem{T,ND,Kind} pairing rather
+# than loose AbstractParticleSystem{T,ND}, so a device-viewed pairing this
+# pfn was never meant to accept (e.g. two fluids, or a fluid paired with a
+# device-viewed BasicParticleSystem) still throws MethodError instead of
+# silently computing with the wrong side's pressure.
+@inline @Base.propagate_inbounds pfn_contribution(f::FluidSolidPfn{S,D,T}, ps_a::DeviceSystem{T,ND,FluidParticleSystem}, ps_b::DeviceSystem{T,ND,ElastoPlasticParticleSystem}, i::Int, j::Int, dx::SVector{ND,T}, gx::SVector{ND,T}, w::T) where {S,D,ND,T<:AbstractFloat} =
+    _fluidsolidpfn_fluid_a_contribution(f, ps_a, ps_b, i, j, dx, gx, w)
+
+@inline _onesided_zero_coupled(::FluidSolidPfn{S,D,T}, ::DeviceSystem{T,ND,FluidParticleSystem}, ::DeviceSystem{T,ND,ElastoPlasticParticleSystem}, i) where {S,D,ND,T} =
     (dvdt = zero(SVector{ND,T}), drhodt = zero(T))
 
 # Solid is the target (ps_a): the fluid is now in ps_b, so its pressure must
 # be read from ps_b.p[j] — the solid's own pressure (ps_a.p[i]) must never
 # appear in this formula.
-@inline @Base.propagate_inbounds function pfn_contribution(f::FluidSolidPfn{S,D,T}, ps_a::ElastoPlasticParticleSystem{T,ND}, ps_b::FluidParticleSystem{T,ND}, i::Int, j::Int, dx::SVector{ND,T}, gx::SVector{ND,T}, w::T) where {S,D,ND,T<:AbstractFloat}
+@inline @Base.propagate_inbounds function _fluidsolidpfn_solid_a_contribution(f::FluidSolidPfn{S,D,T}, ps_a, ps_b, i::Int, j::Int, dx::SVector{ND,T}, gx::SVector{ND,T}, w::T) where {S,D,ND,T<:AbstractFloat}
     vi, vj       = ps_a.v[i], ps_b.v[j]
     rho_i, rho_j = ps_a.rho[i], ps_b.rho[j]
     p_fluid      = ps_b.p[j]       # fluid pressure used for both sides
@@ -1104,5 +1127,15 @@ end
     return (dvdt = dv_tmp, drhodt = drho)
 end
 
+@inline @Base.propagate_inbounds pfn_contribution(f::FluidSolidPfn{S,D,T}, ps_a::ElastoPlasticParticleSystem{T,ND}, ps_b::FluidParticleSystem{T,ND}, i::Int, j::Int, dx::SVector{ND,T}, gx::SVector{ND,T}, w::T) where {S,D,ND,T<:AbstractFloat} =
+    _fluidsolidpfn_solid_a_contribution(f, ps_a, ps_b, i, j, dx, gx, w)
+
 @inline _onesided_zero_coupled(::FluidSolidPfn{S,D,T}, ::ElastoPlasticParticleSystem{T,ND}, ::FluidParticleSystem{T,ND}, i) where {S,D,ND,T} =
+    (dvdt = zero(SVector{ND,T}), drhodt = zero(T))
+
+# ka=true twin — same reasoning as the fluid-as-ps_a twin above.
+@inline @Base.propagate_inbounds pfn_contribution(f::FluidSolidPfn{S,D,T}, ps_a::DeviceSystem{T,ND,ElastoPlasticParticleSystem}, ps_b::DeviceSystem{T,ND,FluidParticleSystem}, i::Int, j::Int, dx::SVector{ND,T}, gx::SVector{ND,T}, w::T) where {S,D,ND,T<:AbstractFloat} =
+    _fluidsolidpfn_solid_a_contribution(f, ps_a, ps_b, i, j, dx, gx, w)
+
+@inline _onesided_zero_coupled(::FluidSolidPfn{S,D,T}, ::DeviceSystem{T,ND,ElastoPlasticParticleSystem}, ::DeviceSystem{T,ND,FluidParticleSystem}, i) where {S,D,ND,T} =
     (dvdt = zero(SVector{ND,T}), drhodt = zero(T))

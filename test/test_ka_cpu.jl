@@ -54,6 +54,18 @@ function _kacpu_random_boundary(rng, n, ndims; L=1.0)
     return inner
 end
 
+function _kacpu_random_elastoplastic(rng, n, ndims; L=1.0, ns=(ndims == 2 ? 4 : 6))
+    ps = ElastoPlasticParticleSystem("wall", n, ndims, ns, 1.0, 10.0; source_v = zeros(ndims))
+    for i in 1:n
+        ps.x[i] = SVector(ntuple(_ -> L * rand(rng), ndims)...)
+        ps.v[i] = SVector(ntuple(_ -> 0.2 * (rand(rng) - 0.5), ndims)...)
+    end
+    # Constructor already zero-fills p/stress/strain*/dvdt/drhodt; FluidSolidPfn
+    # never reads the solid's own p/stress, only its v/rho/mass/c.
+    ps.rho .= 2400.0 .+ 20 .* (rand(rng, n) .- 0.5)
+    return ps
+end
+
 _kacpu_sortbufs(ps) = (Vector{Int}(undef, ps.n), Vector{UInt64}(undef, ps.n), Grasph._make_sort_scratch(ps))
 
 # rtol is deliberately tight (~1e4x headroom over the measured ~2.6e-16
@@ -246,16 +258,17 @@ end
     # (KAKernels.jl) are the KA twin of `_sweep_coupled_onesided_reverse!`/
     # `_sweep_coupled_onesided_dispatch!` (Interaction.jl, Phase C). Reuses
     # `_MutualTestPfn`/`_ReverseOnlyTestPfn` (test-only, WritesBoth/WritesB)
-    # from test_onesided_sweep.jl, plus two real production pfns whose
+    # from test_onesided_sweep.jl, plus three real production pfns whose
     # coupled system types are both device_view-ready: `FluidPfn` fluid-fluid
-    # (WritesBoth, bubble.jl/bubble2.jl/bubble3.jl's shape) and
-    # `InterpolateFieldFn` onto a virtual target (WritesB, Trapdoor.jl/
-    # EP_ColumnCollapse2.jl's shape) — `AbstractVirtualParticleSystem` got its
-    # own device_view in item 5. `NeighborCountFn`/`InterpolateFieldFn`-onto-
-    # probe and `FluidSolidPfn` are WritesB/WritesBoth pfns too but target
-    # `ProbeParticleSystem`/lack a device_view-dispatchable `pfn_contribution`
-    # respectively (see item 5's and Phase C's notes) — neither has a
-    # device_view yet, so `ka=true` isn't reachable for them regardless of
+    # (WritesBoth, bubble.jl/bubble2.jl/bubble3.jl's shape), `FluidSolidPfn`
+    # (WritesBoth, DambreakWall.jl's shape — asymmetric physics, needs two
+    # narrowly-typed DeviceSystem{T,ND,Kind} methods rather than one; see
+    # PairwiseFunctors.jl), and `InterpolateFieldFn` onto a virtual target
+    # (WritesB, Trapdoor.jl/EP_ColumnCollapse2.jl's shape) —
+    # `AbstractVirtualParticleSystem` got its own device_view in item 5.
+    # `NeighborCountFn`/`InterpolateFieldFn`-onto-probe are WritesB pfns too
+    # but target `ProbeParticleSystem`, which lacks a device_view (see item
+    # 5's notes) — so `ka=true` isn't reachable for them regardless of
     # this sweep-infrastructure change; that's items 7-9's gap, not this
     # one's.
     # -----------------------------------------------------------------------
@@ -429,6 +442,107 @@ end
         _kacpu_assert_drhodt_close(a_ref.drhodt, a_ka.drhodt)
         _kacpu_assert_dvdt_close(b_ref.dvdt, b_ka.dvdt)
         _kacpu_assert_drhodt_close(b_ref.drhodt, b_ka.drhodt)
+    end
+
+    @testset "coupled reverse sweep (FluidSolidPfn, WritesBoth): onesided vs ka=true" begin
+        # DambreakWall.jl's fluid/wall coupling shape (fluid=ps_a,
+        # solid=ps_b). Unlike FluidPfn's fluid-fluid case, FluidSolidPfn's
+        # physics is NOT symmetric under relabeling — the fluid's own
+        # pressure must be used for both sides regardless of which slot it's
+        # in — so it needs two distinct DeviceSystem{T,ND,Kind}-typed
+        # `pfn_contribution` methods (see PairwiseFunctors.jl), one per
+        # physical assignment. A WritesBoth interaction exercises both: the
+        # forward pass hits the fluid-as-ps_a method, the reverse pass hits
+        # the solid-as-ps_a method. Same Kind mechanism as the FluidPfn
+        # fluid-fluid fix above.
+        rng = MersenneTwister(114)
+        h = 0.08
+        kernel = CubicSplineKernel(h; ndims=2)
+        cutoff = kernel.interaction_length
+        pfn = FluidSolidPfn(0.03, 0.0, h)
+        a_ref = _kacpu_random_fluid(rng, 220, 2; L=1.0)
+        b_ref = _kacpu_random_elastoplastic(rng, 170, 2; L=1.0)
+        a_ka, b_ka = deepcopy(a_ref), deepcopy(b_ref)
+        si_ref = SystemInteraction(kernel, pfn, a_ref, b_ref; onesided=true)
+        si_ka  = SystemInteraction(kernel, pfn, a_ka, b_ka; onesided=true, ka=true)
+        for (a, b, si) in ((a_ref, b_ref, si_ref), (a_ka, b_ka, si_ka))
+            pa, ka_, sa = _kacpu_sortbufs(a)
+            sort_particles!(a, cutoff, pa, ka_, sa)
+            pb, kb, sb = _kacpu_sortbufs(b)
+            sort_particles!(b, cutoff, pb, kb, sb)
+            create_grid!(si)
+            sweep!(si)
+        end
+        _kacpu_assert_dvdt_close(a_ref.dvdt, a_ka.dvdt)
+        _kacpu_assert_drhodt_close(a_ref.drhodt, a_ka.drhodt)
+        _kacpu_assert_dvdt_close(b_ref.dvdt, b_ka.dvdt)
+        _kacpu_assert_drhodt_close(b_ref.drhodt, b_ka.drhodt)
+    end
+
+    @testset "coupled reverse sweep (FluidSolidPfn, WritesBoth) 3D: onesided vs ka=true" begin
+        rng = MersenneTwister(115)
+        h = 0.08
+        kernel = CubicSplineKernel(h; ndims=3)
+        cutoff = kernel.interaction_length
+        pfn = FluidSolidPfn(0.03, 0.0, h)
+        a_ref = _kacpu_random_fluid(rng, 180, 3; L=1.0)
+        b_ref = _kacpu_random_elastoplastic(rng, 140, 3; L=1.0)
+        a_ka, b_ka = deepcopy(a_ref), deepcopy(b_ref)
+        si_ref = SystemInteraction(kernel, pfn, a_ref, b_ref; onesided=true)
+        si_ka  = SystemInteraction(kernel, pfn, a_ka, b_ka; onesided=true, ka=true)
+        for (a, b, si) in ((a_ref, b_ref, si_ref), (a_ka, b_ka, si_ka))
+            pa, ka_, sa = _kacpu_sortbufs(a)
+            sort_particles!(a, cutoff, pa, ka_, sa)
+            pb, kb, sb = _kacpu_sortbufs(b)
+            sort_particles!(b, cutoff, pb, kb, sb)
+            create_grid!(si)
+            sweep!(si)
+        end
+        _kacpu_assert_dvdt_close(a_ref.dvdt, a_ka.dvdt)
+        _kacpu_assert_drhodt_close(a_ref.drhodt, a_ka.drhodt)
+        _kacpu_assert_dvdt_close(b_ref.dvdt, b_ka.dvdt)
+        _kacpu_assert_drhodt_close(b_ref.drhodt, b_ka.drhodt)
+    end
+
+    @testset "FluidSolidPfn ka=true: solid-side contribution uses fluid's pressure, not solid's own" begin
+        # Regression guard for the asymmetric-physics hazard the two
+        # narrowly-typed methods exist to prevent: if the solid-as-ps_a
+        # device_view method ever regressed to reading ps_a.p (the solid's
+        # own pressure) instead of ps_b.p (the fluid's), this test would
+        # catch it, since the swap-antisymmetry check alone (comparing a
+        # call against itself) cannot.
+        h = 0.1
+        kernel = CubicSplineKernel(h; ndims=2)
+        pfn = FluidSolidPfn(0.03, 0.0, h)
+        fluid = _kacpu_random_fluid(MersenneTwister(116), 3, 2; L=0.05)
+        solid = _kacpu_random_elastoplastic(MersenneTwister(117), 3, 2; L=0.05)
+        dx, gx, w = SVector(0.01, 0.0), SVector(1.0, 0.0), 0.5
+
+        dv_fluid = Grasph.device_view(fluid)
+        c1 = pfn_contribution(pfn, Grasph.device_view(solid), dv_fluid, 1, 1, dx, gx, w)
+
+        solid.p .= 999.0   # must be ignored — FluidSolidPfn never reads the solid's own p
+        c2 = pfn_contribution(pfn, Grasph.device_view(solid), dv_fluid, 1, 1, dx, gx, w)
+
+        @test c1.dvdt == c2.dvdt
+        @test c1.drhodt == c2.drhodt
+    end
+
+    @testset "device_view Kind parameter (FluidSolidPfn): mismatched pairing still MethodErrors" begin
+        # Same regression guard as the FluidPfn fluid-fluid one below, for
+        # FluidSolidPfn's two Kind-typed methods: neither should match a
+        # fluid-fluid pairing (that's FluidPfn's job) or a fluid-bare-system
+        # pairing (that's not a physical fluid-solid coupling).
+        h = 0.1
+        kernel = CubicSplineKernel(h; ndims=2)
+        pfn = FluidSolidPfn(0.03, 0.0, h)
+        fluid  = _kacpu_random_fluid(MersenneTwister(118), 3, 2; L=0.05)
+        fluid2 = _kacpu_random_fluid(MersenneTwister(119), 3, 2; L=0.05)
+        bnd    = _kacpu_random_boundary(MersenneTwister(120), 3, 2; L=0.05)
+        dx, gx, w = SVector(0.01, 0.0), SVector(1.0, 0.0), 0.5
+        @test_throws MethodError pfn_contribution(pfn, Grasph.device_view(fluid), Grasph.device_view(fluid2), 1, 1, dx, gx, w)
+        @test_throws MethodError pfn_contribution(pfn, Grasph.device_view(fluid), Grasph.device_view(bnd), 1, 1, dx, gx, w)
+        @test_throws MethodError pfn_contribution(pfn, Grasph.device_view(bnd), Grasph.device_view(fluid), 1, 1, dx, gx, w)
     end
 
     @testset "device_view Kind parameter: mismatched pairing still MethodErrors" begin
