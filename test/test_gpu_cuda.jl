@@ -657,6 +657,158 @@ else
             @test maximum(abs.(fluid_cpu.p .- p_gpu_h)) < 1e-12 * p_scale
         end
 
+        @testset "RK4TimeIntegrator on real CUDA hardware (item 9 buffer-type fix)" begin
+            # bubble.jl/bubble2.jl/bubble3.jl's shape: RK4TimeIntegrator plus a
+            # self-referencing ghost, reusing the _bubble_like/_bubble_integrator
+            # fixtures from test_onesided_integration_bubble.jl (included
+            # earlier in runtests.jl, same top-level @testset scope).
+            #
+            # Before item 9, RK4's time_integrate! hardcoded Vector for its
+            # sort_perm_buf/sort_key_buf scratch buffers regardless of the
+            # systems' actual array type — LeapFrog's own loop already derived
+            # them via `similar(first(sys).x, ...)`, RK4's didn't. On a real
+            # CUDA-resident RK4 run this mismatched CPU-buffer/GPU-array pair
+            # would hit scalar indexing inside sort_particles! the first time
+            # it ran. This can only be exercised on a real non-CPU backend —
+            # a KA.CPU() test can't distinguish `Vector` from `similar(x,...)`
+            # when `x` is itself a `Vector`.
+            CUDA.allowscalar(false)
+            sys_cpu = _bubble_like()
+            rk_cpu  = _bubble_integrator(sys_cpu; onesided=true)
+
+            sys_gpu = _bubble_like()
+            fluid_Y_gpu = adapt(CUDABackend(), sys_gpu.fluid_Y)
+            # boundary_ghost is self-referencing (boundary_ghost.source ===
+            # fluid_X); adapt the GhostEntry as one unit and pull the
+            # canonical GPU-resident fluid_X back out of it (see
+            # GhostParticleSystem's docstring) rather than adapting fluid_X
+            # a second time.
+            ghost_entry_gpu    = adapt(CUDABackend(), sys_gpu.boundary_ghost_entry)
+            boundary_ghost_gpu = ghost_entry_gpu.ghost
+            fluid_X_gpu        = getfield(boundary_ghost_gpu, :source)
+
+            kernel = sys_gpu.kernel
+            art_visc_alpha, art_visc_beta, h_sph = sys_gpu.art_visc_alpha, sys_gpu.art_visc_beta, sys_gpu.h_sph
+            fluid_X_interaction = SystemInteraction(
+                kernel, FluidPfn(art_visc_alpha, art_visc_beta, h_sph), fluid_X_gpu; onesided=true, ka=true)
+            fluid_Y_interaction = SystemInteraction(
+                kernel, FluidPfn(art_visc_alpha, art_visc_beta, h_sph), fluid_Y_gpu; onesided=true, ka=true)
+            fluid_XY_interaction = SystemInteraction(
+                kernel, FluidPfn(art_visc_alpha, art_visc_beta, h_sph), fluid_Y_gpu, fluid_X_gpu; onesided=true, ka=true)
+            fluid_boundary_interaction = SystemInteraction(
+                kernel, FluidPfn(art_visc_alpha, art_visc_beta, h_sph), fluid_X_gpu, boundary_ghost_gpu; onesided=true, ka=true)
+
+            rk_gpu = RK4TimeIntegrator(
+                [fluid_X_gpu, fluid_Y_gpu],
+                [fluid_X_interaction, fluid_Y_interaction, fluid_XY_interaction, fluid_boundary_interaction];
+                ghosts = [ghost_entry_gpu],
+            )
+
+            nsteps = 8
+            time_integrate!(rk_cpu, nsteps, nsteps + 1, nsteps + 1, 1.5, nothing; print_timer=false)
+            time_integrate!(rk_gpu, nsteps, nsteps + 1, nsteps + 1, 1.5, nothing; print_timer=false)
+
+            fX_gpu_h = adapt(Array, fluid_X_gpu)
+            fY_gpu_h = adapt(Array, fluid_Y_gpu)
+            for (a, b) in ((sys_cpu.fluid_X, fX_gpu_h), (sys_cpu.fluid_Y, fY_gpu_h))
+                oa, ob = _byid(a), _byid(b)
+                @test !any(v -> any(isnan, v), b.x)
+                @test !any(isnan, b.rho)
+                x_scale   = max(maximum(norm.(a.x)), 1.0)
+                rho_scale = max(maximum(abs.(a.rho)), 1.0)
+                @test maximum(norm.(a.x[oa] .- b.x[ob])) < 1e-6 * x_scale
+                @test maximum(abs.(a.rho[oa] .- b.rho[ob])) < 1e-6 * rho_scale
+            end
+        end
+
+        @testset "VirtualParticleSystem position advance (nonzero prescribed_v) on CUDA (item 9)" begin
+            # Trapdoor.jl's trapdoor_moving_virt shape: a VirtualParticleSystem
+            # with nonzero prescribed_v, driven through a real
+            # LeapFrogTimeIntegrator loop. Before item 9,
+            # _update_virtual_positions! was a raw scalar `vps.x[i] += pv*dt`
+            # loop — an unconditional CUDA.allowscalar(false) violation the
+            # instant prescribed_v != 0 on a GPU-resident system, regardless
+            # of whether the virtual system couples into any interaction.
+            CUDA.allowscalar(false)
+            rng = MersenneTwister(220)
+            h = 0.08
+            kernel = CubicSplineKernel(h; ndims=2)
+            pv = SVector(0.3, -0.2)
+
+            fluid_cpu    = _gpucuda_random_fluid(rng, 200, 2; L=1.0)
+            virt_src_cpu = _gpucuda_random_boundary(rng, 60, 2; L=1.0)
+            x0 = copy(virt_src_cpu.x)   # snapshot before any sort permutes it
+            virt_cpu = VirtualParticleSystem(virt_src_cpu, "virt", virt_src_cpu.n, 2, 1.0, 10.0;
+                zero_fields=(:w_sum,), prescribed_v=pv)
+
+            fluid_gpu = adapt(CUDABackend(), deepcopy(fluid_cpu))
+            virt_gpu  = adapt(CUDABackend(), deepcopy(virt_cpu))
+
+            si_cpu = SystemInteraction(kernel, FluidPfn(0.03, 0.0, h), fluid_cpu; onesided=true)
+            si_gpu = SystemInteraction(kernel, FluidPfn(0.03, 0.0, h), fluid_gpu; onesided=true, ka=true)
+
+            lf_cpu = LeapFrogTimeIntegrator([fluid_cpu], [si_cpu]; virtual_systems=(virt_cpu,))
+            lf_gpu = LeapFrogTimeIntegrator([fluid_gpu], [si_gpu]; virtual_systems=(virt_gpu,))
+
+            nsteps = 5
+            time_integrate!(lf_cpu, nsteps, nsteps + 1, nsteps + 1, 0.1, nothing; print_timer=false)
+            time_integrate!(lf_gpu, nsteps, nsteps + 1, nsteps + 1, 0.1, nothing; print_timer=false)
+
+            dt = 0.1 * h / lf_cpu.c
+            expected_disp = nsteps * dt * pv
+
+            src_cpu = getfield(virt_cpu, :source)
+            disp_cpu = src_cpu.x .- x0[getfield(src_cpu, :id)]
+            @test maximum(norm.(disp_cpu .- Ref(expected_disp))) < 1e-10
+
+            src_gpu_h = adapt(Array, getfield(virt_gpu, :source))
+            @test all(isfinite, reinterpret(Float64, src_gpu_h.x))
+            disp_gpu = src_gpu_h.x .- x0[getfield(src_gpu_h, :id)]
+            @test maximum(norm.(disp_gpu .- Ref(expected_disp))) < 1e-8
+        end
+
+        @testset "ProbeParticleSystem measurement (mirror_target + NeighborCountFn) on CUDA (item 9)" begin
+            # CantileverBeam.jl's shape: a probe mirroring a real system's
+            # positions each measurement, summed via NeighborCountFn. Before
+            # item 9, ProbeParticleSystem hardcoded Vector for x/id/w_sum/
+            # extras (no Adapt.adapt_structure at all) and _measure_probes!'s
+            # mirror step was a raw scalar `x[src_id[i]] = src_x[i]` loop —
+            # either alone would make this combination unreachable under
+            # ka=true.
+            CUDA.allowscalar(false)
+            rng = MersenneTwister(221)
+            h = 0.08
+            kernel = CubicSplineKernel(h; ndims=2)
+
+            fluid_cpu = _gpucuda_random_fluid(rng, 200, 2; L=1.0)
+            probe_cpu = ProbeParticleSystem("probe", fluid_cpu; extras=(nbr=zeros(Int, fluid_cpu.n),))
+
+            # probe_cpu is self-referencing (probe_cpu.mirror_target ===
+            # fluid_cpu); adapt the probe as one unit and pull the canonical
+            # GPU-resident fluid back out of it (see ProbeParticleSystem's
+            # docstring) rather than adapting fluid_cpu a second time.
+            probe_gpu = adapt(CUDABackend(), deepcopy(probe_cpu))
+            fluid_gpu = getfield(probe_gpu, :mirror_target)
+
+            si_cpu = SystemInteraction(kernel, FluidPfn(0.03, 0.0, h), fluid_cpu; onesided=true)
+            si_gpu = SystemInteraction(kernel, FluidPfn(0.03, 0.0, h), fluid_gpu; onesided=true, ka=true)
+            pi_cpu = SystemInteraction(kernel, NeighborCountFn(:nbr), fluid_cpu, probe_cpu; onesided=true)
+            pi_gpu = SystemInteraction(kernel, NeighborCountFn(:nbr), fluid_gpu, probe_gpu; onesided=true, ka=true)
+
+            lf_cpu = LeapFrogTimeIntegrator([fluid_cpu], [si_cpu]; probes=(probe_cpu,), probe_interactions=(pi_cpu,))
+            lf_gpu = LeapFrogTimeIntegrator([fluid_gpu], [si_gpu]; probes=(probe_gpu,), probe_interactions=(pi_gpu,))
+
+            mktempdir() do dir
+                time_integrate!(lf_cpu, 3, 4, 3, 0.1, joinpath(dir, "cpu"); print_timer=false)
+                time_integrate!(lf_gpu, 3, 4, 3, 0.1, joinpath(dir, "gpu"); print_timer=false)
+            end
+
+            nbr_cpu = probe_cpu.nbr
+            nbr_gpu = Array(probe_gpu.nbr)
+            @test any(!=(0), nbr_cpu)   # sanity: neighbor counting actually happened
+            @test nbr_cpu == nbr_gpu
+        end
+
         @testset "no scalar indexing anywhere in a real time_integrate! step path" begin
             # The decisive test: wraps several full steps (sort, grid, sweep,
             # state update, integrator axpy, print, save) in

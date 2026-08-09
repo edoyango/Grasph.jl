@@ -40,6 +40,25 @@ end
 
 @inline _axpy_oop!(::KA.Backend, q, q0, dqdt, a) = (@. q = q0 + a * dqdt; nothing)
 
+# Add the same constant SVector to every element: q[i] += a * c for all i.
+# Used to advance a whole system by a single prescribed velocity (virtual/probe
+# position updates) without a per-element scalar loop, which would violate
+# CUDA.allowscalar(false) the instant q is a CuArray. `Ref(...)` wraps the
+# constant as a 0-dimensional broadcast scalar — plain `c` (an SVector, itself
+# a genuine AbstractArray) would otherwise broadcast against q element-for-
+# element like any other same-shaped array, throwing DimensionMismatch unless
+# length(q) happened to equal length(c).
+@inline _axpy_const_ip!(q, c, a) = _axpy_const_ip!(KA.get_backend(q), q, c, a)
+
+@inline function _axpy_const_ip!(::KA.CPU, q, c, a)
+    ac = a * c
+    @inbounds @fastmath @batch for i in eachindex(q)
+        q[i] += ac
+    end
+end
+
+@inline _axpy_const_ip!(::KA.Backend, q, c, a) = (q .+= Ref(a * c); nothing)
+
 @inline function _zero_field(ps::AbstractParticleSystem, field::Symbol)
     f = _getf(ps, Val(field))
     fill!(f, zero(eltype(f)))

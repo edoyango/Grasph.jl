@@ -116,9 +116,40 @@ using CUDA
         @test all(iszero, getfield(vps2, :w_sum))
     end
 
+    @testset "Adapt round-trip preserves fields exactly — ProbeParticleSystem (item 9)" begin
+        positions = [SVector(Float64(i) * 0.1, 0.0) for i in 1:5]
+        probe = ProbeParticleSystem("probe", positions;
+            extras=(cnt=zeros(Int, 5), stress=[zero(SVector{3,Float64}) for _ in 1:5]))
+        getfield(probe, :w_sum) .= collect(1.0:5.0)
+        probe.cnt .= [1, 2, 3, 4, 5]
+
+        probe2 = adapt(Array, probe)
+        @test typeof(probe2) == typeof(probe)
+        @test probe2.x == probe.x
+        @test getfield(probe2, :id) == getfield(probe, :id)
+        @test getfield(probe2, :w_sum) == getfield(probe, :w_sum)
+        @test probe2.cnt == probe.cnt
+        @test probe2.stress == probe.stress
+        @test getfield(probe2, :prescribed_v) == getfield(probe, :prescribed_v)
+        @test getfield(probe2, :mirror_target) === nothing
+
+        # mirror_target (a real particle system) round-trips too. adapt(Array, ·)
+        # on an already-Array-backed object is a no-op at the array level (see
+        # the GhostParticleSystem testset below), so this does NOT assert
+        # independence from the original — only a real CuArray round-trip
+        # (below, CUDA.functional()-guarded) forces an actual copy.
+        src = BasicParticleSystem("src", 5, 2, 1.0, 2.0)
+        src.x .= positions
+        probe_m = ProbeParticleSystem("probe_m", src; extras=(cnt=zeros(Int, 5),))
+        probe_m2 = adapt(Array, probe_m)
+        @test typeof(probe_m2) == typeof(probe_m)
+        @test getfield(probe_m2, :mirror_target).x == getfield(probe_m, :mirror_target).x
+    end
+
     @testset "Adapt round-trip preserves fields exactly — GhostParticleSystem/GhostEntry (item 7)" begin
         fluid = FluidParticleSystem("fluid", 6, 2, 1.0, 10.0; source_v=zeros(2))
         fluid.x .= [SVector(0.1 * i, 0.05) for i in 1:6]
+        fill!(fluid.v, zero(SVector{2,Float64}))   # was left undef, making the ghost.v equality check below flaky (occasional NaN garbage, which never equals itself)
         fluid.rho .= 1000.0
         fluid.p   .= collect(1.0:6.0)
 
@@ -254,6 +285,11 @@ using CUDA
             vps = VirtualParticleSystem(vps_source, "virt", 5, 2, 1.0, 2.0; zero_fields=(:w_sum,))
             getfield(vps, :w_sum) .= collect(1.0:5.0)
 
+            probe = ProbeParticleSystem("probe",
+                [SVector(Float64(i) * 0.1, 0.0) for i in 1:5];
+                extras=(cnt=zeros(Int, 5),))
+            getfield(probe, :w_sum) .= collect(1.0:5.0)
+
             sb = StaticBoundarySystem(basic, 0.5)
             db = DynamicBoundarySystem(basic, [1.0, 0.0], [0.0, 0.0], 1.0)
 
@@ -265,11 +301,21 @@ using CUDA
             ghost_entry = GhostEntry(ghost, 0.15, (SVector(0.0, 1.0), SVector(0.0, 0.0)))
             generate_ghosts!(ghost_entry)   # populate before adapting, like a real driver script would
 
-            for ps in (basic, fluid, stress, ep2d, ep3d, vps, sb, db, ghost_entry)
+            for ps in (basic, fluid, stress, ep2d, ep3d, vps, probe, sb, db, ghost_entry)
                 d = adapt(CuArray, ps)
                 r = adapt(Array, d)
                 @test typeof(r) == typeof(ps)
             end
+
+            d_probe = adapt(CuArray, probe)
+            @test getfield(d_probe, :x) isa CuArray{SVector{2,Float64}}
+            @test getfield(d_probe, :id) isa CuArray{Int}
+            @test getfield(d_probe, :w_sum) isa CuArray{Float64}
+            @test d_probe.cnt isa CuArray{Int}
+            r_probe = adapt(Array, d_probe)
+            @test r_probe.x == probe.x
+            @test getfield(r_probe, :w_sum) == getfield(probe, :w_sum)
+            @test r_probe.cnt == probe.cnt
 
             # Field-exact round-trips and device-storage-type assertions for
             # the three systems reachable in the dambreak.jl vertical slice.

@@ -927,9 +927,9 @@ _interp_zeros(::Tuple{}, ps) = ()
     return (zero(eltype(getproperty(ps, fname))), _interp_zeros(Base.tail(fields), ps)...)
 end
 
-_onesided_shape(::InterpolateFieldFn, ::AbstractParticleSystem, ::Union{AbstractVirtualParticleSystem,ProbeParticleSystem}) = WritesB()
+_onesided_shape(::InterpolateFieldFn, ::AbstractParticleSystem, ::Union{AbstractVirtualParticleSystem,AbstractProbeParticleSystem}) = WritesB()
 
-@inline @Base.propagate_inbounds function pfn_contribution(::InterpolateFieldFn{fields, ACC_WSUM}, ps_a::Union{AbstractVirtualParticleSystem{T,ND},ProbeParticleSystem{T,ND}}, ps_b::AbstractParticleSystem{T,ND}, i::Int, j::Int, dx::SVector{ND,T}, gx::SVector{ND,T}, w::T) where {fields, ACC_WSUM, ND, T<:AbstractFloat}
+@inline @Base.propagate_inbounds function pfn_contribution(::InterpolateFieldFn{fields, ACC_WSUM}, ps_a::Union{AbstractVirtualParticleSystem{T,ND},AbstractProbeParticleSystem{T,ND}}, ps_b::AbstractParticleSystem{T,ND}, i::Int, j::Int, dx::SVector{ND,T}, gx::SVector{ND,T}, w::T) where {fields, ACC_WSUM, ND, T<:AbstractFloat}
     kw = w * (ps_b.mass / ps_b.rho[j])
     vals = _interp_values(fields, ps_b, j, kw)
     if ACC_WSUM
@@ -939,7 +939,7 @@ _onesided_shape(::InterpolateFieldFn, ::AbstractParticleSystem, ::Union{Abstract
     end
 end
 
-@inline function _onesided_zero_coupled(::InterpolateFieldFn{fields, ACC_WSUM}, ps_a::Union{AbstractVirtualParticleSystem{T,ND},ProbeParticleSystem{T,ND}}, ::AbstractParticleSystem{T,ND}, i) where {fields, ACC_WSUM, ND, T<:AbstractFloat}
+@inline function _onesided_zero_coupled(::InterpolateFieldFn{fields, ACC_WSUM}, ps_a::Union{AbstractVirtualParticleSystem{T,ND},AbstractProbeParticleSystem{T,ND}}, ::AbstractParticleSystem{T,ND}, i) where {fields, ACC_WSUM, ND, T<:AbstractFloat}
     zeros_ = _interp_zeros(fields, ps_a)
     if ACC_WSUM
         return NamedTuple{(fields..., :w_sum)}((zeros_..., zero(T)))
@@ -974,13 +974,13 @@ end
 # the reverse sweep's call convention puts the write target (probe) in the
 # "ps_a" position, matching the mutating method above with roles swapped.
 
-_onesided_shape(::NeighborCountFn, ::AbstractParticleSystem, ::ProbeParticleSystem) = WritesB()
+_onesided_shape(::NeighborCountFn, ::AbstractParticleSystem, ::AbstractProbeParticleSystem) = WritesB()
 
-@inline @Base.propagate_inbounds function pfn_contribution(::NeighborCountFn{field}, probe::ProbeParticleSystem{T,ND}, ps_b::AbstractParticleSystem{T,ND}, i::Int, j::Int, dx::SVector{ND,T}, gx::SVector{ND,T}, w::T) where {field,ND,T<:AbstractFloat}
+@inline @Base.propagate_inbounds function pfn_contribution(::NeighborCountFn{field}, probe::AbstractProbeParticleSystem{T,ND}, ps_b::AbstractParticleSystem{T,ND}, i::Int, j::Int, dx::SVector{ND,T}, gx::SVector{ND,T}, w::T) where {field,ND,T<:AbstractFloat}
     return NamedTuple{(field,)}((one(eltype(getproperty(probe, field))),))
 end
 
-@inline _onesided_zero_coupled(::NeighborCountFn{field}, probe::ProbeParticleSystem, ::AbstractParticleSystem, i) where {field} =
+@inline _onesided_zero_coupled(::NeighborCountFn{field}, probe::AbstractProbeParticleSystem, ::AbstractParticleSystem, i) where {field} =
     NamedTuple{(field,)}((zero(eltype(getproperty(probe, field))),))
 
 """

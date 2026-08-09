@@ -388,9 +388,7 @@ _update_virtual_positions!(::Tuple{}, dt) = nothing
 @inline function _update_virtual_positions!(vsys::Tuple, dt)
     vps = first(vsys)
     pv  = getfield(vps, :prescribed_v)
-    @inbounds for i in 1:vps.n
-        vps.x[i] += pv * dt
-    end
+    iszero(pv) || _axpy_const_ip!(vps.x, pv, dt)
     _update_virtual_positions!(Base.tail(vsys), dt)
 end
 
@@ -445,13 +443,31 @@ _advance_probe_positions!(::Tuple{}, dt) = nothing
 @inline function _advance_probe_positions!(probes::Tuple, dt)
     probe = first(probes)
     pv = getfield(probe, :prescribed_v)
-    if !iszero(pv)
-        x = getfield(probe, :x)
-        @inbounds for i in 1:probe.n
-            x[i] += pv * dt
-        end
-    end
+    iszero(pv) || _axpy_const_ip!(getfield(probe, :x), pv, dt)
     _advance_probe_positions!(Base.tail(probes), dt)
+end
+
+# Scatter src_x[i] into dst_x[src_id[i]] — src_id is always a permutation of
+# 1:n, so every thread/iteration writes a distinct slot; no aliasing hazard.
+# Backend-dispatched like every other array-level primitive in this file:
+# a plain scalar loop on CPU, a dedicated KA kernel (KAKernels.jl) elsewhere —
+# a Base fancy-indexing scatter (`dst_x[src_id] = src_x`) would work for CUDA
+# specifically but isn't guaranteed across arbitrary KA backends.
+@inline _mirror_positions!(dst_x, src_x, src_id) =
+    _mirror_positions!(KA.get_backend(dst_x), dst_x, src_x, src_id)
+
+@inline function _mirror_positions!(::KA.CPU, dst_x, src_x, src_id)
+    @inbounds @batch for i in eachindex(src_id)
+        dst_x[src_id[i]] = src_x[i]
+    end
+end
+
+function _mirror_positions!(backend::KA.Backend, dst_x, src_x, src_id)
+    n = length(src_id)
+    n == 0 && return nothing
+    _probe_mirror_kernel!(backend, _KA_WORKGROUP)(dst_x, src_x, src_id; ndrange = n)
+    KA.synchronize(backend)
+    return nothing
 end
 
 # Measure all probes: mirror → sort-by-cell → grids → zero → sweep → update → sort-by-id.
@@ -474,12 +490,7 @@ function _measure_probes!(probes, probe_ints, sort_cutoff, perm_buf, key_buf, pr
     for probe in probes
         mt = getfield(probe, :mirror_target)
         if mt !== nothing
-            src_id = getfield(mt, :id)
-            src_x  = getfield(mt, :x)
-            x = getfield(probe, :x)
-            @inbounds for i in 1:probe.n
-                x[src_id[i]] = src_x[i]
-            end
+            _mirror_positions!(getfield(probe, :x), getfield(mt, :x), getfield(mt, :id))
         end
     end
     # Sort probes by cell so create_grid! can build a CSR grid
@@ -750,8 +761,9 @@ function time_integrate!(
     acc_bufs = map(_make_acc_bufs, sys)
 
     sort_cutoff       = T(2) * integrator.h
-    sort_perm_buf     = Vector{Int}(undef, maximum(ps.n for ps in sys))
-    sort_key_buf      = Vector{UInt64}(undef, maximum(ps.n for ps in sys))
+    sort_max_n        = maximum(ps.n for ps in sys)
+    sort_perm_buf     = similar(first(sys).x, Int, sort_max_n)
+    sort_key_buf      = similar(first(sys).x, UInt64, sort_max_n)
     sys_scratches     = map(_make_sort_scratch, sys)
     ghost_scratches   = [_make_empty_sort_scratch(ge.ghost) for ge in integrator.ghosts]
     virtual_scratches = [_make_sort_scratch(vps) for vps in vsys]

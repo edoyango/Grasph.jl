@@ -10,9 +10,13 @@ using Random
 # ElastoPlasticParticleSystem, DynamicBoundarySystem, and
 # VirtualParticleSystem.
 #
-# ProbeParticleSystem is deliberately NOT covered here — it still hardcodes
-# `Vector` for its per-particle arrays, which blocks Adapt entirely
-# regardless of device_view (see docs/gpu-migration-plan.md, item 9).
+# ProbeParticleSystem (item 9, docs/gpu-migration-plan.md) IS covered below:
+# its array fields are now generic (VA/SA/IA, ProbeParticles.jl) too, so it
+# gets the same DeviceVirtualSystem-shaped treatment — a dedicated
+# `DeviceProbeSystem` subtyping the new `AbstractProbeParticleSystem` so every
+# probe-coupled pfn_contribution method (InterpolateFieldFn/NeighborCountFn's
+# WritesB() methods, already narrowly typed on that abstraction) dispatches
+# into it unmodified.
 #
 # GhostParticleSystem (item 7, docs/gpu-migration-plan.md) IS covered below:
 # its array fields are now generic (VA/SA/IA, GhostParticles.jl), so it gets
@@ -115,6 +119,19 @@ end
     @test :idx_boundary  ∉ ghost_inner_names
     @test :normals       ∉ ghost_inner_names
     @test :source        ∉ ghost_inner_names   # flattened away, not carried as a sub-object
+
+    probe = _random_probe_rv(rng, 30, 2; L=0.05)
+    probe.w_sum .= rand(rng, 30)
+    dvp = Grasph.device_view(probe)
+    @test dvp isa Grasph.AbstractProbeParticleSystem{Float64,2}
+    for f in (:n, :x, :w_sum, :prescribed_v, :rho, :v)
+        @test getproperty(dvp, f) == getproperty(probe, f)
+    end
+    probe_inner_names = keys(getfield(dvp, :_f))
+    @test :name           ∉ probe_inner_names
+    @test :id             ∉ probe_inner_names   # sort-order bookkeeping, never read by a pfn
+    @test :mirror_target  ∉ probe_inner_names
+    @test :state_updater  ∉ probe_inner_names
 end
 
 @testset "pfn_contribution: device_view(ps_b) matches host ps_b exactly" begin
@@ -217,6 +234,27 @@ end
         @test pfn_contribution(pfn2, ps_a, ghost, 1, 1, dx, gx, w) ==
               pfn_contribution(pfn2, ps_a, Grasph.device_view(ghost), 1, 1, dx, gx, w)
     end
+
+    @testset "InterpolateFieldFn/NeighborCountFn, probe target (item 9)" begin
+        # CantileverBeam.jl/Trapdoor.jl's shape: real source -> probe target.
+        # Probe sits in ps_a (the write target) for InterpolateFieldFn, same
+        # slot as Virtual in the testset above — a structurally distinct
+        # dispatch from the ghost/virtual-in-ps_b tests further up.
+        pfn = InterpolateFieldFn(:v, :rho; accumulate_wsum=true)
+        probe = _random_probe_rv(rng, 2, 2; L=0.05)
+        fluid = _random_fluid(rng, 2, 2; L=0.05)
+        dx, gx, w = _dv_pair_dx_gx_w(kernel, h, probe.x[1], fluid.x[2])
+        c_host   = pfn_contribution(pfn, probe, fluid, 1, 2, dx, gx, w)
+        c_device = pfn_contribution(pfn, Grasph.device_view(probe), fluid, 1, 2, dx, gx, w)
+        @test c_host == c_device
+
+        pfn2 = NeighborCountFn(:nbr_count)
+        probe2 = _random_probe_nbr(rng, 2, 2; L=0.05)
+        dx2, gx2, w2 = _dv_pair_dx_gx_w(kernel, h, probe2.x[1], fluid.x[2])
+        c_host2   = pfn_contribution(pfn2, probe2, fluid, 1, 2, dx2, gx2, w2)
+        c_device2 = pfn_contribution(pfn2, Grasph.device_view(probe2), fluid, 1, 2, dx2, gx2, w2)
+        @test c_host2 == c_device2
+    end
 end
 
 @testset "state updaters read prescribed_v through getproperty, not raw getfield" begin
@@ -257,7 +295,31 @@ end
     @test virt_host.v[1] == virt_dev.v[1]
 end
 
-@testset "narrow typing wasn't loosened by the AbstractVirtualParticleSystem widening" begin
+@testset "state updaters read prescribed_v through getproperty, not raw getfield (probe, item 9)" begin
+    # Same regression class as the VirtualParticleSystem testset above, for
+    # DeviceProbeSystem — Trapdoor.jl's td_probe_static/td_probe_moving use
+    # exactly this updater against a probe.
+    rng = MersenneTwister(504)
+    positions = [SVector(Float64(i) * 0.1, 0.0) for i in 1:5]
+    build_probe() = ProbeParticleSystem("probe", positions;
+        extras=(stress=[zero(SVector{4,Float64}) for _ in 1:5],),
+        prescribed_v = SVector(1.5, -2.5))
+
+    probe_host = build_probe()
+    probe_dev  = deepcopy(probe_host)
+    dvp = Grasph.device_view(probe_dev)
+
+    u1 = VirtualNormUpdater(SVector(1.0, 1.0), :stress)
+    for p in (probe_host, dvp)
+        p.w_sum[1] = 2.0
+        p.stress[1] = SVector(4.0, 6.0, 8.0, 10.0)
+    end
+    u1(probe_host, 1)
+    u1(dvp, 1)   # must not throw FieldError; only reachable via getproperty, not raw getfield
+    @test probe_host.stress[1] == probe_dev.stress[1]
+end
+
+@testset "narrow typing wasn't loosened by the AbstractVirtualParticleSystem/AbstractProbeParticleSystem widening" begin
     rng = MersenneTwister(502)
     h = 0.1
     kernel = _dv_pairkernel(h)
@@ -268,4 +330,12 @@ end
     dx, gx, w = _dv_pair_dx_gx_w(kernel, h, ps_a.x[1], ps_b_bare.x[1])
     @test_throws MethodError pfn_contribution(pfn, ps_a, ps_b_bare, 1, 1, dx, gx, w)
     @test_throws MethodError pfn_contribution(pfn, ps_a, Grasph.device_view(ps_b_bare), 1, 1, dx, gx, w)
+
+    # InterpolateFieldFn/NeighborCountFn's probe-target methods must not
+    # accidentally widen to match a bare real system in the write-target slot.
+    pfn2 = InterpolateFieldFn(:v; accumulate_wsum=false)
+    fluid_b = _random_fluid(rng, 2, 2; L=0.05)
+    dx2, gx2, w2 = _dv_pair_dx_gx_w(kernel, h, ps_a.x[1], fluid_b.x[1])
+    @test_throws MethodError pfn_contribution(pfn2, ps_a, fluid_b, 1, 1, dx2, gx2, w2)
+    @test_throws MethodError pfn_contribution(pfn2, Grasph.device_view(ps_a), fluid_b, 1, 1, dx2, gx2, w2)
 end

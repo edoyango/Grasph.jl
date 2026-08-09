@@ -176,3 +176,44 @@ end
     nt = _device_fields(ghost)
     return DeviceGhostSystem{T, ND, typeof(nt)}(nt)
 end
+
+# ---------------------------------------------------------------------------
+# ProbeParticleSystem — same shape as DeviceVirtualSystem/DeviceGhostSystem
+# above: subtypes AbstractProbeParticleSystem so every pfn_contribution/
+# _onesided_zero_coupled/_onesided_shape method already narrowly typed on that
+# abstraction (InterpolateFieldFn/NeighborCountFn's WritesB() methods — a
+# probe is always a write target, never a read-only neighbour) dispatches
+# into the device view unmodified.
+#
+# `id`/`mirror_target`/`_print_fields` are pure host bookkeeping — sort-order
+# identity, the (possibly non-isbits) mirror source, print-field names — never
+# read by a pfn or state updater via `ps.field`, so they're left out, same
+# reasoning as ghost's idx_original/idx_boundary/normals. `mass`/`c`/`rho` are
+# deliberately absent too: every probe-target pfn method reads the *neighbour*
+# system's mass/rho (`ps_b.mass`, `ps_b.rho[j]`), never the probe's own — a
+# probe has no physical mass or density to begin with.
+# ---------------------------------------------------------------------------
+
+struct DeviceProbeSystem{T, ND, NT<:NamedTuple} <: AbstractProbeParticleSystem{T, ND}
+    _f::NT
+end
+
+@inline function Base.getproperty(ds::DeviceProbeSystem{T,ND}, s::Symbol) where {T,ND}
+    s === :ndims && return ND
+    return getfield(getfield(ds, :_f), s)
+end
+
+function Adapt.adapt_structure(to, ds::DeviceProbeSystem{T,ND}) where {T,ND}
+    nt = Adapt.adapt(to, getfield(ds, :_f))
+    DeviceProbeSystem{T, ND, typeof(nt)}(nt)
+end
+
+@inline _device_fields(probe::ProbeParticleSystem) =
+    merge((n = probe.n, x = getfield(probe, :x), w_sum = getfield(probe, :w_sum),
+           prescribed_v = getfield(probe, :prescribed_v)),
+          getfield(probe, :extras))
+
+@inline function device_view(probe::ProbeParticleSystem{T,ND}) where {T,ND}
+    nt = _device_fields(probe)
+    return DeviceProbeSystem{T, ND, typeof(nt)}(nt)
+end

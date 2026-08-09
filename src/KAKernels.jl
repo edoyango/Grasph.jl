@@ -364,3 +364,18 @@ end
     k = @index(Global, Linear)
     @inbounds arr[k] = _apply_mode(src_arr[idx[k]], mode, normals[k])
 end
+
+# ---------------------------------------------------------------------------
+# _measure_probes!'s mirror step (TimeIntegration.jl): overwrite a probe's
+# positions from its mirror_target's current (post-sort) positions, keyed by
+# the target's own stable id. One thread per source particle i, scattering
+# into dst_x[src_id[i]] — src_id is always a permutation of 1:n (the
+# sort-tracking invariant every system maintains), so every thread writes a
+# distinct destination slot and no atomics are needed, same reasoning as
+# _ghost_scatter_kernel! above.
+# ---------------------------------------------------------------------------
+
+@kernel function _probe_mirror_kernel!(dst_x, @Const(src_x), @Const(src_id))
+    i = @index(Global, Linear)
+    @inbounds dst_x[src_id[i]] = src_x[i]
+end

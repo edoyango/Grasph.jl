@@ -593,6 +593,56 @@ end
         @test maximum(abs.(virt_ref.w_sum .- virt_ka.w_sum)) < 1e-9 * max(maximum(abs.(virt_ref.w_sum)), 1.0)
     end
 
+    @testset "coupled reverse sweep (InterpolateFieldFn, WritesB, probe target, item 9): onesided vs ka=true" begin
+        # CantileverBeam.jl/Trapdoor.jl's shape: real source -> probe target.
+        # Probe is device_view-ready since item 9 (DeviceProbeSystem); this is
+        # the first KA test to exercise it, mirroring the virtual-target test
+        # just above.
+        rng = MersenneTwister(114)
+        h = 0.08
+        kernel = CubicSplineKernel(h; ndims=2)
+        cutoff = kernel.interaction_length
+        pfn = InterpolateFieldFn(:v, :rho; accumulate_wsum=true)
+        src = _kacpu_random_fluid(rng, 220, 2; L=1.0)
+        probe_ref = _random_probe_rv(rng, 170, 2; L=1.0)
+        probe_ka  = deepcopy(probe_ref)
+        si_ref = SystemInteraction(kernel, pfn, src, probe_ref; onesided=true)
+        si_ka  = SystemInteraction(kernel, pfn, src, probe_ka;  onesided=true, ka=true)
+        pa, ka_, sa = _kacpu_sortbufs(src)
+        sort_particles!(src, cutoff, pa, ka_, sa)
+        for (p, si) in ((probe_ref, si_ref), (probe_ka, si_ka))
+            pb, kb, sb = _kacpu_sortbufs(p)
+            sort_particles!(p, cutoff, pb, kb, sb)
+            create_grid!(si)
+            sweep!(si)
+        end
+        @test _elemdiff(probe_ref.v, probe_ka.v) < 1e-9 * _elemscale(probe_ref.v)
+        @test maximum(abs.(probe_ref.rho .- probe_ka.rho)) < 1e-9 * max(maximum(abs.(probe_ref.rho)), 1.0)
+        @test maximum(abs.(probe_ref.w_sum .- probe_ka.w_sum)) < 1e-9 * max(maximum(abs.(probe_ref.w_sum)), 1.0)
+    end
+
+    @testset "coupled reverse sweep (NeighborCountFn, WritesB, probe target, item 9): onesided vs ka=true" begin
+        rng = MersenneTwister(115)
+        h = 0.08
+        kernel = CubicSplineKernel(h; ndims=2)
+        cutoff = kernel.interaction_length
+        pfn = NeighborCountFn(:nbr_count)
+        src = _kacpu_random_fluid(rng, 220, 2; L=1.0)
+        probe_ref = _random_probe_nbr(rng, 170, 2; L=1.0)
+        probe_ka  = deepcopy(probe_ref)
+        si_ref = SystemInteraction(kernel, pfn, src, probe_ref; onesided=true)
+        si_ka  = SystemInteraction(kernel, pfn, src, probe_ka;  onesided=true, ka=true)
+        pa, ka_, sa = _kacpu_sortbufs(src)
+        sort_particles!(src, cutoff, pa, ka_, sa)
+        for (p, si) in ((probe_ref, si_ref), (probe_ka, si_ka))
+            pb, kb, sb = _kacpu_sortbufs(p)
+            sort_particles!(p, cutoff, pb, kb, sb)
+            create_grid!(si)
+            sweep!(si)
+        end
+        @test probe_ref.nbr_count == probe_ka.nbr_count
+    end
+
     @testset "coupled sweep (fluid<->GhostParticleSystem, item 7): onesided vs ka=true" begin
         # GhostParticleSystem's dispatch surface (pfn_contribution methods
         # narrowly typed on AbstractGhostParticleSystem) predates item 7, but
