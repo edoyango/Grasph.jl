@@ -171,6 +171,35 @@ fill!(top_inner.v, zero(SVector{2,Float64}))
 top_dyn = DynamicBoundarySystem(top_inner, SVector(0.0, -1.0), SVector(0.0, y_top), 3.0)
 
 # ---------------------------------------------------------------------------
+# Backend selection
+#
+# Defaults to CPU (Vector-backed, coloured sweep) so the script is unchanged
+# in normal use. Set GRASPH_BACKEND=cuda to run GPU-resident via
+# KernelAbstractions.jl: adapts every system to CuArray and switches every
+# interaction to the one-sided KA sweep (the only sweep implemented as a KA
+# kernel — see docs/gpu-migration-plan.md). Requires CUDA.jl in the active
+# environment (it is not a hard dependency of Grasph itself).
+# ---------------------------------------------------------------------------
+
+const GRASPH_BACKEND = get(ENV, "GRASPH_BACKEND", "cpu")
+const ka_mode = GRASPH_BACKEND == "cuda"
+
+if ka_mode
+    using CUDA
+    using Adapt
+    fluid       = adapt(CUDABackend(), fluid)
+    wall        = adapt(CUDABackend(), wall)
+    floor_inner = adapt(CUDABackend(), floor_inner)
+    left_inner  = adapt(CUDABackend(), left_inner)
+    right_inner = adapt(CUDABackend(), right_inner)
+    top_inner   = adapt(CUDABackend(), top_inner)
+    floor_dyn = DynamicBoundarySystem(floor_inner, SVector(0.0, 1.0), SVector(0.0, 0.0), 3.0)
+    left_dyn  = DynamicBoundarySystem(left_inner, SVector(1.0, 0.0), SVector(0.0, 0.0), 3.0)
+    right_dyn = DynamicBoundarySystem(right_inner, SVector(-1.0, 0.0), SVector(x_right, 0.0), 3.0)
+    top_dyn   = DynamicBoundarySystem(top_inner, SVector(0.0, -1.0), SVector(0.0, y_top), 3.0)
+end
+
+# ---------------------------------------------------------------------------
 # Kernel and interactions
 # ---------------------------------------------------------------------------
 
@@ -182,14 +211,14 @@ fluid_solid_pfn = FluidSolidPfn(art_visc_alpha, art_visc_beta, h_sph)
 sr_pfn          = StrainRateVorticityPfn()
 
 # (stage-1 pfn, stage-2 pfn) for each interaction
-int_fluid_self  = SystemInteraction(kernel, (nothing, fluid_pfn), fluid)
-int_fluid_floor = SystemInteraction(kernel, (nothing, fluid_pfn), fluid, floor_dyn)
-int_fluid_left  = SystemInteraction(kernel, (nothing, fluid_pfn), fluid, left_dyn)
-int_fluid_right = SystemInteraction(kernel, (nothing, fluid_pfn), fluid, right_dyn)
-int_fluid_top   = SystemInteraction(kernel, (nothing, fluid_pfn), fluid, top_dyn)
-int_wall_self   = SystemInteraction(kernel, (sr_pfn, cauchy_pfn), wall)
-int_wall_floor  = SystemInteraction(kernel, (sr_pfn, cauchy_pfn), wall, floor_dyn)
-int_fluid_wall  = SystemInteraction(kernel, (nothing, fluid_solid_pfn), fluid, wall)
+int_fluid_self  = SystemInteraction(kernel, (nothing, fluid_pfn), fluid; onesided = ka_mode, ka = ka_mode)
+int_fluid_floor = SystemInteraction(kernel, (nothing, fluid_pfn), fluid, floor_dyn; onesided = ka_mode, ka = ka_mode)
+int_fluid_left  = SystemInteraction(kernel, (nothing, fluid_pfn), fluid, left_dyn; onesided = ka_mode, ka = ka_mode)
+int_fluid_right = SystemInteraction(kernel, (nothing, fluid_pfn), fluid, right_dyn; onesided = ka_mode, ka = ka_mode)
+int_fluid_top   = SystemInteraction(kernel, (nothing, fluid_pfn), fluid, top_dyn; onesided = ka_mode, ka = ka_mode)
+int_wall_self   = SystemInteraction(kernel, (sr_pfn, cauchy_pfn), wall; onesided = ka_mode, ka = ka_mode)
+int_wall_floor  = SystemInteraction(kernel, (sr_pfn, cauchy_pfn), wall, floor_dyn; onesided = ka_mode, ka = ka_mode)
+int_fluid_wall  = SystemInteraction(kernel, (nothing, fluid_solid_pfn), fluid, wall; onesided = ka_mode, ka = ka_mode)
 
 # ---------------------------------------------------------------------------
 # Integrator
@@ -205,7 +234,7 @@ integrator = LeapFrogTimeIntegrator(
 # ---------------------------------------------------------------------------
 
 println("n_fluid=$(n_fluid)  n_wall=$(n_wall)  n_floor=$(n_floor)  n_left=$(n_left)  n_right=$(n_right)  n_top=$(n_top)")
-println("c_sound=$(round(c_sound; digits=2)) m/s  c_wall=$(round(c_wall; digits=2)) m/s")
+println("c_sound=$(round(c_sound; digits=2)) m/s  c_wall=$(round(c_wall; digits=2)) m/s  backend=$GRASPH_BACKEND")
 
 stages = [
     Stage(integrator, 1000000, CFL_num, "run"),

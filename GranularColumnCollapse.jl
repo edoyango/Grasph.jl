@@ -95,6 +95,33 @@ left_ghost  = GhostParticleSystem(fluid, nothing, GhostCopier(:stress))
 left_ghost_entry = GhostEntry(left_ghost, 3.0 * h_sph, (SVector(1.0, 0.0), SVector(0.0, 0.0)))
 
 # ---------------------------------------------------------------------------
+# Backend selection
+#
+# Defaults to CPU (Vector-backed, coloured sweep) so the script is unchanged
+# in normal use. Set GRASPH_BACKEND=cuda to run GPU-resident via
+# KernelAbstractions.jl: adapts every system to CuArray and switches every
+# interaction to the one-sided KA sweep (the only sweep implemented as a KA
+# kernel — see docs/gpu-migration-plan.md). Requires CUDA.jl in the active
+# environment (it is not a hard dependency of Grasph itself).
+# ---------------------------------------------------------------------------
+
+const GRASPH_BACKEND = get(ENV, "GRASPH_BACKEND", "cpu")
+const ka_mode = GRASPH_BACKEND == "cuda"
+
+if ka_mode
+    using CUDA
+    using Adapt
+    bottom_boundary = adapt(CUDABackend(), bottom_boundary)
+    # left_ghost is self-referencing (left_ghost.source === fluid); adapt the
+    # GhostEntry as one unit and pull the canonical GPU-resident fluid back
+    # out of it (see GhostParticleSystem's docstring) — adapting fluid
+    # separately would create two independent, non-aliased GPU copies.
+    left_ghost_entry = adapt(CUDABackend(), left_ghost_entry)
+    left_ghost = left_ghost_entry.ghost
+    fluid = getfield(left_ghost, :source)
+end
+
+# ---------------------------------------------------------------------------
 # Interactions and integrator
 # ---------------------------------------------------------------------------
 
@@ -109,21 +136,24 @@ kinematics_pfn = CauchyFluidPfn(art_visc_alpha, art_visc_beta, h_sph; delta=0.1)
 fluid_interaction = SystemInteraction(
     kernel,                # the kernel to be used in this interaction
     (sr_pfn, kinematics_pfn),
-    fluid                 # the particles in the interaction
+    fluid;                 # the particles in the interaction
+    onesided = ka_mode, ka = ka_mode,
 )
 
 fluid_bottom_boundary_interaction = SystemInteraction(
     kernel,
     (sr_pfn, kinematics_pfn),
     fluid,
-    dynamic_bottom
+    dynamic_bottom;
+    onesided = ka_mode, ka = ka_mode,
 )
 
 fluid_left_boundary_interaction = SystemInteraction(
     kernel,
     (sr_pfn, kinematics_pfn),
     fluid,
-    left_ghost
+    left_ghost;
+    onesided = ka_mode, ka = ka_mode,
 )
 
 integrator = LeapFrogTimeIntegrator(
@@ -136,7 +166,7 @@ integrator = LeapFrogTimeIntegrator(
 # Run
 # ---------------------------------------------------------------------------
 
-println("n_fluid = $n_fluid  |  mass = $fluid_mass")
+println("n_fluid = $n_fluid  |  mass = $fluid_mass  |  backend = $GRASPH_BACKEND")
 
 run_driver!(
     [Stage(integrator, 50000, 0.1, "run")],

@@ -76,13 +76,33 @@ end
 
 update_state!(particles)
 
+# ---------------------------------------------------------------------------
+# Backend selection
+#
+# Defaults to CPU (Vector-backed, coloured sweep) so the script is unchanged
+# in normal use. Set GRASPH_BACKEND=cuda to run GPU-resident via
+# KernelAbstractions.jl: adapts particles to CuArray and switches the
+# interaction to the one-sided KA sweep (the only sweep implemented as a KA
+# kernel — see docs/gpu-migration-plan.md). Requires CUDA.jl in the active
+# environment (it is not a hard dependency of Grasph itself).
+# ---------------------------------------------------------------------------
+
+const GRASPH_BACKEND = get(ENV, "GRASPH_BACKEND", "cpu")
+const ka_mode = GRASPH_BACKEND == "cuda"
+
+if ka_mode
+    using CUDA
+    using Adapt
+    particles = adapt(CUDABackend(), particles)
+end
 
 # initialize kernel
 kernel = CubicSplineKernel(h_sph; ndims=2)
 si = SystemInteraction(
     kernel,                   # the kernel to be used in this interaction
     FluidPfn(art_visc_alpha, art_visc_beta, h_sph),
-    particles                 # the particles in the interaction
+    particles;                # the particles in the interaction
+    onesided = ka_mode, ka = ka_mode,
 )                             # since only one system is supplied, the interaction describes
                               # the interaction between particles within the system
 
@@ -95,7 +115,7 @@ integrator = LeapFrogTimeIntegrator(particles, si)
 # Run
 # ---------------------------------------------------------------------------
 
-println("n_particles = $n_particles  |  mass = $(particle_mass)")
+println("n_particles = $n_particles  |  mass = $(particle_mass)  |  backend = $GRASPH_BACKEND")
 
 run_driver!(
     [Stage(integrator, 5000, 0.05, "run")],

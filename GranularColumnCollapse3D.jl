@@ -131,6 +131,33 @@ boundary_ghost_entry = GhostEntry(boundary_ghost, 3.0*h_sph,
 )
 
 # ---------------------------------------------------------------------------
+# Backend selection
+#
+# Defaults to CPU (Vector-backed, coloured sweep) so the script is unchanged
+# in normal use. Set GRASPH_BACKEND=cuda to run GPU-resident via
+# KernelAbstractions.jl: adapts every system to CuArray and switches every
+# interaction to the one-sided KA sweep (the only sweep implemented as a KA
+# kernel — see docs/gpu-migration-plan.md). Requires CUDA.jl in the active
+# environment (it is not a hard dependency of Grasph itself).
+# ---------------------------------------------------------------------------
+
+const GRASPH_BACKEND = get(ENV, "GRASPH_BACKEND", "cpu")
+const ka_mode = GRASPH_BACKEND == "cuda"
+
+if ka_mode
+    using CUDA
+    using Adapt
+    bottom_boundary = adapt(CUDABackend(), bottom_boundary)
+    # boundary_ghost is self-referencing (boundary_ghost.source === fluid);
+    # adapt the GhostEntry as one unit and pull the canonical GPU-resident
+    # fluid back out of it (see GhostParticleSystem's docstring) — adapting
+    # fluid separately would create two independent, non-aliased GPU copies.
+    boundary_ghost_entry = adapt(CUDABackend(), boundary_ghost_entry)
+    boundary_ghost = boundary_ghost_entry.ghost
+    fluid = getfield(boundary_ghost, :source)
+end
+
+# ---------------------------------------------------------------------------
 # Interactions and integrator
 # ---------------------------------------------------------------------------
 
@@ -147,11 +174,11 @@ sr_pfn         = StrainRatePfn()
 kinematics_pfn = CauchyFluidPfn(art_visc_alpha, art_visc_beta, h_sph)
 pfns           = (sr_pfn, kinematics_pfn)
 
-fluid_interaction = SystemInteraction(kernel, pfns, fluid)
+fluid_interaction = SystemInteraction(kernel, pfns, fluid; onesided = ka_mode, ka = ka_mode)
 
-fluid_bottom_interaction = SystemInteraction(kernel, pfns, fluid, dynamic_bottom)
+fluid_bottom_interaction = SystemInteraction(kernel, pfns, fluid, dynamic_bottom; onesided = ka_mode, ka = ka_mode)
 
-fluid_boundary_interaction = SystemInteraction(kernel, pfns, fluid, boundary_ghost)
+fluid_boundary_interaction = SystemInteraction(kernel, pfns, fluid, boundary_ghost; onesided = ka_mode, ka = ka_mode)
 
 integrator = LeapFrogTimeIntegrator(
     [fluid, bottom_boundary],
@@ -163,8 +190,8 @@ integrator = LeapFrogTimeIntegrator(
 # Run
 # ---------------------------------------------------------------------------
 
-@printf("n_soil = %d  |  n_bottom = %d  |  mass = %.4g\n",
-        n_fluid, n_bottom, fluid_mass)
+@printf("n_soil = %d  |  n_bottom = %d  |  mass = %.4g  |  backend = %s\n",
+        n_fluid, n_bottom, fluid_mass, GRASPH_BACKEND)
 
 run_driver!(
     [Stage(integrator, 50000, 0.1, "run")],
