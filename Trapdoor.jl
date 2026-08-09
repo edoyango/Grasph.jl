@@ -176,6 +176,51 @@ walls_entry = GhostEntry(
 )
 
 # ---------------------------------------------------------------------------
+# Backend selection
+#
+# Defaults to CPU (Vector-backed, coloured sweep) so the script is unchanged
+# in normal use. Set GRASPH_BACKEND=cuda to run GPU-resident via
+# KernelAbstractions.jl: adapts every system to CuArray and switches every
+# interaction to the one-sided KA sweep (the only sweep implemented as a KA
+# kernel — see docs/gpu-migration-plan.md). Requires CUDA.jl in the active
+# environment (it is not a hard dependency of Grasph itself).
+# ---------------------------------------------------------------------------
+
+const GRASPH_BACKEND = get(ENV, "GRASPH_BACKEND", "cpu")
+const ka_mode = GRASPH_BACKEND == "cuda"
+
+if ka_mode
+    using CUDA
+    using Adapt
+    # walls_ghost is self-referencing (walls_ghost.source === soil); adapt
+    # the GhostEntry as one unit and pull the canonical GPU-resident soil
+    # back out of it (see GhostParticleSystem's docstring) — adapting soil
+    # separately would create two independent, non-aliased GPU copies.
+    walls_entry = adapt(CUDABackend(), walls_entry)
+    walls_ghost = walls_entry.ghost
+    soil        = getfield(walls_ghost, :source)
+
+    # bottom_virt fully aliases bottom_source's fields (VirtualParticleSystem
+    # forwards x/v/rho/stress/etc. via getproperty); adapt as one unit.
+    bottom_virt = adapt(CUDABackend(), bottom_virt)
+
+    # trapdoor_static_virt and trapdoor_moving_virt both wrap the SAME
+    # trapdoor_source, so the two run phases (static then moving) share live
+    # position/stress state across the stage boundary. Adapt one, then
+    # rebuild the other around the same adapted source — adapting both
+    # independently would silently give each phase its own disconnected
+    # copy of the trapdoor.
+    trapdoor_static_virt = adapt(CUDABackend(), trapdoor_static_virt)
+    trapdoor_source_gpu  = getfield(trapdoor_static_virt, :source)
+    trapdoor_moving_virt = VirtualParticleSystem(
+        trapdoor_source_gpu, "trapdoor_moving_virt", n_trapdoor, 2, soil_mass, c_sound;
+        zero_fields   = (:v, :rho, :stress),
+        prescribed_v  = SVector(0.0, trapdoor_vel),
+        state_updater = _trapdoor_updater,
+    )
+end
+
+# ---------------------------------------------------------------------------
 # Interactions
 # ---------------------------------------------------------------------------
 
@@ -185,12 +230,18 @@ kin_pfn    = CauchyFluidPfn(art_visc_alpha, art_visc_beta, h_sph)
 interp_rho = InterpolateFieldFn(:rho; accumulate_wsum=true)
 interp_str = InterpolateFieldFn(:stress; accumulate_wsum=false)
 
-soil_self            = SystemInteraction(kernel, (nothing,    sr_pfn,  nothing,    kin_pfn), soil)
-soil_bottom          = SystemInteraction(kernel, (interp_rho, sr_pfn,  interp_str, kin_pfn), soil, bottom_virt)
-ghost_bottom         = SystemInteraction(kernel, (interp_rho, nothing, interp_str, nothing), walls_ghost, bottom_virt)
-soil_trapdoor_static = SystemInteraction(kernel, (interp_rho, sr_pfn,  interp_str, kin_pfn), soil, trapdoor_static_virt)
-soil_trapdoor_moving = SystemInteraction(kernel, (interp_rho, sr_pfn,  interp_str, kin_pfn), soil, trapdoor_moving_virt)
-soil_walls           = SystemInteraction(kernel, (nothing,    sr_pfn,  nothing,    kin_pfn), soil, walls_ghost)
+soil_self            = SystemInteraction(kernel, (nothing,    sr_pfn,  nothing,    kin_pfn), soil;
+    onesided = ka_mode, ka = ka_mode)
+soil_bottom          = SystemInteraction(kernel, (interp_rho, sr_pfn,  interp_str, kin_pfn), soil, bottom_virt;
+    onesided = ka_mode, ka = ka_mode)
+ghost_bottom         = SystemInteraction(kernel, (interp_rho, nothing, interp_str, nothing), walls_ghost, bottom_virt;
+    onesided = ka_mode, ka = ka_mode)
+soil_trapdoor_static = SystemInteraction(kernel, (interp_rho, sr_pfn,  interp_str, kin_pfn), soil, trapdoor_static_virt;
+    onesided = ka_mode, ka = ka_mode)
+soil_trapdoor_moving = SystemInteraction(kernel, (interp_rho, sr_pfn,  interp_str, kin_pfn), soil, trapdoor_moving_virt;
+    onesided = ka_mode, ka = ka_mode)
+soil_walls           = SystemInteraction(kernel, (nothing,    sr_pfn,  nothing,    kin_pfn), soil, walls_ghost;
+    onesided = ka_mode, ka = ka_mode)
 
 # ---------------------------------------------------------------------------
 # Stress probes: 5 points across the top surface of the trapdoor (y = 0.5*dx)
@@ -219,8 +270,17 @@ td_probe_moving = ProbeParticleSystem(
     prescribed_v  = SVector(0.0, trapdoor_vel),
 )
 
-probe_static_int = SystemInteraction(kernel, InterpolateFieldFn(:stress), soil, td_probe_static)
-probe_moving_int = SystemInteraction(kernel, InterpolateFieldFn(:stress), soil, td_probe_moving)
+if ka_mode
+    # Neither probe references anything else (no mirror_target), so each
+    # adapts independently — no aliasing to preserve.
+    td_probe_static = adapt(CUDABackend(), td_probe_static)
+    td_probe_moving = adapt(CUDABackend(), td_probe_moving)
+end
+
+probe_static_int = SystemInteraction(kernel, InterpolateFieldFn(:stress), soil, td_probe_static;
+    onesided = ka_mode, ka = ka_mode)
+probe_moving_int = SystemInteraction(kernel, InterpolateFieldFn(:stress), soil, td_probe_moving;
+    onesided = ka_mode, ka = ka_mode)
 
 # ---------------------------------------------------------------------------
 # Integrators
@@ -250,7 +310,7 @@ integrator_moving = LeapFrogTimeIntegrator(
 # ---------------------------------------------------------------------------
 
 println("n_soil=$n_soil  n_bottom=$n_bottom  n_trapdoor=$n_trapdoor")
-println("c_sound=$(round(c_sound; digits=2)) m/s")
+println("c_sound=$(round(c_sound; digits=2)) m/s  |  backend=$GRASPH_BACKEND")
 
 stages = [
     Stage(integrator_static, 20000,  0.1, "damping"),

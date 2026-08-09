@@ -97,15 +97,12 @@ fill!(fix_inner.v, zero(SVector{2,Float64}))
 fix_dyn = DynamicBoundarySystem(fix_inner, SVector(1.0, 0.0), SVector(0.0, 0.0), 3.0)
 
 # ---------------------------------------------------------------------------
-# Kernel and interactions
+# Kernel and pairwise functors
 # ---------------------------------------------------------------------------
 
-kernel     = CubicSplineKernel(; ndims=2)
+kernel     = CubicSplineKernel(h_sph; ndims=2)
 sr_pfn     = StrainRateVorticityPfn()
 cauchy_pfn = CauchyFluidPfn(art_visc_alpha, art_visc_beta, h_sph)
-
-beam_self = SystemInteraction(kernel, (sr_pfn, cauchy_pfn), beam; h=h_sph)
-beam_fix  = SystemInteraction(kernel, (sr_pfn, cauchy_pfn), beam, fix_dyn; h=h_sph)
 
 # ---------------------------------------------------------------------------
 # Neighbor-count probe (mirrors all beam particle positions)
@@ -116,7 +113,40 @@ beam_probe = ProbeParticleSystem(
     extras = (nbr_count = zeros(Int, n_beam),),
 )
 
-probe_nbr = SystemInteraction(kernel, NeighborCountFn(:nbr_count), beam, beam_probe; h=h_sph)
+# ---------------------------------------------------------------------------
+# Backend selection
+#
+# Defaults to CPU (Vector-backed, coloured sweep) so the script is unchanged
+# in normal use. Set GRASPH_BACKEND=cuda to run GPU-resident via
+# KernelAbstractions.jl: adapts every system to CuArray and switches every
+# interaction to the one-sided KA sweep (the only sweep implemented as a KA
+# kernel — see docs/gpu-migration-plan.md). Requires CUDA.jl in the active
+# environment (it is not a hard dependency of Grasph itself).
+# ---------------------------------------------------------------------------
+
+const GRASPH_BACKEND = get(ENV, "GRASPH_BACKEND", "cpu")
+const ka_mode = GRASPH_BACKEND == "cuda"
+
+if ka_mode
+    using CUDA
+    using Adapt
+    # beam_probe is self-referencing (beam_probe.mirror_target === beam);
+    # adapt the probe as one unit and pull the canonical GPU-resident beam
+    # back out of it (see ProbeParticleSystem's docstring) — adapting beam
+    # separately would create two independent, non-aliased GPU copies.
+    beam_probe = adapt(CUDABackend(), beam_probe)
+    beam       = getfield(beam_probe, :mirror_target)
+    fix_inner  = adapt(CUDABackend(), fix_inner)
+    fix_dyn    = DynamicBoundarySystem(fix_inner, SVector(1.0, 0.0), SVector(0.0, 0.0), 3.0)
+end
+
+# ---------------------------------------------------------------------------
+# Interactions
+# ---------------------------------------------------------------------------
+
+beam_self = SystemInteraction(kernel, (sr_pfn, cauchy_pfn), beam; onesided = ka_mode, ka = ka_mode)
+beam_fix  = SystemInteraction(kernel, (sr_pfn, cauchy_pfn), beam, fix_dyn; onesided = ka_mode, ka = ka_mode)
+probe_nbr = SystemInteraction(kernel, NeighborCountFn(:nbr_count), beam, beam_probe; onesided = ka_mode, ka = ka_mode)
 
 # ---------------------------------------------------------------------------
 # Integrator
@@ -134,7 +164,7 @@ integrator = LeapFrogTimeIntegrator(
 # ---------------------------------------------------------------------------
 
 δ_eb = 3 * rho0 * 9.81 * L^4 / (2 * E * H^2)
-println("n_beam=$n_beam  n_fix=$n_fix  c_beam=$(round(c_beam; digits=2)) m/s")
+println("n_beam=$n_beam  n_fix=$n_fix  c_beam=$(round(c_beam; digits=2)) m/s  |  backend=$GRASPH_BACKEND")
 println("Euler-Bernoulli tip deflection ≈ $(round(δ_eb; digits=4)) m")
 
 stages = [

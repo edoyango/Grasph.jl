@@ -102,6 +102,30 @@ else
             ghost_gpu = adapt(CUDABackend(), entry).ghost
             dvg = Grasph.device_view(ghost_gpu)
             @test isbitstype(typeof(cudaconvert(dvg)))
+
+            # Regression (Trapdoor.jl's two-virtuals-share-one-source shape,
+            # item 10): VirtualParticleSystem's keyword constructor used to
+            # hardcode `w_sum = zeros(T, n)` regardless of the source's own
+            # array type. Building a *second* virtual directly around an
+            # already GPU-resident source (the correct idiom for keeping two
+            # virtual systems aliased to the same live physical state — see
+            # VirtualParticleSystem's docstring) silently produced a
+            # mixed-backend struct (source on CuArray, w_sum on Vector) that
+            # is not isbits, so `cudaconvert` succeeds (it only converts
+            # CuArrays it finds) but the *kernel launch* itself fails to
+            # compile — a much worse failure mode than a caught type error,
+            # since it only surfaces the first time that struct actually
+            # reaches a `@kernel` call. Fixed by deriving w_sum's array type
+            # from the source via `similar`, mirroring how RK4's sort buffers
+            # were already fixed to do the same thing (item 9).
+            virt_src = FluidParticleSystem("virt_src", 10, 2, 1.0, 10.0)
+            virt1 = VirtualParticleSystem(virt_src, "virt1", 10, 2, 1.0, 10.0)
+            virt1_gpu = adapt(CUDABackend(), virt1)
+            shared_src_gpu = getfield(virt1_gpu, :source)
+            virt2_gpu = VirtualParticleSystem(shared_src_gpu, "virt2", 10, 2, 1.0, 10.0)
+            @test getfield(virt2_gpu, :w_sum) isa CuArray
+            dvv = Grasph.device_view(virt2_gpu)
+            @test isbitstype(typeof(cudaconvert(dvv)))
         end
 
         @testset "full pipeline (sort+grid+sweep), self: CPU oracle vs CUDA" begin

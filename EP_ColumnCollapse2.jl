@@ -130,6 +130,33 @@ left_virt = VirtualParticleSystem(
 )
 
 # ---------------------------------------------------------------------------
+# Backend selection
+#
+# Defaults to CPU (Vector-backed, coloured sweep) so the script is unchanged
+# in normal use. Set GRASPH_BACKEND=cuda to run GPU-resident via
+# KernelAbstractions.jl: adapts every system to CuArray and switches every
+# interaction to the one-sided KA sweep (the only sweep implemented as a KA
+# kernel — see docs/gpu-migration-plan.md). Requires CUDA.jl in the active
+# environment (it is not a hard dependency of Grasph itself).
+# ---------------------------------------------------------------------------
+
+const GRASPH_BACKEND = get(ENV, "GRASPH_BACKEND", "cpu")
+const ka_mode = GRASPH_BACKEND == "cuda"
+
+if ka_mode
+    using CUDA
+    using Adapt
+    fluid = adapt(CUDABackend(), fluid)
+    # bottom_virt/left_virt each fully alias their own source system's fields
+    # (VirtualParticleSystem forwards x/v/rho/stress/etc. via getproperty);
+    # adapting the wrapper as one unit keeps that aliasing intact. Neither
+    # bottom_source nor left_source is read again after construction, so
+    # there's no separate copy to keep in sync.
+    bottom_virt = adapt(CUDABackend(), bottom_virt)
+    left_virt   = adapt(CUDABackend(), left_virt)
+end
+
+# ---------------------------------------------------------------------------
 # Interactions (4 pfns each)
 # ---------------------------------------------------------------------------
 
@@ -140,13 +167,16 @@ interp_vel = InterpolateFieldFn(:v, :rho; accumulate_wsum=true)
 interp_str = InterpolateFieldFn(:stress; accumulate_wsum=false)
 
 # fluid ↔ fluid
-fluid_self = SystemInteraction(kernel, (nothing, sr_pfn, nothing, kin_pfn), fluid)
+fluid_self = SystemInteraction(kernel, (nothing, sr_pfn, nothing, kin_pfn), fluid;
+    onesided = ka_mode, ka = ka_mode)
 
 # fluid ↔ bottom_virt: interpolate (stages 1,3) + strain/kinematics (stages 2,4)
-fluid_bottom = SystemInteraction(kernel, (interp_vel, sr_pfn, interp_str, kin_pfn), fluid, bottom_virt)
+fluid_bottom = SystemInteraction(kernel, (interp_vel, sr_pfn, interp_str, kin_pfn), fluid, bottom_virt;
+    onesided = ka_mode, ka = ka_mode)
 
 # fluid ↔ left_virt: interpolate (stages 1,3) + strain/kinematics (stages 2,4)
-fluid_left = SystemInteraction(kernel, (interp_vel, sr_pfn, interp_str, kin_pfn), fluid, left_virt)
+fluid_left = SystemInteraction(kernel, (interp_vel, sr_pfn, interp_str, kin_pfn), fluid, left_virt;
+    onesided = ka_mode, ka = ka_mode)
 
 # ---------------------------------------------------------------------------
 # Integrator
@@ -162,7 +192,7 @@ integrator = LeapFrogTimeIntegrator(
 # Run
 # ---------------------------------------------------------------------------
 
-println("n_fluid = $n_fluid  |  mass = $fluid_mass")
+println("n_fluid = $n_fluid  |  mass = $fluid_mass  |  backend = $GRASPH_BACKEND")
 
 run_driver!(
     [Stage(integrator, 50000, 0.1, "run")],

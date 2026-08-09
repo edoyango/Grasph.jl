@@ -577,7 +577,13 @@ function VirtualParticleSystem(
     n    == ps.n || throw(ArgumentError("n=$n does not match source n=$(ps.n)"))
     state_updaters = state_updater isa Tuple ? state_updater : (state_updater,)
     _check_functors_eltype(state_updaters, T, "state updater")
-    w_sum = zeros(T, n)
+    # Derive w_sum's array type from ps.x rather than hardcoding Vector, so
+    # constructing a VirtualParticleSystem directly around an already
+    # GPU-resident source (e.g. reusing one virtual's adapted source to build
+    # a second virtual system sharing it) doesn't silently produce a
+    # mixed-backend object (source on CuArray, w_sum on Vector) — the same
+    # buffer-type bug class RK4TimeIntegrator had before item 9.
+    w_sum = fill!(similar(ps.x, T, n), zero(T))
     pv = prescribed_v === nothing ? zero(SVector{ND,T}) : SVector{ND,T}(prescribed_v)
     VirtualParticleSystem{T, ND, typeof(ps), typeof(state_updaters), zero_fields, typeof(w_sum)}(
         String(name), ps, w_sum, state_updaters, pv,

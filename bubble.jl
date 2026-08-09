@@ -138,6 +138,33 @@ boundary_ghost_entry = GhostEntry(boundary_ghost, 3.0 * h_sph,
 )
 
 # ---------------------------------------------------------------------------
+# Backend selection
+#
+# Defaults to CPU (Vector-backed, coloured sweep) so the script is unchanged
+# in normal use. Set GRASPH_BACKEND=cuda to run GPU-resident via
+# KernelAbstractions.jl: adapts every system to CuArray and switches every
+# interaction to the one-sided KA sweep (the only sweep implemented as a KA
+# kernel — see docs/gpu-migration-plan.md). Requires CUDA.jl in the active
+# environment (it is not a hard dependency of Grasph itself).
+# ---------------------------------------------------------------------------
+
+const GRASPH_BACKEND = get(ENV, "GRASPH_BACKEND", "cpu")
+const ka_mode = GRASPH_BACKEND == "cuda"
+
+if ka_mode
+    using CUDA
+    using Adapt
+    fluid_Y = adapt(CUDABackend(), fluid_Y)
+    # boundary_ghost is self-referencing (boundary_ghost.source === fluid_X);
+    # adapt the GhostEntry as one unit and pull the canonical GPU-resident
+    # fluid_X back out of it (see GhostParticleSystem's docstring) — adapting
+    # fluid_X separately would create two independent, non-aliased GPU copies.
+    boundary_ghost_entry = adapt(CUDABackend(), boundary_ghost_entry)
+    boundary_ghost = boundary_ghost_entry.ghost
+    fluid_X = getfield(boundary_ghost, :source)
+end
+
+# ---------------------------------------------------------------------------
 # Interactions and integrator
 # ---------------------------------------------------------------------------
 
@@ -148,14 +175,16 @@ kernel = WenlandC2Kernel(h_sph; ndims=2)
 fluid_X_interaction = SystemInteraction(
     kernel,                # the kernel to be used in this interaction
     FluidPfn(art_visc_alpha, art_visc_beta, h_sph),
-    fluid_X                 # the particles in the interaction
+    fluid_X;                # the particles in the interaction
+    onesided = ka_mode, ka = ka_mode,
 )
 
 # bubble fluid particles interacting with themselves
 fluid_Y_interaction = SystemInteraction(
     kernel,
     FluidPfn(art_visc_alpha, art_visc_beta, h_sph),
-    fluid_Y
+    fluid_Y;
+    onesided = ka_mode, ka = ka_mode,
 )
 
 # bubble/heavy fluid particles interacting with eachother
@@ -163,7 +192,8 @@ fluid_XY_interaction = SystemInteraction(
     kernel,
     FluidPfn(art_visc_alpha, art_visc_beta, h_sph),
     fluid_Y, # useful to make Y the first system as the iteration space is smaller
-    fluid_X,
+    fluid_X;
+    onesided = ka_mode, ka = ka_mode,
 )
 
 # heavy fluid particles interacting with boundary.
@@ -174,7 +204,8 @@ fluid_boundary_interaction = SystemInteraction(
     kernel,
     FluidPfn(art_visc_alpha, art_visc_beta, h_sph),
     fluid_X,
-    boundary_ghost
+    boundary_ghost;
+    onesided = ka_mode, ka = ka_mode,
 )
 
 integrator = RK4TimeIntegrator(
@@ -189,6 +220,8 @@ integrator = RK4TimeIntegrator(
 # ---------------------------------------------------------------------------
 # Run
 # ---------------------------------------------------------------------------
+
+println("n_fluid_X = $(fluid_X.n)  n_fluid_Y = $(fluid_Y.n)  |  backend = $GRASPH_BACKEND")
 
 run_driver!(
     [Stage(integrator, 6000, 1.5, "run")],
