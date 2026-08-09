@@ -57,6 +57,18 @@ _once a ghost's capacity can exceed its count — see the item's own note for_
 _the full story, including what a 3-reviewer adversarial pass found and_
 _closed. Suite: 1600/1600 (up from 1496)._
 
+_2026-08-09 update #7: item 8's remaining scope (actually wiring_
+_`onesided=true`/`ka=true` into the 11 non-dambreak scripts) is partly done —_
+_5 of the 11 (`ellipse.jl`, `DambreakWall.jl`, `GranularColumnCollapse.jl`,_
+_`GranularColumnCollapse3D.jl`, `EP_ColumnCollapse.jl`) now have the_
+_`GRASPH_BACKEND` switch, verified on real CUDA hardware. The other 6_
+_(`bubble.jl`/`bubble2.jl`/`bubble3.jl`, `EP_ColumnCollapse2.jl`,_
+_`Trapdoor.jl`, `CantileverBeam.jl`) turn out to be blocked by item 9, not_
+_item 8 — they use `RK4TimeIntegrator`, `VirtualParticleSystem`, or_
+_`ProbeParticleSystem`, none of which have GPU-resident orchestration yet,_
+_confirmed directly this session rather than assumed. See item 8's own note_
+_for the full breakdown. No new tests; suite stays 1600/1600._
+
 ## Why this migration, and why not an octree
 
 The original ask was to get GraSPH.jl (a Julia SPH code) running on GPUs via
@@ -849,7 +861,8 @@ to coloured for all 13 scripts, and no script's behavior changed.
    `onesided=true`/`ka=true` into their actual `SystemInteraction`/
    `GhostEntry` calls is still item 8's job (see item 8's own remaining-scope
    note below, now further unblocked).
-8. **Wire `onesided=true`/`ka=true` into the other 12 scripts**, one at a
+8. **Wire `onesided=true`/`ka=true` into the other 11 scripts** (12 minus
+   `dambreak_3d.jl`, done separately as item 3), one at a
    time, mirroring `dambreak.jl`'s `GRASPH_BACKEND` switch — now unblocked
    by items 5-7 plus Phase C's integration harnesses (`test/
    test_onesided_integration_*.jl`), which give a per-shape correctness
@@ -885,19 +898,94 @@ to coloured for all 13 scripts, and no script's behavior changed.
    pass (dispatch-safety/correctness/test-coverage, 3 independent reviewers)
    found no confirmed issues. Suite: 1496/1496 (up from 1479 after item 6).
 
-   This item's remaining scope — actually wiring `onesided=true`/`ka=true`
+   ~~This item's remaining scope — actually wiring `onesided=true`/`ka=true`
    into the 12 non-dambreak scripts' `SystemInteraction` calls — is
-   unstarted; every pfn those scripts use now has a working `ka=true`
-   dispatch path, but none of the scripts themselves opt into it yet (all
-   still default to the coloured sweep). Item 7 (below) closes the last
-   remaining gap for the 7 of those 12 that use ghosts — `GhostParticleSystem`
-   now has a working `ka=true` path too, so nothing pfn- or
-   infrastructure-side blocks any of the 12 scripts anymore; it's purely
-   script-wiring work from here.
+   unstarted~~ — **5 of the remaining 11 done** (item 7, above, closed the
+   last pfn-/infrastructure-side gap for ghost-using scripts, which is what
+   unblocked this). `ellipse.jl`, `DambreakWall.jl`,
+   `GranularColumnCollapse.jl`, `GranularColumnCollapse3D.jl`, and
+   `EP_ColumnCollapse.jl` now carry the same `GRASPH_BACKEND` switch as
+   `dambreak.jl`/`dambreak_3d.jl`: defaults to CPU/coloured, and
+   `GRASPH_BACKEND=cuda` adapts every system to `CuArray` and passes
+   `onesided=ka_mode, ka=ka_mode` to every `SystemInteraction`. These 5 were
+   chosen specifically because they use nothing but `LeapFrogTimeIntegrator`
+   plus system types that already have a working `ka=true` path end to end
+   (`FluidParticleSystem`, `BasicParticleSystem`/`DynamicBoundarySystem`,
+   `StressParticleSystem`, `ElastoPlasticParticleSystem`,
+   `GhostParticleSystem`) — no `VirtualParticleSystem`, no
+   `ProbeParticleSystem`, no `RK4TimeIntegrator`.
+
+   For the 3 ghost-using scripts in this batch (`GranularColumnCollapse.jl`,
+   `GranularColumnCollapse3D.jl`, `EP_ColumnCollapse.jl`), the adapt call
+   follows `GhostParticleSystem`'s own docstring exactly (see item 7): the
+   `GhostEntry` is adapted as one unit and the canonical GPU-resident source
+   is pulled back out via `getfield(ghost, :source)` rather than adapting the
+   source fluid a second time — e.g. `left_ghost_entry =
+   adapt(CUDABackend(), left_ghost_entry); left_ghost = left_ghost_entry.ghost;
+   fluid = getfield(left_ghost, :source)`. `DambreakWall.jl` needed every one
+   of its 6 systems (fluid, wall, and 4 independently-normaled
+   `DynamicBoundarySystem`-wrapped walls) adapted and all 8 interactions
+   switched — mechanically the largest script in this batch, but the same
+   pattern throughout since none of its systems are self-referencing.
+
+   **Verified per script** by running each one directly, once unmodified
+   (coloured sweep) and once with `GRASPH_BACKEND=cuda`, on real CUDA
+   hardware (RTX 4060 Laptop) via the merged-throwaway-environment technique
+   (see "Environment notes" above) — `run_driver!`'s scripts aren't part of
+   `Pkg.test()`'s own dependency resolution, so this needed
+   `Pkg.add(["CUDA","Adapt","KernelAbstractions","HDF5","Printf"])` in a
+   throwaway environment same as always. Every script ran cleanly for
+   several thousand steps (some far more — `ellipse.jl`, 1976 particles,
+   ran to full completion, 5000/5000 steps, in both modes) with no
+   `MethodError`, no `scalar indexing disabled` violation, and no `NaN`.
+   Where directly comparable (deterministic setup, matching step number),
+   printed field summaries agreed with the CPU run to float noise consistent
+   with the CPU/GPU FMA-contraction difference this codebase already
+   tolerances elsewhere — e.g. `GranularColumnCollapse.jl` step 500 `v`
+   magnitude range: CPU `[0.000143611, 0.048455]`, GPU
+   `[0.000140276, 0.0484567]`.
+
+   No new automated `ka=true` integration tests were added for these 5
+   scripts specifically, deliberately: the pfn-level `ka=true` sweep
+   computation they depend on is already exhaustively tested (items 6 and 8
+   itself, both `KA.CPU()` and real CUDA), and
+   `test_onesided_integration_{dambreakwall,ellipse,soil2d,soil3d}.jl`
+   (Phase C) already prove `onesided=true` (CPU) matches the coloured sweep
+   for exactly these shapes — so by transitivity the only risk this item
+   could actually introduce was mechanical (right systems threaded to the
+   right interactions, adapt ordering, ghost-aliasing), which direct
+   execution checks for as directly as a new fixture would. Revisit if that
+   judgment call turns out wrong (a real regression slips through unnoticed).
+
+   **Still not wired, and blocked by item 9 below, not by anything in this
+   item**: `bubble.jl`/`bubble2.jl`/`bubble3.jl` (all `RK4TimeIntegrator`),
+   `EP_ColumnCollapse2.jl` (`VirtualParticleSystem` boundaries),
+   `Trapdoor.jl` (`VirtualParticleSystem` *and* `ProbeParticleSystem`), and
+   `CantileverBeam.jl` (`ProbeParticleSystem`). Confirmed directly rather
+   than assumed: `_update_virtual_positions!` (`TimeIntegration.jl`) is a
+   raw `@inbounds for i in 1:vps.n; vps.x[i] += pv*dt; end` scalar loop with
+   no backend dispatch at all, which would violate `CUDA.allowscalar(false)`
+   the instant a virtual system's arrays are `CuArray`s — regardless of
+   whether `prescribed_v` happens to be zero, since the loop still executes;
+   `ProbeParticleSystem` is still hardcoded-`Vector` (item 5), so it has no
+   `Adapt.adapt_structure` at all; `RK4TimeIntegrator`'s own multi-stage
+   bookkeeping was already named directly in item 9. Also deliberately not
+   given `onesided=true` alone (without `ka=true`) as a partial step: item
+   2's crossover benchmark shows the one-sided CPU sweep is *slower* than
+   the coloured sweep at every scale measured (2,500-202,500 particles, up
+   to ~2.1× slower) — it exists purely as the GPU-compatible sweep shape,
+   not a CPU-side optimization, so shipping it alone on these 6 scripts
+   would be a pure regression with no offsetting benefit until item 9 makes
+   `ka=true` reachable for them too.
 9. Virtual particle systems, probes, and the RK4 integrator have no GPU
    sweep path at all yet, independent of pfn support — `VirtualParticleSystem`
    position/state advance, `_measure_probes!`, and RK4's multi-stage
-   bookkeeping are all still CPU-`for`-loop or Polyester code.
+   bookkeeping are all still CPU-`for`-loop or Polyester code. Confirmed
+   directly (not just asserted) while scoping item 8's script-wiring pass:
+   6 of the remaining 11 scripts (`bubble.jl`/`bubble2.jl`/`bubble3.jl`,
+   `EP_ColumnCollapse2.jl`, `Trapdoor.jl`, `CantileverBeam.jl`) are blocked
+   here rather than by any pfn or `device_view` gap — see item 8's own note
+   for exactly which gap blocks which script.
 
 ## Explicitly deferred (not started, not part of the current scope)
 
@@ -915,8 +1003,11 @@ to coloured for all 13 scripts, and no script's behavior changed.
   support since item 5, it's specifically their *position/state-advance
   orchestration* (mirrored by Virtual/probes/RK4 above) that's still
   CPU-only.
-- Extending `onesided=true`/`ka=true` support to the other 12 experiment
-  scripts (all still on the coloured sweep by default; see item 8 above).
+- Extending `onesided=true`/`ka=true` support to the remaining 6 experiment
+  scripts blocked on item 9 (`bubble.jl`/`bubble2.jl`/`bubble3.jl`,
+  `EP_ColumnCollapse2.jl`, `Trapdoor.jl`, `CantileverBeam.jl` — still on the
+  coloured sweep by default; see item 8 above). The other 5 non-dambreak
+  scripts are done.
 - Persistent/cached grid, Verlet-skin rebuild cadence, and fusing the sort's
   gather+copyback into a single `Ref`-swap — all flagged during Phase B2 as
   follow-ups once the crossover benchmark shows whether launch count is
@@ -932,7 +1023,7 @@ to coloured for all 13 scripts, and no script's behavior changed.
 ## Practical notes for picking this back up
 
 - Branch: `onesided-sweep-gpu-prep`, based on `main` at commit `37e9a5a`, now
-  27 commits ahead of it (`12ac526`..`eda4234`). Nothing on this branch has
+  29 commits ahead of it (`12ac526`..`f8f7498`). Nothing on this branch has
   been pushed to any remote.
 - Run the full suite with `julia --project -e 'using Pkg; Pkg.test()'` —
   should show `1600/1600` (834 through Phase B1, up to 935 after Phase B2's
