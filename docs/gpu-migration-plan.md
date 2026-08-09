@@ -1,8 +1,19 @@
 # GraSPH.jl → GPU (CUDA.jl) migration: status and plan
 
-_Last updated: 2026-08-08. Branch: `onesided-sweep-gpu-prep` (off `main`). Written
+_Last updated: 2026-08-09. Branch: `onesided-sweep-gpu-prep` (off `main`). Written
 because this work is moving from a CPU-only dev machine to one with an NVIDIA
 GPU — everything needed to pick the work back up should be in this file._
+
+_2026-08-09 update: Phase C (below) landed since the previous update —_
+_"Next steps" item 4 from the 2026-08-08 revision ("converting the remaining_
+_pfns to `pfn_contribution`") is now done, CPU-side only. `ka=true`/GPU_
+_support for any of it was explicitly kept out of scope; that's the bulk of_
+_what's left, and the priority list at the bottom is rewritten around it._
+
+_2026-08-09 update #2: item 5 (`device_view` for Stress/ElastoPlastic/_
+_DynamicBoundary/Virtual systems) is also done now — see the item itself,_
+_below, for what shipped, what was scoped out, and a real bug an adversarial_
+_review caught and got fixed along the way._
 
 ## Why this migration, and why not an octree
 
@@ -286,6 +297,132 @@ was run with `GRASPH_BACKEND=cuda` through the real `run_driver!`/CLI path
 `g·t` free-fall exactly, densities stayed at `rho0`, no NaNs. `Pkg.test()`
 stayed at 834/834 throughout every step of this work.
 
+## Phase C — pairwise-functor conversion to `pfn_contribution` (done, CPU-only)
+
+_Landed 2026-08-09, on the CPU-only dev machine (no GPU work in this phase —_
+_see "what this does NOT do" below). This is "Next steps" item 4 from the_
+_previous revision of this doc, plus a bug fix and a verification pass that_
+_weren't originally scoped but turned out to be necessary along the way._
+
+**Why this was next**: the coloured sweep can only retire once every pfn
+actually used by the 13 experiment scripts has a `pfn_contribution` method.
+Before this phase, only `FluidPfn`'s self-interaction and its
+`StaticBoundarySystem`-coupled method were converted — the minimum
+`dambreak.jl`/`dambreak_3d.jl` needed. Everything else
+(`StrainRatePfn`, `StrainRateVorticityPfn`, `CauchyFluidPfn`, `XSPHPfn`,
+`InterpolateFieldFn`, `NeighborCountFn`, `FluidSolidPfn`, plus `FluidPfn`'s
+remaining variants) was still coloured-sweep-only, which is what kept the
+other 11 scripts permanently off the one-sided path.
+
+**Scope note, unchanged from Phase A/B2's own framing**: this is CPU
+(`onesided=true`) only. `ka=true`/GPU support for any pfn converted here was
+explicitly deferred — see "What this does NOT do" below and the revised
+"Next steps" list.
+
+### What got built, in commit order (`bbf6283` → `d548e06`)
+
+- **Bucket A** (`bbf6283`) — mechanical one-sided transcriptions for pfns
+  that were already one-sided in their mutating form (only ever wrote
+  `ps_a`'s fields): `StrainRatePfn`/`StrainRateVorticityPfn` (self +
+  ghost/virtual-coupled + `DynamicBoundarySystem`-coupled),
+  `CauchyFluidPfn` (same three shapes, general two-real-system method left
+  unconverted and narrowed defensively — confirmed dead via grep),
+  `XSPHPfn` (self only at this point), `FluidPfn`'s remaining two one-sided
+  variants. Also generalized `_onesided_writeback_self!`/
+  `_onesided_writeback_coupled!` to one NamedTuple-name-dispatched method
+  for every pfn, replacing per-pfn hand-written versions.
+- **Reverse-sweep infrastructure** (`0c29f6d`, `301a886`) — new sweep pass
+  mirroring `_sweep_coupled_onesided!`'s shape but iterating `system_b`
+  instead of `system_a`, scanning `_cell_start_a` (already built
+  unconditionally for every coupled interaction) for `system_a` neighbours,
+  calling `pfn_contribution(pfn, system_b, system_a, j, i, -dx, -gx, w)` —
+  i.e. **the "ps_a" argument slot is always the write target and "ps_b" is
+  always the read-only neighbour, regardless of which physical system fills
+  which slot or which pass is running.** Added the `_onesided_shape(pfn,
+  ps_a, ps_b)` trait (`WritesA()` default / `WritesB()` / `WritesBoth()`)
+  that picks which pass(es) run. This is the one genuinely new piece of
+  sweep machinery in Phase C — everything else is either a mechanical
+  transcription or a direct consumer of this.
+- **Bucket B** (`5f46096`) — `InterpolateFieldFn`/`NeighborCountFn` →
+  `WritesB()`. Both already wrote into `ps_b` in their mutating form, so
+  this was a direct application of the reverse-sweep infra with zero script
+  changes.
+- **Bucket C** (`90bbd44`) — the genuinely mutual pfns, `WritesBoth()`:
+  `FluidPfn` fluid-fluid (two distinct real `FluidParticleSystem` instances,
+  `bubble.jl`/`bubble2.jl`/`bubble3.jl`) got **one** `pfn_contribution`
+  method serving both pass directions, since the physics is symmetric under
+  relabeling. `FluidSolidPfn` (`DambreakWall.jl`) got **two** distinct,
+  narrowly-typed methods (fluid-as-target / solid-as-target) with no
+  generic fallback, because its physics is deliberately *not* symmetric —
+  the fluid's own pressure drives the pressure-force term on both sides, to
+  keep pressure continuous across the interface. Verified via mutation
+  testing (injecting the wrong-side-pressure bug and confirming a dedicated
+  regression test catches it).
+- **`XSPHPfn` ghost-coupling bug fix** (`91d9016`) — not originally scoped;
+  found by an adversarial review while converting `XSPHPfn`'s coupled form.
+  Every real `GhostParticleSystem` in this codebase self-references its
+  source (`GhostParticleSystem(fluid_X, ...)`), and `GhostParticleSystem`
+  doesn't own a `v_adjustment` array, so `XSPHPfn`'s old, fully-symmetric
+  mutating method's `ps_b.v_adjustment[j] -= ...` write fell through
+  `getproperty` straight into the real system's own array — aliased, and
+  indexed by the ghost's *local* index rather than the particle it mirrors.
+  Silently wrong whenever `ghost.n < fluid.n`; heap-corrupting
+  (SIGABRT/SIGSEGV, reproduced directly) whenever `ghost.n > fluid.n` — a
+  regime `bubble3.jl`'s actual `fluid_boundary_interaction` can hit. This
+  predates Phase C entirely; it was just never exercised as a "coloured
+  sweep is the oracle" comparison before. Fixed by adding a narrowly-typed
+  one-sided mutating method (matching the `FluidPfn`/`CauchyFluidPfn`/
+  `StrainRatePfn` ghost/virtual precedent) that only ever writes `ps_a`.
+- **Integration harnesses** (`d548e06`) — the pairwise-comparison tests
+  above only ever proved single-pair or single-sweep equivalence. This adds
+  one reduced-scale standalone test per distinct interaction shape across
+  all 11 non-dambreak scripts, each running a *real* multi-stage
+  `LeapFrogTimeIntegrator`/`RK4TimeIntegrator` loop (with ghosts/virtuals/
+  probes wired up exactly as the real script does) once coloured and once
+  `onesided=true`, checked for both short-run trajectory equivalence and
+  long-run stability. Also confirmed `CantileverBeam.jl` is broken as
+  committed (invalid `CubicSplineKernel`/`SystemInteraction` calls,
+  unrelated to this work, not fixed) — its harness reconstructs the
+  intended shape with corrected calls instead.
+
+Full suite: **1371/1371** (up from 935 before Phase C; +100 pfn-conversion
+tests, +8 for the `XSPHPfn` fix, +311 for the integration harnesses, +17
+from other test additions along the way).
+
+### What this does NOT do
+
+- **No `ka=true`/GPU support for any pfn converted in Phase C.** Every
+  `pfn_contribution` method added here runs on CPU (`onesided=true`) only.
+  `device_view`/`DeviceViews.jl` still only covers `BasicParticleSystem`/
+  `FluidParticleSystem` (the two types `dambreak.jl` needs) — none of
+  `StressParticleSystem`, `ElastoPlasticParticleSystem`,
+  `VirtualParticleSystem`, `ProbeParticleSystem`, `DynamicBoundarySystem`,
+  or ghost systems have an isbits GPU-kernel-safe proxy.
+- **No KA kernel twin for the reverse/`WritesBoth` sweep.** The new
+  `_sweep_coupled_onesided_reverse!` pass and the `WritesB()`/`WritesBoth()`
+  dispatch only exist as Polyester CPU code in `Interaction.jl`; nothing in
+  `KAKernels.jl` mirrors it yet.
+- **The other 12 scripts are still on the coloured sweep by default.**
+  Phase C proved `onesided=true` is *correct* for their interaction shapes
+  (that's what the integration harnesses are for); it didn't flip any
+  script's actual default, and none of them gained a `GRASPH_BACKEND`
+  switch. `dambreak.jl`/`dambreak_3d.jl` remain the only two scripts wired
+  to `ka=true` at all.
+- **Ghosts, virtual systems, probes, and RK4 still have no GPU story.**
+  Phase C's reduced-scale harnesses run them on CPU inside a real integrator
+  loop, which proves onesided-sweep correctness but says nothing about
+  GPU-residency — `generate_ghosts!`'s serial count-then-cursor algorithm in
+  particular doesn't port by simple translation (see "Explicitly deferred"
+  below, unchanged on this point).
+
+The coloured sweep has **not** been retired from `src/` — that was always
+staged for after every pfn was converted, and Phase C is that "every pfn"
+milestone reached (for actual usage; a few narrowly-typed defensive
+fallbacks exist for combinations grep confirmed are unused, e.g.
+`CauchyFluidPfn`'s general two-real-system method). Retiring it is now
+unblocked on the CPU side but wasn't done in this phase — it still defaults
+to coloured for all 13 scripts, and no script's behavior changed.
+
 ### Environment notes for the next machine move
 
 - A fresh checkout needs `Pkg.Registry.update()` before `Pkg.instantiate()`/
@@ -382,30 +519,112 @@ stayed at 834/834 throughout every step of this work.
      whatever the script itself `using`s directly, e.g. StaticArrays/Printf)
      — letting the resolver settle everything at once avoids the conflict
      (lands on CUDA 5.8.5, same as `Pkg.test()`'s own resolve).
-4. Converting the remaining pfns to `pfn_contribution`, and only then
-   retiring the coloured sweep — unchanged from before, still not started.
+4. ~~**Converting the remaining pfns to `pfn_contribution`**~~ — **done,
+   CPU-only** (Phase C above, `bbf6283`..`d548e06`). Every pfn actually used
+   by the 13 experiment scripts now has a `pfn_contribution` method and an
+   `_onesided_shape` (the `is_mutual` trait mentioned in earlier revisions
+   of this doc, actually built as a three-way `WritesA()`/`WritesB()`/
+   `WritesBoth()` trait rather than a boolean — `FluidSolidPfn`'s two-method
+   asymmetric-physics case is why: a boolean can't distinguish "mutual" from
+   "which side's pressure wins"). The coloured sweep itself has **not** been
+   retired — see "What this does NOT do" in Phase C. **What's actually next
+   is GPU work, not more pfn conversion:**
+5. ~~**Extend `device_view`/`DeviceViews.jl`**~~ — **done, for 4 of the 6
+   types originally listed** (commit `e57b787`): `StressParticleSystem`,
+   `ElastoPlasticParticleSystem`, and `DynamicBoundarySystem` were fully
+   mechanical, following the `BasicParticleSystem`/`FluidParticleSystem`/
+   `StaticBoundarySystem` pattern already built. `VirtualParticleSystem` was
+   not: unlike the boundary wrappers (which own no host-only fields at all),
+   it owns a non-isbits `name::String` directly, so its own concrete type
+   can't be rebuilt around a device-viewed inner system the way
+   `StaticBoundarySystem`/`DynamicBoundarySystem` are. Fixed by introducing
+   an `AbstractVirtualParticleSystem` supertype (mirroring the existing
+   `AbstractGhostParticleSystem`/`GhostParticleSystem` precedent) and a new
+   isbits `DeviceVirtualSystem`, then widening *only* the one-sided-protocol
+   method signatures (`pfn_contribution`/`_onesided_zero_coupled`/
+   `_onesided_shape`) that pattern-matched on `VirtualParticleSystem{T,ND}`
+   to dispatch on the abstract type instead — the legacy coloured-sweep
+   methods are untouched, since that sweep is CPU-only forever and never
+   constructs a `device_view`.
+
+   `ProbeParticleSystem`/ghost systems (`GhostParticleSystem`) are **not**
+   covered and were deliberately dropped from this item's scope: both
+   hardcode `Vector` for their per-particle arrays (`x`, `id`, `w_sum`/`v`/
+   `rho`, etc.) rather than the array-type-generic parameter every other
+   system type uses, which blocks `Adapt.jl` entirely regardless of
+   `device_view` — a deeper struct change than "add a device_view method",
+   and ghosts specifically are already covered by item 7 below (their
+   `resize!`-based generation is the harder problem anyway, not the missing
+   proxy). Revisit `ProbeParticleSystem`'s array-type genericity whenever
+   probes get their own GPU story (item 9).
+
+   An adversarial review of this change caught a real, reproducible bug it
+   exposed rather than introduced: `VirtualNormUpdater`/
+   `PrescribedVelocityUpdater` (`StateUpdaters.jl`) read `prescribed_v` via
+   raw `getfield(ps, :prescribed_v)` instead of `ps.prescribed_v` — harmless
+   on the real struct (a genuine field there) but bypassing
+   `DeviceVirtualSystem`'s `getproperty` entirely, since `getfield` never
+   consults `getproperty` overrides. Would have thrown `FieldError` the first
+   time either updater ran against a device-viewed virtual system, i.e. the
+   first time a `VirtualParticleSystem` is actually GPU-resident — exactly
+   the capability this item adds. Fixed both call sites; the regression test
+   was confirmed to fail-then-pass via mutation testing (revert the fix →
+   the predicted `FieldError` reproduces exactly → restore it → green).
+
+   One gap surfaced but deliberately left unfixed here, since it's
+   pre-existing and belongs with item 8, not this item: `FluidSolidPfn`'s two
+   `pfn_contribution` methods are typed on the concrete
+   `FluidParticleSystem{T,ND}`/`ElastoPlasticParticleSystem{T,ND}` pair, not
+   on any device-view-compatible abstraction — so `device_view(fluid)`/
+   `device_view(wall)` (both become an unrelated `DeviceSystem`) can't
+   dispatch into them yet. `ElastoPlasticParticleSystem`'s own device view is
+   otherwise field-complete; this only matters once `DambreakWall.jl`
+   (`FluidSolidPfn`'s one real call site) actually tries `ka=true`.
+   Suite: 1433/1433 (up from 1371).
+6. **Write the KA kernel twin for the reverse/`WritesBoth` sweep.**
+   `_sweep_coupled_onesided_reverse!` and the `WritesB()`/`WritesBoth()`
+   dispatch (Phase C's one new piece of sweep machinery) only exist as
+   Polyester CPU code in `Interaction.jl` — nothing in `KAKernels.jl`
+   mirrors it. Without this, Phase C's mutual/reverse pfns (`FluidPfn`
+   fluid-fluid, `FluidSolidPfn`, `InterpolateFieldFn`, `NeighborCountFn`,
+   `XSPHPfn`-coupled) can run `onesided=true` on GPU-resident arrays via KA's
+   `CPU()` backend but not on `CUDABackend()`.
+7. **Ghosts on GPU** — the hardest remaining piece, and gates 7 of the 13
+   scripts. `generate_ghosts!`'s two-pass count-then-cursor logic doesn't
+   port by direct translation; needs a GPU-compatible rewrite (flag +
+   exclusive-scan + compaction into capacity-preallocated buffers, since
+   per-step `resize!` — while it does work on `CuVector` — isn't the right
+   growth strategy for a count that changes every step). Unchanged from
+   every earlier revision of this doc; still not started.
+8. **Wire `onesided=true`/`ka=true` into the other 12 scripts**, one at a
+   time, mirroring `dambreak.jl`'s `GRASPH_BACKEND` switch — now unblocked
+   by items 5-7 plus Phase C's integration harnesses (`test/
+   test_onesided_integration_*.jl`), which give a per-shape correctness
+   oracle to validate each script's GPU wiring against before trusting it.
+   `DambreakWall.jl` specifically also needs `FluidSolidPfn`'s two
+   `pfn_contribution` methods widened off the concrete `FluidParticleSystem`/
+   `ElastoPlasticParticleSystem` pair to something `device_view` can
+   dispatch into (see item 5's note) before it can try `ka=true` at all.
+9. Virtual particle systems, probes, and the RK4 integrator have no GPU
+   sweep path at all yet, independent of pfn support — `VirtualParticleSystem`
+   position/state advance, `_measure_probes!`, and RK4's multi-stage
+   bookkeeping are all still CPU-`for`-loop or Polyester code.
 
 ## Explicitly deferred (not started, not part of the current scope)
 
-- Converting the remaining pfns (`StrainRatePfn`, `StrainRateVorticityPfn`,
-  `CauchyFluidPfn`, `XSPHPfn`, `InterpolateFieldFn`, `NeighborCountFn`,
-  `FluidSolidPfn`) to the one-sided `pfn_contribution` protocol.
-  `FluidSolidPfn` and any two-real-system coupling need the `is_mutual` trait
-  design (sweep runs a second pass over `system_b`'s particles), which was
-  scoped but never implemented.
+- **GPU (`ka=true`) support for any pfn converted in Phase C** — see items
+  5-9 just above; this is now the actual next-steps list, not a deferred
+  afterthought, but it's still true that none of it has started.
 - Ghost particles, virtual particle systems, probes, RK4 integrator,
-  stress/elasto-plastic systems — none have one-sided pfn/sweep support yet.
-  Ghosts are used by 7 of the repo's 13 experiment scripts. Ghosts need
-  `generate_ghosts!`'s two-pass count-then-cursor logic rewritten for GPU
-  compatibility (flag + exclusive-scan + compaction into
-  capacity-preallocated buffers, since per-step `resize!`, while it does work
-  on `CuVector`, isn't the right growth strategy for a count that changes
-  every step).
-- Extending `onesided=true`/GPU support to the other 12 experiment scripts
-  (all still on the coloured sweep, unaffected by this session's work).
+  stress/elasto-plastic systems — none have GPU-resident sweep support yet
+  (Phase C gave them CPU one-sided support and proved it correct in-context;
+  GPU residency is a separate, unstarted piece — see item 7 above for why
+  ghosts specifically are the hard part).
+- Extending `onesided=true`/`ka=true` support to the other 12 experiment
+  scripts (all still on the coloured sweep by default; see item 8 above).
 - Persistent/cached grid, Verlet-skin rebuild cadence, and fusing the sort's
-  gather+copyback into a single `Ref`-swap — all flagged during this session
-  as follow-ups once the crossover benchmark shows whether launch count is
+  gather+copyback into a single `Ref`-swap — all flagged during Phase B2 as
+  follow-ups once the crossover benchmark shows whether launch count is
   actually the bottleneck at dambreak's scale; not built.
 - Morton/Z-order sort keys (packed lexicographic `UInt64` key shipped
   instead).
@@ -417,16 +636,31 @@ stayed at 834/834 throughout every step of this work.
 
 ## Practical notes for picking this back up
 
-- Branch: `onesided-sweep-gpu-prep`, based on `main` at commit `37e9a5a`.
-  Nothing on this branch has been pushed to any remote.
+- Branch: `onesided-sweep-gpu-prep`, based on `main` at commit `37e9a5a`, now
+  19 commits ahead of it (`12ac526`..`e57b787`). Nothing on this branch has
+  been pushed to any remote.
 - Run the full suite with `julia --project -e 'using Pkg; Pkg.test()'` —
-  should show `834/834` (plus whatever the Tier 1/2/3 additions above bring
-  it to once they land).
-- `test/test_onesided_sweep.jl` and `test/test_adapt.jl` are the two test
-  files from Phase A/B1; both are wired into `test/runtests.jl`. This
-  session's `device_view`/KA-kernel work has been validated with ad hoc
-  scripts, not yet with checked-in tests — that's next steps item 1 above.
+  should show `1433/1433` (834 through Phase B1, up to 935 after Phase B2's
+  3D work, up to 1371 after Phase C, up to 1433 after item 5's `device_view`
+  extension).
+- `test/test_onesided_sweep.jl` (Phase A/C, ~1100 lines by now — one section
+  per pfn/shape, including the `XSPHPfn` ghost-aliasing regression test) and
+  `test/test_adapt.jl` (Phase B1) are the two long-running test files that
+  keep growing with each phase. Phase C also added nine new standalone files,
+  `test/test_onesided_integration_{soil2d,soil3d,virtual,trapdoor,bubble,
+  bubble3,ellipse,dambreakwall,cantilever}.jl` — one per interaction shape
+  across the 11 non-dambreak scripts, all wired into `test/runtests.jl`.
+  Item 5 added `test/test_device_views.jl` (proxy-correctness, dispatch
+  equivalence between host and `device_view`'d systems, and the
+  `VirtualNormUpdater`/`PrescribedVelocityUpdater` `getfield`-bypass
+  regression test), also wired in.
+  Phase B2's `device_view`/KA-kernel work has its own three tiers
+  (`test_ka_cpu.jl`, `test_gpu_cuda.jl`, `test_gpu_dambreak.jl`) — see next
+  steps item 1 for what's still ad hoc there vs. checked in.
 - `CUDA.jl` is now confirmed to install and run correctly on a real GPU from
   this repo's dependency graph (see environment notes above) — the earlier
   "no GPU in the dev environment this was built in" caveat throughout Phase
-  A/B1 no longer applies.
+  A/B1 no longer applies. Phase C and item 5 were both done on a CPU-only
+  machine again, though (`device_view` correctness is fully checkable via
+  `KA.CPU()` and plain field/dispatch comparisons — no CUDA hardware needed
+  until item 6's kernel twin actually launches on `CUDABackend()`).
