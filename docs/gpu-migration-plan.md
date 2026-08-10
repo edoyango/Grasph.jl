@@ -539,6 +539,16 @@ to coloured for all 13 scripts, and no script's behavior changed.
   fully-absolute `--project=`/script paths for any one-shot remote command,
   or the failure looks like a broken environment when it's actually just the
   wrong `pwd`.
+- **CUDA 13 dropped Volta (`sm_70`) `ptxas` support** (confirmed on NCI
+  Gadi's V100 nodes, item 13's V100 run): a shared `~/.julia` depot that
+  already resolved `CUDA_Runtime_jll` to 13.x while setting up a newer GPU
+  (Ampere/Hopper) will fail on Volta with `ptxas fatal: Value 'sm_70' is
+  not defined for option 'gpu-name'` the first time a KA kernel compiles.
+  Fix on a login node (needs internet to fetch the older toolkit):
+  `julia --project=<env> -e 'using CUDA; CUDA.set_runtime_version!(v"12.6")'`
+  — 12.6 still supports Ampere/Hopper, so pinning it doesn't regress an
+  environment also shared with A100/H200 work. The pin lives in that
+  environment's `LocalPreferences.toml`, not the depot globally.
 
 ## Next steps, in priority order
 
@@ -1456,15 +1466,18 @@ to coloured for all 13 scripts, and no script's behavior changed.
     coloured sweep's grid-pitch handling, are also explicitly out of scope —
     see the constructor guards above.
 
-13. **Server hardware validation (A100 + H200) — done.** `docs/server-
+13. **Server hardware validation (A100 + V100 + H200) — done.** `docs/server-
     handoff-2026-08-10.md` handed off one open question: items 11 and 12
     were measured only on the RTX 4060 Laptop, and both conclusions rest on
     that GPU having no FP64 compute edge over its own CPU and a
     ~8.3µs/launch overhead floor. Does that story hold on server hardware
     with a real compute/bandwidth edge and far more VRAM headroom? The
-    handoff was picked up independently, same day, on two different
-    machines — results below are merged from both rather than kept as
-    separate docs, so they can be compared directly instead of read apart.
+    handoff was originally picked up independently, same day, on two
+    different machines (A100, H200) — a third machine (V100) was added in a
+    follow-up session on request, extending coverage to three GPU
+    generations. Results below are merged from all three rather than kept
+    as separate docs, so they can be compared directly instead of read
+    apart.
 
     _**A100 run**: `mlerp-monash-node05` (Slurm job 158888, `BigCats`
     partition): NVIDIA **A100-PCIE-40GB** (sm_80, ECC on, persistence mode
@@ -1480,6 +1493,22 @@ to coloured for all 13 scripts, and no script's behavior changed.
     depot the compute node (`gadi-gpu-h200-0017`) then read with no further
     network access needed — see "Environment notes" above for the gotcha
     this surfaced (SSH one-shot commands landing in the wrong directory)._
+
+    _**V100 run**: NCI Gadi, PBS job `175894283` (`gpuvolta` queue): NVIDIA
+    **Tesla V100-SXM2-32GB** (Volta/sm_70), 12 allocated CPUs (Intel Xeon
+    Platinum 8268 @ 2.90GHz), 64GB RAM, driver 580.173.02. Same login/
+    compute split as the H200 run, same shared NFS `~/.julia` depot. One
+    additional wrinkle this surfaced: that depot's `benchenv` had already
+    resolved `CUDA_Runtime_jll` to 13.3 while setting up for the H200, and
+    **CUDA 13 dropped `ptxas` support for Volta (`sm_70`)** —
+    `dambreak_scaling.jl` failed immediately with `ptxas fatal: Value
+    'sm_70' is not defined for option 'gpu-name'` on first kernel launch.
+    Fixed on the login node with `CUDA.set_runtime_version!(v"12.6")`
+    against `benchenv` (writes a `LocalPreferences.toml`, downloads the
+    older toolkit — needs internet, hence login node, not compute node);
+    12.6 still supports Ampere/Hopper, so this doesn't regress the A100/H200
+    paths sharing the same depot. See "Environment notes for the next
+    machine move" below._
 
     **Test suite**, reconfirmed before trusting any timing on either machine:
 
@@ -1531,8 +1560,8 @@ to coloured for all 13 scripts, and no script's behavior changed.
     can't be checked). Whatever the cause, both effects push the same way:
     more launches are, if anything, more expensive on server hardware, and
     halving arithmetic is worth even less when compute is already this
-    cheap — which is exactly what both machines' `col/1s` numbers below
-    show.
+    cheap — which is exactly what all three server GPUs' `col/1s` numbers
+    below show.
 
     **Thread count matters more than the laptop numbers can settle.** Nothing
     in this repo sets `Threads.nthreads()` (Julia defaults to 1), so on the
@@ -1549,29 +1578,34 @@ to coloured for all 13 scripts, and no script's behavior changed.
     scattered cell-list access pattern, not the embarrassingly-parallel
     compute-bound loop the microbenchmark measures.
 
-    **Three machines, one tie point** (`nfx = 450`, `n_fluid = 202,500` —
+    **Four machines, one tie point** (`nfx = 450`, `n_fluid = 202,500` —
     the laptop's own ceiling, and a size every run tested):
 
     | machine | cores | cpu_col µs | cpu_1s µs | gpu_1s µs | gpu_col µs | gpu_1s+skin µs | col/1s | skin/1s |
     |---|---|---|---|---|---|---|---|---|
     | RTX 4060 Laptop | unrecorded | 29,141.5 | 55,450.5 | 17,083.8 | 11,514.8 | 17,154.6 | 0.672 | 1.004 |
     | A100 | 26 | 16,080.9 | 21,328.5 | 3,518.6  | 6,414.7  | 1,325.6  | 1.823 | 0.377 |
+    | V100 | 12 | 15,429.0 | 21,414.3 | 2,857.9  | 7,855.7  | 1,324.0  | 2.749 | 0.463 |
     | H200 | 12 | 30,522.9 | 51,981.1 | 1,576.6  | 5,040.5  | 856.2    | 3.197 | 0.543 |
 
-    `gpu_1s` falls monotonically (17,084 → 3,519 → 1,577µs) and `col/1s`
-    *rises* monotonically (0.672 → 1.823 → 3.197) as the GPU class improves
-    laptop → A100 → H200 — the single cleanest confirmation that
-    `ColouredKA`'s problem is structural, not laptop-specific: every step up
-    in raw GPU power makes the 15-launches-vs-2 gap matter *more*, not less.
-    `skin/1s` stays solidly below 1.0 on both server GPUs (0.377, 0.543) —
-    both a clear improvement on the laptop's 1.004 breakeven at this exact
-    size. That said, the A100-vs-H200 gap here (44% relative) is larger than
-    either machine's own internal run-to-run noise (~15-25% on the A100,
-    ~10% on the H200 — see below), so unlike the `col/1s` trend this one
-    specific comparison shouldn't be over-read as another clean monotonic
-    step; it may be a real difference in the two GPUs' sort/memory-subsystem
-    behavior under the skin-caching path, not (only) noise, but this item
-    didn't isolate which.
+    `gpu_1s` falls from the laptop's 17,084µs to three much closer server-GPU
+    figures — 3,519µs (A100), 2,858µs (V100), 1,577µs (H200) — and `col/1s`
+    rises from the laptop's 0.672 through 1.823 (A100) and 2.749 (V100) to
+    3.197 (H200). The `col/1s` climb is monotonic across all three server
+    GPUs and is the single cleanest confirmation that `ColouredKA`'s problem
+    is structural, not laptop-specific: every step up in raw GPU power makes
+    the 15-launches-vs-2 gap matter *more*, not less. `gpu_1s` itself is
+    *not* quite monotonic with a naive "GPU generation" ordering — the V100
+    (Volta, 2017) edges out the newer A100 here (2,858 vs 3,519µs), even
+    though A100 has substantially more memory bandwidth and SMs on paper.
+    That gap (~23%) sits right at the ~15-25% run-to-run noise band
+    `us_per_step`'s single-warmup-then-timed-pass design already produces
+    (see below), so it reads as most likely noise rather than a genuine
+    "V100 beats A100" result — but it means `gpu_1s` alone isn't as clean a
+    monotonic story as `col/1s` is. `skin/1s` stays solidly below 1.0 on all
+    three server GPUs (0.377 A100, 0.463 V100, 0.543 H200) — a clear
+    improvement on the laptop's 1.004 breakeven at this exact size, though
+    (same noise caveat) the exact values shouldn't be over-read past ~±20%.
 
     **A100 default sizes** (`nfx` = 50/100/200/320/450 → `n_fluid` = 2,500 to
     202,500 — the laptop's full tested range), Run A (`-t 1`):
@@ -1649,21 +1683,51 @@ to coloured for all 13 scripts, and no script's behavior changed.
     | 1000 | 1,000,000 | 137,584.6 | 236,786.0 | 5,231.7 | 7,818.8  | 2,537.9 | 1.494 | 0.485 |
     | 1300 | 1,690,000 | 229,661.9 | 405,445.5 | 8,221.9 | 11,548.8 | 3,910.0 | 1.405 | 0.476 |
 
-    **Item 11's crossover does not reappear on either server GPU — it gets
-    pushed off the entire tested range, and further off on the faster GPU.**
-    The laptop crossed `col/1s < 1.0` at its largest size, `n_fluid =
-    202,500` (`col/1s = 0.672`). On the A100, `col/1s` falls monotonically
-    across the extended run's five points as `n_fluid` grows — 2.252 → 1.582
-    → 1.422 → 1.415 → 1.332 — but is still comfortably above 1.0 at
-    3,240,000 particles. On the H200 the same pattern holds even more
-    strongly at small sizes (4.687 → 5.945 → 5.461 → 4.603 → 3.197 by
-    `n_fluid = 202,500`, i.e. `ColouredKA` loses by up to ~5.9× rather than
-    the A100's ~3.6×) and settles at 1.405 by 1,690,000 particles, still above
-    1.0. This directly answers the handoff's question on both machines: **no,
-    the crossover does not move to a smaller `n_fluid` on server hardware; if
+    **V100 default sizes** (same five sizes, 12 allocated cores, CUDA
+    runtime pinned to 12.6 — see the environment note above):
+
+    | nfx | n_fluid | cpu_col µs | cpu_1s µs | gpu_1s µs | gpu_col µs | gpu_1s+skin µs | col/1s | skin/1s |
+    |---|---|---|---|---|---|---|---|---|
+    | 50  | 2,500   | 200.8    | 233.8    | 1,172.8 | 4,458.7 | 517.4  | 3.802 | 0.441 |
+    | 100 | 10,000  | 716.1    | 995.5    | 1,358.0 | 5,263.0 | 755.4  | 3.876 | 0.556 |
+    | 200 | 40,000  | 3,884.7  | 5,806.4  | 1,592.5 | 5,484.9 | 584.0  | 3.444 | 0.367 |
+    | 320 | 102,400 | 8,564.5  | 12,705.5 | 2,089.2 | 6,462.4 | 919.6  | 3.093 | 0.440 |
+    | 450 | 202,500 | 15,429.0 | 21,414.3 | 2,857.9 | 7,855.7 | 1,324.0| 2.749 | 0.463 |
+
+    **V100 extended sizes** (`--sizes 450,600,800,1000,1300`, matching the
+    H200 run exactly for direct comparison; up to 1,690,000 particles with
+    no CUDA out-of-memory issues on this card's 32GB — comfortably inside
+    the same linear-in-`n`, ~54MB-at-the-top-end grid memory footprint the
+    A100 extended run's scale-safety review already established):
+
+    | nfx | n_fluid | cpu_col µs | cpu_1s µs | gpu_1s µs | gpu_col µs | gpu_1s+skin µs | col/1s | skin/1s |
+    |---|---|---|---|---|---|---|---|---|
+    | 450  | 202,500   | 14,629.4  | 20,937.7  | 3,094.2  | 7,828.5  | 1,379.5 | 2.530 | 0.446 |
+    | 600  | 360,000   | 24,309.2  | 32,024.7  | 4,878.0  | 10,643.6 | 2,305.8 | 2.182 | 0.473 |
+    | 800  | 640,000   | 39,077.2  | 51,040.8  | 8,703.8  | 18,120.6 | 3,961.7 | 2.082 | 0.455 |
+    | 1000 | 1,000,000 | 69,185.3  | 83,617.7  | 11,986.8 | 29,421.1 | 5,603.7 | 2.454 | 0.467 |
+    | 1300 | 1,690,000 | 116,528.6 | 147,080.4 | 24,132.4 | 53,693.8 | 9,363.2 | 2.225 | 0.388 |
+
+    **Item 11's crossover does not reappear on any of the three server
+    GPUs — it gets pushed off the entire tested range on all of them.** The
+    laptop crossed `col/1s < 1.0` at its largest size, `n_fluid = 202,500`
+    (`col/1s = 0.672`). On the A100, `col/1s` falls monotonically across the
+    extended run's five points as `n_fluid` grows — 2.252 → 1.582 → 1.422 →
+    1.415 → 1.332 — but is still comfortably above 1.0 at 3,240,000
+    particles. On the V100, `col/1s` stays in a tighter 2.08-2.53 band
+    across the same extended range without as clean a monotonic trend
+    (2.530 → 2.182 → 2.082 → 2.454 → 2.225 — likely the same run-to-run
+    noise flagged elsewhere in this item), but never comes close to 1.0
+    either. On the H200 the same pattern holds even more strongly at small
+    sizes (4.687 → 5.945 → 5.461 → 4.603 → 3.197 by `n_fluid = 202,500`,
+    i.e. `ColouredKA` loses by up to ~5.9× rather than the A100's ~3.6×) and
+    settles at 1.405 by 1,690,000 particles, still above 1.0. This directly
+    answers the handoff's question on all three machines: **no, the
+    crossover does not move to a smaller `n_fluid` on server hardware; if
     anything `ColouredKA` is further from paying off than on the laptop, and
-    further still on the faster of the two server GPUs** — exactly the
-    monotonic trend the three-way tie-point table above shows directly. The
+    further still on H200, the fastest of the three server GPUs tested** —
+    exactly the monotonic trend the four-way tie-point table above shows
+    directly for `col/1s`. The
     likely reason isn't just launch overhead (which item 2's mechanism alone
     would predict shrinking in relative terms as compute gets cheaper) — a
     scale-safety review that preceded the A100 extended run found
@@ -1671,25 +1735,27 @@ to coloured for all 13 scripts, and no script's behavior changed.
     in the fluid bounding box regardless of whether a boundary particle is
     actually nearby (`src/KAKernels.jl`, coupled colour loop), so it carries
     a fixed per-cell tax that `OnesidedKA`'s per-particle traversal doesn't
-    pay — consistent with both machines' ratios flattening out well above
-    1.0 instead of continuing to fall toward it. **`ColouredKA` remains
-    correctly out of scope for every script** — this item does not change
-    item 11's "not wired into any script" conclusion; both independent runs
-    reinforce it.
+    pay — consistent with all three machines' ratios flattening out well
+    above 1.0 instead of continuing to fall toward it. **`ColouredKA`
+    remains correctly out of scope for every script** — this item does not
+    change item 11's "not wired into any script" conclusion; all three
+    independent runs reinforce it.
 
-    **Item 12's skin caching does not taper off on either machine — it stays
-    a clear win across the entire tested range.** The laptop's `skin/1s`
-    crossed *above* 1.0 (stopped helping) around `n_fluid = 100,000` and sat
-    at breakeven (1.004) by 202,500. On the A100 it never leaves the
-    0.36-0.57 band across all three A100 runs, all the way to 3,240,000
-    particles. On the H200 it stays in a near-identical 0.41-0.66 band all
-    the way to 1,690,000. Both machines show a consistent 1.5-2.8× speedup
-    at every tested size, not just the small ones the laptop's own benefit
-    was concentrated in. This also directly answers the handoff's question,
-    in the direction items 2/11's own reasoning would predict: removing
-    launches is worth *more*, not less, when the hardware's per-launch floor
-    is a bigger share of an otherwise-cheaper step — true on both server
-    GPUs, independently measured.
+    **Item 12's skin caching does not taper off on any of the three
+    machines — it stays a clear win across the entire tested range.** The
+    laptop's `skin/1s` crossed *above* 1.0 (stopped helping) around
+    `n_fluid = 100,000` and sat at breakeven (1.004) by 202,500. On the A100
+    it never leaves the 0.36-0.57 band across all three A100 runs, all the
+    way to 3,240,000 particles. On the V100 it stays in a similar 0.39-0.47
+    band across the same extended range. On the H200 it stays in a
+    near-identical 0.41-0.66 band all the way to 1,690,000. All three server
+    GPUs show a consistent ~1.5-2.8× speedup at every tested size, not just
+    the small ones the laptop's own benefit was concentrated in. This also
+    directly answers the handoff's question, in the direction items 2/11's
+    own reasoning would predict: removing launches is worth *more*, not
+    less, when the hardware's per-launch floor is a bigger share of an
+    otherwise-cheaper step — true on all three server GPUs, independently
+    measured.
 
     **The CPU-vs-GPU crossover (item 2) moved on every configuration tested,
     but for two different reasons that happen to land on similar numbers.**
@@ -1700,15 +1766,24 @@ to coloured for all 13 scripts, and no script's behavior changed.
     40,000` — the same point item 2 found on the laptop; whether that is a
     real coincidence or an artifact of the laptop measurement having used a
     similar effective thread count isn't knowable from the original doc,
-    which never recorded `Threads.nthreads()`. On the H200 (12 cores
-    throughout), the crossover also lands at `n_fluid ≈ 10,000` — but this
+    which never recorded `Threads.nthreads()`. On the V100 (12 cores
+    throughout, the job's full allocation), the crossover also lands at
+    `n_fluid ≈ 40,000` — matching the laptop and the A100's `-t 26` run, but
+    for neither of those runs' specific reason: the V100's CPU baseline (a
+    normal 12-core allocation, not artificially starved like the A100 `-t
+    1` case) and its GPU (`gpu_1s` 1,592.5µs at this size — faster than a
+    laptop GPU, nowhere near H200's edge) both land in an unremarkable
+    middle ground that happens to reproduce the same number two different
+    extremes landed on elsewhere. On the H200 (12 cores throughout), the
+    crossover also lands at `n_fluid ≈ 10,000` — but this
     time because the GPU itself is dramatically faster (`gpu_1s` at
     `n_fluid=202,500` is 1,576.6µs vs. the A100 `-t 26` run's 3,518.6µs),
     against a CPU baseline in the same ballpark as the laptop's, not because
-    the CPU side is weak. Same resulting number, opposite mechanism from the
-    A100 `-t 1` case — a reminder that `col/1s`/`skin/1s` (GPU-vs-GPU ratios,
-    immune to CPU thread count entirely) are the more reliable numbers to
-    compare across machines than any CPU-involving crossover point.
+    the CPU side is weak. Three different mechanisms landing on two
+    crossover values — a reminder that `col/1s`/`skin/1s` (GPU-vs-GPU
+    ratios, immune to CPU thread count entirely) are the more reliable
+    numbers to compare across machines than any CPU-involving crossover
+    point.
 
     **Not built or changed**: no script's default changed, `ColouredKA`
     remains reachable only via the internal `mode` override (item 11's scope
@@ -1716,15 +1791,83 @@ to coloured for all 13 scripts, and no script's behavior changed.
     is measurement and documentation only. `bench/dambreak_scaling.jl` gained
     a provenance header (thread count, CPU model, GPU name, CUDA.jl version)
     so future runs are self-describing; its CSV schema is unchanged. Running
-    `bench/gpu_microbench.jl` on the H200 (no equivalent numbers exist yet)
-    is natural, unstarted follow-up work. `bench-output/*.csv`/`*.log` from
-    both sessions are gitignored, not committed — re-run the commands above
-    (merged environment, same as item 2) to reproduce either machine's
-    numbers. The H200 run was originally written up as a separate
+    `bench/gpu_microbench.jl` on the H200 or V100 (no equivalent numbers
+    exist yet for either) is natural, unstarted follow-up work.
+    `bench-output/*.csv`/`*.log` from all three sessions are gitignored, not
+    committed — re-run the commands above (merged environment, same as item
+    2) to reproduce any machine's numbers. The H200 run was originally
+    written up as a separate
     freestanding doc (`docs/h200-benchmark-results-2026-08-10.md`); its full
     content is preserved here and the standalone file was removed to keep one
     canonical record instead of two differently-shaped ones — see git history
     for the original if the raw, unmerged version is ever needed.
+
+14. **Real-workload GPU validation (`bubble3.jl`, H200 + V100) — done.**
+    Items 11-13 all measure `dambreak_scaling.jl`'s synthetic single/coupled-
+    interaction shape. Does the GPU speedup hold on an actual production
+    script — `bubble3.jl` (two-phase bubble-rise, XSPH + artificial surface
+    tension, 4 `SystemInteraction`s including a ghost boundary, 37,500
+    particles: 35,524 fluid-X + 1,976 fluid-Y), run end-to-end rather than
+    step-timed in isolation? Run on both PBS job `175894287` (H200) and job
+    `175894283` (V100), same NCI Gadi allocations as item 13, no source
+    changes needed — `bubble3.jl` already supports `GRASPH_BACKEND=cuda`
+    (see its own header) and `run_driver!`'s `--run-steps`/
+    `--non-interactive`/`--output-prefix none` CLI flags (`src/Driver.jl`)
+    already covered everything this needed.
+
+    **Method**: wall-clock the whole `julia ... bubble3.jl --run-steps N
+    --non-interactive --output-prefix none` process (shell `time`, around
+    each `ssh <compute-node>` invocation) at two step counts per backend
+    (`N=200`, `N=3000`) and fit a line — the slope is the steady-state
+    per-step cost once every kernel/method has compiled at least once (all
+    of them do, within the first ~100 steps, confirmed via a smoke-test
+    run); the intercept lumps together everything that's a one-time cost
+    regardless of step count: Julia startup, package precompilation, and —
+    for the GPU backend specifically — every distinct KA kernel's
+    first-launch PTX/SASS compile. This is deliberately different from
+    `dambreak_scaling.jl`'s `us_per_step` (single warmup pass then a single
+    timed pass, no fixed-cost/steady-state separation) because a
+    60,000-step production run's fixed cost is negligible, but a 200-step
+    smoke test's isn't — conflating the two would make either the GPU look
+    artificially slow (short run swamped by warm-up) or hide a real
+    per-step difference (implicitly assuming the fixed cost scales with
+    `N`, which it doesn't).
+
+    | | 12 cores (H200 job) | H200 GPU | 12 cores (V100 job) | V100 GPU |
+    |---|---|---|---|---|
+    | Steady-state cost/step | 7.5 ms | 3.3 ms | 8.4 ms | 4.2 ms |
+    | Fixed warm-up (intercept) | ~13.3 s | ~44.5 s | ~20.3 s | ~53.1 s |
+    | Wall-clock, 200 steps | 14.8 s | 45.2 s | 22.0 s | 54.0 s |
+    | Wall-clock, 3000 steps | 35.7 s | 54.4 s | 45.6 s | 65.7 s |
+    | Break-even step count | ~7,400 | | ~7,730 | |
+    | Projected @ 60,000 steps (script's actual default) | ~463 s | ~242 s | ~527 s | ~305 s |
+
+    (The two jobs' CPU steady-state costs differ — 7.5ms vs 8.4ms/step —
+    because they land on different physical node types, `gpuhopper-exec`'s
+    vs `gpuvolta`'s CPU allocation, not because of anything GPU-related;
+    item 13's own `dambreak_scaling.jl` provenance header independently
+    confirms the V100 job's CPU as an Intel Xeon Platinum 8268.)
+
+    **GPU wins end-to-end at the script's real 60,000-step default on both
+    cards** — 1.9× on H200, 1.73× on V100 — despite paying a warm-up cost
+    3-4× larger than the CPU backend's own Julia-startup-only fixed cost.
+    Below the ~7,400-7,730-step break-even, plain CPU actually finishes
+    *sooner* in wall-clock terms purely because of that warm-up tax — a
+    result `dambreak_scaling.jl`'s step-timing methodology structurally
+    cannot see, since it explicitly discards a warmup pass before timing.
+    Both cards' per-step GPU-vs-CPU ratio here (2.0-2.3×) is far smaller
+    than `dambreak_scaling.jl`'s own `gpu_1s`-vs-`cpu_col` ratio at a
+    comparable particle count (item 13's tie point: ~19.4× on H200, ~5.4×
+    on V100) — expected, since `bubble3.jl` spends much of its per-step
+    budget on ghost regeneration, XSPH, and sorting across 4 interactions,
+    work that doesn't offload to GPU as cleanly as a single bare
+    fluid-fluid sweep.
+
+    **Not built or changed**: no source change, benchmark-only, same as item
+    13. No CSV/committed script artifact — the wall-clock numbers came from
+    `time` around each `ssh` invocation using the existing driver CLI, not a
+    new benchmark script; the raw `*.log`/`*.time` files live under a
+    scratch directory outside the repo, not `bench-output/`.
 
 ## Explicitly deferred (not started, not part of the current scope)
 
