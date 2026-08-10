@@ -185,26 +185,37 @@ precision, multi-GPU/MPI/ORB. None of those were touched this session and
 none depend on what you're about to measure — they're independent future
 work, not blocked on this handoff.
 
-## Status: executed (2026-08-10, same day)
+## Status: executed (2026-08-10, same day, on two machines independently)
 
-This handoff was picked up the same day it was written, on an A100-PCIE-40GB
-Slurm node (`mlerp-monash-node05`). Full results are `docs/gpu-migration-
-plan.md` item 13; short version:
+This handoff was picked up the same day it was written — twice,
+independently, on an A100-PCIE-40GB Slurm node (`mlerp-monash-node05`) and
+an NCI Gadi H200 node (PBS job `175894287`). Both runs reached the same
+conclusions; full merged results (including the H200 run, originally a
+separate `docs/h200-benchmark-results-2026-08-10.md` that has since been
+folded in here to keep one canonical record) are `docs/gpu-migration-
+plan.md` item 13. Short version:
 
-- **Item 11's crossover didn't move to a smaller `n_fluid` — it disappeared
-  from the entire tested range.** `col/1s` stays above 1.0 all the way to
-  3,240,000 particles (16× past the laptop's 202,500 ceiling), where the
-  laptop had already crossed below 1.0 at its own top size. `ColouredKA`
-  stays correctly unwired from every script.
-- **Item 12's skin caching didn't taper off — it stayed a 1.8-2.8× win at
-  every tested size**, never approaching the laptop's ~100,000-particle
-  breakeven.
+- **Item 11's crossover didn't move to a smaller `n_fluid` on either
+  machine — it disappeared from the entire tested range, and further so on
+  the faster GPU.** `col/1s` stays above 1.0 all the way to 3,240,000
+  particles on the A100 (16× past the laptop's 202,500 ceiling) and to
+  1,690,000 on the H200 (8.3×), where the laptop had already crossed below
+  1.0 at its own top size. At the one size all three machines share
+  (`n_fluid = 202,500`), `col/1s` rises monotonically as the GPU gets
+  faster — 0.672 (laptop) → 1.823 (A100) → 3.197 (H200) — the cleanest
+  single number in the whole exercise. `ColouredKA` stays correctly
+  unwired from every script.
+- **Item 12's skin caching didn't taper off on either machine — it stayed a
+  1.5-2.8× win at every tested size**, never approaching the laptop's
+  ~100,000-particle breakeven.
 - The mechanism differs from what this doc speculated: kernel-launch
   overhead measured *higher* on the A100 (38-40µs) than the laptop's ~8.3µs,
-  not lower — but the A100 also has a ~38× FP64 compute edge the laptop
-  never had, so both effects push the same direction anyway. See item 13's
-  microbenchmark table (`bench/gpu_microbench.jl`, new) for the numbers.
-- `Pkg.test()` reconfirmed 1691/1691 on sm_80 before any timing was trusted.
+  not lower — but both server GPUs also have a large FP64 compute edge the
+  laptop never had (~38× the laptop GPU's own throughput, on the A100), so
+  both effects push the same direction anyway. See item 13's microbenchmark
+  table (`bench/gpu_microbench.jl`, new, A100 only so far) for the numbers.
+- `Pkg.test()` reconfirmed 1691/1691 on both sm_80 (A100) and sm_90 (H200)
+  before any timing was trusted on either machine.
 - The `julia_version` pin cited above as `1.12.6` was a miscitation —
   `Manifest.toml` actually pins `1.12.5`; corrected in item 13's edit to the
   "Environment notes" section.
