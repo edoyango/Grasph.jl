@@ -184,3 +184,27 @@ Morton/Z-order sort keys, an explicit neighbour list, Float32/mixed
 precision, multi-GPU/MPI/ORB. None of those were touched this session and
 none depend on what you're about to measure — they're independent future
 work, not blocked on this handoff.
+
+## Status: executed (2026-08-10, same day)
+
+This handoff was picked up the same day it was written, on an A100-PCIE-40GB
+Slurm node (`mlerp-monash-node05`). Full results are `docs/gpu-migration-
+plan.md` item 13; short version:
+
+- **Item 11's crossover didn't move to a smaller `n_fluid` — it disappeared
+  from the entire tested range.** `col/1s` stays above 1.0 all the way to
+  3,240,000 particles (16× past the laptop's 202,500 ceiling), where the
+  laptop had already crossed below 1.0 at its own top size. `ColouredKA`
+  stays correctly unwired from every script.
+- **Item 12's skin caching didn't taper off — it stayed a 1.8-2.8× win at
+  every tested size**, never approaching the laptop's ~100,000-particle
+  breakeven.
+- The mechanism differs from what this doc speculated: kernel-launch
+  overhead measured *higher* on the A100 (38-40µs) than the laptop's ~8.3µs,
+  not lower — but the A100 also has a ~38× FP64 compute edge the laptop
+  never had, so both effects push the same direction anyway. See item 13's
+  microbenchmark table (`bench/gpu_microbench.jl`, new) for the numbers.
+- `Pkg.test()` reconfirmed 1691/1691 on sm_80 before any timing was trusted.
+- The `julia_version` pin cited above as `1.12.6` was a miscitation —
+  `Manifest.toml` actually pins `1.12.5`; corrected in item 13's edit to the
+  "Environment notes" section.

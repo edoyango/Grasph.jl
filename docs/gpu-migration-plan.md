@@ -280,6 +280,13 @@ around 40,000 particles, past which the GPU wins by a growing margin. So the
 doesn't generalize to "this GPU is never worth it" — that would have been
 the wrong conclusion to draw from the small-scale-only smoke test.
 
+_(Update, item 13: this whole paragraph is laptop-specific and does not hold
+on server hardware. On a real datacenter GPU — A100-PCIE-40GB — there is a
+large FP64 compute edge over the host CPU, ~38× the laptop GPU's own
+measured throughput, on top of the bandwidth edge. See item 13 for the
+numbers and for how items 11/12's conclusions do, and don't, change as a
+result.)_
+
 **Scope**: a vertical slice — `dambreak.jl` (2D) fully GPU-resident
 end-to-end (sort → grid → sweep → state update → integrator), gated behind
 `GRASPH_BACKEND=cuda` (default `cpu`, zero behaviour change otherwise).
@@ -509,7 +516,8 @@ to coloured for all 13 scripts, and no script's behavior changed.
 ### Environment notes for the next machine move
 
 - A fresh checkout needs `Pkg.Registry.update()` before `Pkg.instantiate()`/
-  `Pkg.test()` — the committed `Manifest.toml` pins `julia_version = "1.12.6"`
+  `Pkg.test()` — the committed `Manifest.toml` pins `julia_version = "1.12.5"`
+  (this doc previously miscited this as `1.12.6` — corrected, item 13)
   and an `Adapt` version the local registry cache didn't have yet, producing
   an "Unsatisfiable requirements" error that looks like a real dependency
   conflict but is just a stale registry.
@@ -1437,6 +1445,173 @@ to coloured for all 13 scripts, and no script's behavior changed.
     entirely. Ghost/virtual-aware staleness tracking, and any change to the
     coloured sweep's grid-pitch handling, are also explicitly out of scope —
     see the constructor guards above.
+
+13. **Server hardware validation (A100) — done.** `docs/server-handoff-
+    2026-08-10.md` handed off one open question: items 11 and 12 were
+    measured only on the RTX 4060 Laptop, and both conclusions rest on that
+    GPU having no FP64 compute edge over its own CPU and a ~8.3µs/launch
+    overhead floor. Does that story hold on server hardware with a real
+    compute/bandwidth edge and far more VRAM headroom?
+
+    _Measured on `mlerp-monash-node05` (Slurm job 158888, `BigCats`
+    partition): NVIDIA **A100-PCIE-40GB** (sm_80, ECC on, persistence mode
+    on), 26 allocated Intel Xeon (Icelake) cores of a 52-core node, Julia
+    1.12.6, CUDA.jl 5.8.5 (the same version the resolver settled on for the
+    laptop — see "Environment notes" above). `Pkg.test()` reconfirmed
+    **1691/1691** on this hardware before any timing was trusted — this item
+    changes no source code, only `bench/` and this doc._
+
+    **The microbenchmark numbers item 2 quoted were never turned into a
+    script or committed.** `bench/gpu_microbench.jl` (new this item) fixes
+    that — measuring launch overhead, FP64 FMA throughput (device and host),
+    and device bandwidth directly, instead of inferring them from step
+    timings:
+
+    | | RTX 4060 Laptop (item 2) | A100 node (this item) | ratio |
+    |---|---|---|---|
+    | launch overhead | ~8.3 µs | 38-40 µs | 4.6-4.8× **higher** |
+    | GPU FP64 FMA | 0.138 TFLOP/s | 5.24-5.25 TFLOP/s | ~38× |
+    | GPU memory bandwidth | 216 GB/s | ~1400 GB/s | ~6.5× |
+    | CPU FP64 FMA (multi-core) | 0.143-0.311 TFLOP/s (16-core, thread count unrecorded) | 0.1331 TFLOP/s (26-core) | roughly comparable |
+
+    (`launch_us`: near-zero-work KA kernel, `ndrange=1`, 2000 synchronized
+    reps, same `@kernel`/launch path the real sweep kernels use — not a raw
+    CUDA-API lower bound. `gpu_tflops`/`cpu_tflops`: chained-FMA kernel, 8
+    independent accumulators per thread so a single CPU thread measures
+    pipelined throughput rather than FMA *latency* — the GPU kernel needed no
+    such fix, since thousands of concurrent threads already hide one
+    another's latency the same way. `gpu_gb_s`: STREAM-triad-style kernel.)
+
+    **The laptop's defining fact — no FP64 compute edge over its own CPU —
+    does not hold here.** The A100 has both the bandwidth edge the laptop
+    also had (~6.5×) and a large compute edge it never had (~38× the laptop
+    GPU's own throughput). **Launch overhead moved the "wrong" way for the
+    hypothesis that server hardware would fix `ColouredKA`'s crossover** — it
+    is *higher* here, not lower, though the two figures were never guaranteed
+    to be methodologically comparable (item 2's number came from an ad hoc
+    script that was never committed, so its exact methodology can't be
+    checked). Whatever the cause, both effects push the same way: more
+    launches are, if anything, more expensive here, and halving arithmetic is
+    worth even less when compute is already this cheap.
+
+    **Thread count matters more than the laptop numbers can settle.** Nothing
+    in this repo sets `Threads.nthreads()` (Julia defaults to 1), so
+    `bench/dambreak_scaling.jl` was run twice — `-t 1` and `-t 26` (this
+    job's full Slurm CPU allocation) — to bracket whichever thread count the
+    laptop numbers actually used, which the original doc does not record.
+    The CPU-FMA microbenchmark shows the honest cost of not knowing: 0.0101
+    TFLOP/s at 1 thread vs. 0.1331 TFLOP/s at 26 (13.2× from 26× the threads,
+    ~51% parallel efficiency) — but the real `cpu_col`/`cpu_1s` sweep columns
+    below scale far worse at their own largest size (`n_fluid = 202,500`:
+    3.74×/4.85× from the same 26×, 14-19% efficiency), because the SPH sweep
+    is memory-bandwidth-bound with a scattered cell-list access pattern, not
+    the embarrassingly-parallel compute-bound loop the microbenchmark
+    measures.
+
+    **Default sizes** (`nfx` = 50/100/200/320/450 → `n_fluid` = 2,500 to
+    202,500 — the laptop's full tested range), Run A (`-t 1`):
+
+    | nfx | n_fluid | cpu_col µs | cpu_1s µs | gpu_1s µs | gpu_col µs | gpu_1s+skin µs | col/1s | skin/1s |
+    |---|---|---|---|---|---|---|---|---|
+    | 50  | 2,500   | 668.4    | 1,195.6  | 1,416.5 | 4,386.0 | 746.3   | 3.096 | 0.527 |
+    | 100 | 10,000  | 2,753.2  | 4,713.9  | 1,625.8 | 5,790.3 | 591.7   | 3.561 | 0.364 |
+    | 200 | 40,000  | 13,284.9 | 23,084.0 | 1,792.6 | 6,327.9 | 645.8   | 3.530 | 0.360 |
+    | 320 | 102,400 | 32,782.1 | 55,955.4 | 2,214.4 | 6,162.2 | 860.8   | 2.783 | 0.389 |
+    | 450 | 202,500 | 60,180.9 | 103,402.1| 3,434.6 | 6,287.1 | 1,262.3 | 1.830 | 0.368 |
+
+    Run B (`-t 26`, this job's full CPU allocation — the realistic server
+    baseline):
+
+    | nfx | n_fluid | cpu_col µs | cpu_1s µs | gpu_1s µs | gpu_col µs | gpu_1s+skin µs | col/1s | skin/1s |
+    |---|---|---|---|---|---|---|---|---|
+    | 50  | 2,500   | 380.8    | 370.4    | 1,639.5 | 4,577.9 | 810.1   | 2.792 | 0.494 |
+    | 100 | 10,000  | 1,024.3  | 1,150.3  | 1,608.6 | 5,735.9 | 675.0   | 3.566 | 0.420 |
+    | 200 | 40,000  | 4,431.2  | 5,825.5  | 1,877.9 | 5,878.0 | 760.4   | 3.130 | 0.405 |
+    | 320 | 102,400 | 10,898.1 | 14,047.4 | 2,315.1 | 6,103.2 | 906.1   | 2.636 | 0.391 |
+    | 450 | 202,500 | 16,080.9 | 21,328.5 | 3,518.6 | 6,414.7 | 1,325.6 | 1.823 | 0.377 |
+
+    GPU columns agree between Run A and Run B to within ~15% at every size
+    (expected — host thread count shouldn't affect device work; the residual
+    is timing noise from `us_per_step`'s single warmup-pass-then-timed-pass
+    design, with no repeated-trial averaging). `col/1s` and `skin/1s` tell
+    the same story in both runs regardless of that noise, which is the point
+    of running both.
+
+    **Extended sizes** (`nfx` = 450/640/900/1273/1800 → `n_fluid` = 202,500
+    to 3,240,000 — up to 16× past the laptop's ceiling, `-t 26`,
+    `--budget 5e7` to keep step counts off their floor at the top end; a
+    scale-safety review of index widths, grid memory, and KA launch sizing
+    preceded this run and found no correctness risk this far out — indices
+    are all `Int`/`UInt64` with 2-3 orders of magnitude of headroom, and grid
+    memory stays linear in particle count, ~54 MB of cell-list arrays at the
+    top size):
+
+    | nfx | n_fluid | cpu_col µs | cpu_1s µs | gpu_1s µs | gpu_col µs | gpu_1s+skin µs | col/1s | skin/1s |
+    |---|---|---|---|---|---|---|---|---|
+    | 450  | 202,500   | 17,553.8  | 23,242.8  | 2,920.4  | 6,576.7  | 1,654.5  | 2.252 | 0.567 |
+    | 640  | 409,600   | 30,086.2  | 40,977.1  | 4,749.4  | 7,511.2  | 2,028.8  | 1.582 | 0.427 |
+    | 900  | 810,000   | 55,140.5  | 67,782.0  | 7,566.6  | 10,760.1 | 3,276.9  | 1.422 | 0.433 |
+    | 1273 | 1,620,529 | 93,862.4  | 119,222.9 | 14,582.4 | 20,637.9 | 6,134.8  | 1.415 | 0.421 |
+    | 1800 | 3,240,000 | 198,821.6 | 225,910.7 | 29,843.8 | 39,757.9 | 12,324.0 | 1.332 | 0.413 |
+
+    (`nfx = 450` repeats as a tie point against Run B, at a higher step-count
+    budget: `col/1s` 1.823 → 2.252, `skin/1s` 0.377 → 0.567 — a bigger swing
+    than the Run A/B cross-check, from timing 247 steps here vs. 99 there.
+    The qualitative conclusions below are unaffected by this noise; read the
+    precise ratios as ±20-25%, not exact.)
+
+    **Item 11's crossover does not reappear — it gets pushed off the entire
+    tested range, 16× past where the laptop found it.** The laptop crossed
+    `col/1s < 1.0` at its largest size, `n_fluid = 202,500` (`col/1s =
+    0.672`). Here `col/1s` falls monotonically across the extended run's five
+    points as `n_fluid` grows — 2.252 → 1.582 → 1.422 → 1.415 → 1.332 — but
+    is still comfortably above 1.0 at 3,240,000 particles, the largest size
+    tested. This directly answers the handoff's question: **no, the
+    crossover does not move to a smaller `n_fluid` on server hardware; if
+    anything `ColouredKA` is further from paying off than on the laptop.**
+    The likely reason isn't just launch overhead (which item 2's mechanism
+    alone would predict shrinking in relative terms as compute got ~38×
+    cheaper) — a scale-safety review that preceded these runs found
+    `ColouredKA`'s coupled-interaction colours launch one thread per *cell*
+    in the fluid bounding box regardless of whether a boundary particle is
+    actually nearby (`src/KAKernels.jl`, coupled colour loop), so it carries
+    a fixed per-cell tax that `OnesidedKA`'s per-particle traversal doesn't
+    pay — consistent with the ratio flattening out around 1.3-1.4× instead of
+    continuing to fall toward 1.0. **`ColouredKA` remains correctly out of
+    scope for every script** — this item does not change item 11's "not
+    wired into any script" conclusion; if anything it reinforces it.
+
+    **Item 12's skin caching does not taper off — it stays a clear win across
+    the entire tested range.** The laptop's `skin/1s` crossed *above* 1.0
+    (stopped helping) around `n_fluid = 100,000` and sat at breakeven (1.004)
+    by 202,500. Here it never leaves the 0.36-0.57 band across all three runs
+    above, all the way to 3,240,000 particles — a 1.8-2.8× win at every size
+    tested, not just the small ones. This also directly answers the
+    handoff's question, in the direction items 2/11's own reasoning would
+    predict: removing launches is worth *more*, not less, when the
+    hardware's per-launch floor is a bigger share of an otherwise-cheaper
+    step.
+
+    **The CPU-vs-GPU crossover (item 2) moved, but the direction depends on
+    which thread count you compare against, and by less than the raw compute
+    gap alone would suggest.** At `-t 1`, `gpu_1s` beats `cpu_col` from
+    `n_fluid ≈ 10,000` — far earlier than the laptop's 40,000, as expected
+    against one weak Icelake core. At `-t 26`, the realistic server number,
+    the crossover lands at `n_fluid ≈ 40,000` — the same point item 2 found
+    on the laptop. Whether that is a real coincidence or an artifact of the
+    laptop measurement having used a similar effective thread count isn't
+    knowable from the original doc, which never recorded
+    `Threads.nthreads()`.
+
+    **Not built or changed**: no script's default changed, `ColouredKA`
+    remains reachable only via the internal `mode` override (item 11's scope
+    guards are untouched), and no source-level GPU code was added — this item
+    is measurement and documentation only. `bench/dambreak_scaling.jl` gained
+    a provenance header (thread count, CPU model, GPU name, CUDA.jl version)
+    so future runs are self-describing; its CSV schema is unchanged.
+    `bench-output/*.csv`/`*.log` from this session are gitignored, not
+    committed — re-run the commands above (merged environment, same as
+    item 2) to reproduce.
 
 ## Explicitly deferred (not started, not part of the current scope)
 

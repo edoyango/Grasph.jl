@@ -175,7 +175,12 @@ end
 function main()
     sizes, budget = _parse_args(ARGS)
     println("=== dambreak.jl scaling benchmark — ", Dates.now(), " ===")
+    println("Julia threads: ", Threads.nthreads(), " (Sys.CPU_THREADS = ", Sys.CPU_THREADS, ")")
+    println("CPU: ", Sys.cpu_info()[1].model)
     println("CUDA available: ", HAVE_CUDA)
+    if HAVE_CUDA
+        println("GPU: ", CUDA.name(CUDA.device()), "  (CUDA.jl v", pkgversion(CUDA), ")")
+    end
     println()
     @printf("%6s %10s %10s %8s | %12s %12s %12s %12s %12s | %9s %9s %9s %9s\n",
             "nfx", "n_fluid", "n_bnd", "steps", "cpu_col us", "cpu_1s us", "gpu_1s us", "gpu_col us", "gpu_1s+skin us",
