@@ -206,6 +206,123 @@ else
             @test maximum(norm.(fluid_cpu.dvdt[oc] .- fluid_gpu_h.dvdt[og])) < 1e-10 * dvdt_scale
         end
 
+        @testset "full pipeline (sort+grid+sweep), ColouredKA self+coupled: CPU-coloured oracle vs CUDA" begin
+            # ColouredKA (docs/gpu-migration-plan.md's coloured-GPU
+            # benchmarking spike, Backend.jl) reuses the *two-sided mutating*
+            # pfn contract via `mode=ColouredKA()` (not `onesided=true`), one
+            # kernel launch per colour (KAKernels.jl). Unlike OnesidedKA vs.
+            # ColouredCPU (different pair-visitation order — bounded only by
+            # FMA-contraction-level rtol below), ColouredKA visits pairs in
+            # the identical colour-by-colour, once-per-pair order as
+            # ColouredCPU, so a real bug here would show up as more than
+            # noise, not as amplified chaos.
+            CUDA.allowscalar(false)
+            rng = MersenneTwister(203)
+            h = 0.08
+            kernel = CubicSplineKernel(h; ndims=2)
+            cutoff = kernel.interaction_length
+            pfn = FluidPfn(0.03, 0.0, h)
+
+            n_fluid, n_bnd = 1500, 600
+            fluid_cpu = _gpucuda_random_fluid(rng, n_fluid, 2; L=3.0)
+            bnd_cpu   = _gpucuda_random_boundary(rng, n_bnd, 2; L=3.0)
+            static_bnd_cpu = StaticBoundarySystem(bnd_cpu, 0.03)
+
+            fluid_gpu = adapt(CUDABackend(), deepcopy(fluid_cpu))
+            bnd_gpu   = adapt(CUDABackend(), deepcopy(bnd_cpu))
+            static_bnd_gpu = StaticBoundarySystem(bnd_gpu, 0.03)
+
+            pbb, kbb, scb = _gpucuda_sortbufs_cpu(bnd_cpu)
+            sort_particles!(bnd_cpu, cutoff, pbb, kbb, scb)
+            pb2, kb2, sc2 = _gpucuda_sortbufs_cpu(fluid_cpu)
+            sort_particles!(fluid_cpu, cutoff, pb2, kb2, sc2)
+            si_self_cpu = SystemInteraction(kernel, pfn, fluid_cpu; mode=Grasph.ColouredCPU())
+            si_cpl_cpu  = SystemInteraction(kernel, pfn, fluid_cpu, static_bnd_cpu; mode=Grasph.ColouredCPU())
+            create_grid!(si_self_cpu); create_grid!(si_cpl_cpu)
+            sweep!(si_self_cpu); sweep!(si_cpl_cpu)
+
+            pbbg, kbbg, scbg = _gpucuda_sortbufs_gpu(bnd_gpu)
+            sort_particles!(bnd_gpu, cutoff, pbbg, kbbg, scbg)
+            pb2g, kb2g, sc2g = _gpucuda_sortbufs_gpu(fluid_gpu)
+            sort_particles!(fluid_gpu, cutoff, pb2g, kb2g, sc2g)
+            si_self_gpu = SystemInteraction(kernel, pfn, fluid_gpu; mode=Grasph.ColouredKA())
+            si_cpl_gpu  = SystemInteraction(kernel, pfn, fluid_gpu, static_bnd_gpu; mode=Grasph.ColouredKA())
+            create_grid!(si_self_gpu); create_grid!(si_cpl_gpu)
+            sweep!(si_self_gpu); sweep!(si_cpl_gpu)
+
+            @test Array(si_self_gpu._cell_start) == si_self_cpu._cell_start
+
+            fluid_gpu_h = adapt(Array, fluid_gpu)
+            oc, og = _byid(fluid_cpu), _byid(fluid_gpu_h)
+            dvdt_scale = max(maximum(norm.(fluid_cpu.dvdt)), 1.0)
+            drhodt_scale = max(maximum(abs.(fluid_cpu.drhodt)), 1.0)
+            @test maximum(norm.(fluid_cpu.dvdt[oc] .- fluid_gpu_h.dvdt[og])) < 1e-10 * dvdt_scale
+            @test maximum(abs.(fluid_cpu.drhodt[oc] .- fluid_gpu_h.drhodt[og])) < 1e-10 * drhodt_scale
+        end
+
+        @testset "full pipeline (sort+grid+sweep), verlet_skin > 0 (padded grid), self+coupled onesided: CPU oracle vs CUDA" begin
+            # docs/gpu-migration-plan.md deferred item 1: create_grid!(si, skin)
+            # widens the cell-partitioning pitch (si._grid_cutoff) while
+            # si._cell_size (the physical cutoff feeding cutoff_sq) stays
+            # unchanged — see Interaction.jl/KAKernels.jl. The KA onesided
+            # kernels now take two scalar cutoff arguments instead of one
+            # (grid pitch for _cell_1idx, physical cutoff_sq for the pairwise
+            # filter); this is the only tier that exercises that arg split on
+            # a real GPU launch, not just KA.CPU().
+            CUDA.allowscalar(false)
+            rng = MersenneTwister(211)
+            h = 0.08
+            kernel = CubicSplineKernel(h; ndims=2)
+            cutoff = kernel.interaction_length
+            skin = 0.3 * cutoff
+            pfn = FluidPfn(0.03, 0.0, h)
+
+            n_fluid, n_bnd = 1500, 600
+            fluid_cpu = _gpucuda_random_fluid(rng, n_fluid, 2; L=3.0)
+            bnd_cpu   = _gpucuda_random_boundary(rng, n_bnd, 2; L=3.0)
+            static_bnd_cpu = StaticBoundarySystem(bnd_cpu, 0.03)
+
+            fluid_gpu = adapt(CUDABackend(), deepcopy(fluid_cpu))
+            bnd_gpu   = adapt(CUDABackend(), deepcopy(bnd_cpu))
+            static_bnd_gpu = StaticBoundarySystem(bnd_gpu, 0.03)
+
+            # Sort with the same padded cutoff time_integrate! would use
+            # (sort_cutoff = 2h + verlet_skin), so the CSR build's "already
+            # sorted per this cell assignment" invariant holds under the
+            # padded grid too — see TimeIntegration.jl's verlet_skin gate.
+            pbb, kbb, scb = _gpucuda_sortbufs_cpu(bnd_cpu)
+            sort_particles!(bnd_cpu, cutoff + skin, pbb, kbb, scb)
+            pb2, kb2, sc2 = _gpucuda_sortbufs_cpu(fluid_cpu)
+            sort_particles!(fluid_cpu, cutoff + skin, pb2, kb2, sc2)
+            si_self_cpu = SystemInteraction(kernel, pfn, fluid_cpu; onesided=true)
+            si_cpl_cpu  = SystemInteraction(kernel, pfn, fluid_cpu, static_bnd_cpu; onesided=true)
+            create_grid!(si_self_cpu, skin); create_grid!(si_cpl_cpu, skin)
+            sweep!(si_self_cpu); sweep!(si_cpl_cpu)
+
+            pbbg, kbbg, scbg = _gpucuda_sortbufs_gpu(bnd_gpu)
+            sort_particles!(bnd_gpu, cutoff + skin, pbbg, kbbg, scbg)
+            pb2g, kb2g, sc2g = _gpucuda_sortbufs_gpu(fluid_gpu)
+            sort_particles!(fluid_gpu, cutoff + skin, pb2g, kb2g, sc2g)
+            si_self_gpu = SystemInteraction(kernel, pfn, fluid_gpu; onesided=true, ka=true)
+            si_cpl_gpu  = SystemInteraction(kernel, pfn, fluid_gpu, static_bnd_gpu; onesided=true, ka=true)
+            create_grid!(si_self_gpu, skin); create_grid!(si_cpl_gpu, skin)
+            sweep!(si_self_gpu); sweep!(si_cpl_gpu)
+
+            @test si_self_gpu._grid_cutoff[] ≈ cutoff + skin
+            @test si_self_cpu._grid_cutoff[] ≈ cutoff + skin
+            @test Array(si_self_gpu._cell_start) == si_self_cpu._cell_start
+            @test Array(si_self_gpu._mingridx) == Vector(si_self_cpu._mingridx)
+            @test Array(si_self_gpu._ngridx) == Vector(si_self_cpu._ngridx)
+            @test Array(si_cpl_gpu._cell_start) == si_cpl_cpu._cell_start
+
+            fluid_gpu_h = adapt(Array, fluid_gpu)
+            oc, og = _byid(fluid_cpu), _byid(fluid_gpu_h)
+            dvdt_scale = max(maximum(norm.(fluid_cpu.dvdt)), 1.0)
+            drhodt_scale = max(maximum(abs.(fluid_cpu.drhodt)), 1.0)
+            @test maximum(norm.(fluid_cpu.dvdt[oc] .- fluid_gpu_h.dvdt[og])) < 1e-10 * dvdt_scale
+            @test maximum(abs.(fluid_cpu.drhodt[oc] .- fluid_gpu_h.drhodt[og])) < 1e-10 * drhodt_scale
+        end
+
         @testset "full pipeline (sort+grid+sweep), coupled reverse/WritesBoth: CPU oracle vs CUDA" begin
             # gpu-migration-plan.md "Next steps" item 6: KA kernel twin for
             # the reverse/WritesBoth sweep (_sweep_coupled_ka_reverse!/

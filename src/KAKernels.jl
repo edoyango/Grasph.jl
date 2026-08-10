@@ -92,10 +92,9 @@ end
 
 # --- self-interaction ---
 
-@kernel function _sweep_self_onesided_kernel_2d!(ps, pfn, kernel, h, cutoff, @Const(cell_start), mingridx, ngridx)
+@kernel function _sweep_self_onesided_kernel_2d!(ps, pfn, kernel, h, cutoff, cutoff_sq, @Const(cell_start), mingridx, ngridx)
     i = @index(Global, Linear)
     @inbounds begin
-        cutoff_sq = cutoff * cutoff
         n_cells_y = ngridx[2]
         val_ndims = Val{2}()
         cell_idx  = _cell_1idx(ps.x[i], mingridx, cutoff, ngridx, val_ndims)
@@ -113,10 +112,9 @@ end
     end
 end
 
-@kernel function _sweep_self_onesided_kernel_3d!(ps, pfn, kernel, h, cutoff, @Const(cell_start), mingridx, ngridx)
+@kernel function _sweep_self_onesided_kernel_3d!(ps, pfn, kernel, h, cutoff, cutoff_sq, @Const(cell_start), mingridx, ngridx)
     i = @index(Global, Linear)
     @inbounds begin
-        cutoff_sq  = cutoff * cutoff
         n_cells_z  = ngridx[3]
         n_cells_y  = ngridx[2]
         n_cells_yz = n_cells_y * n_cells_z
@@ -145,7 +143,7 @@ function _sweep_self_ka!(si::SystemInteraction{T,2}, pfn::PFN) where {T,PFN}
     ps      = si.system_a
     backend = KA.get_backend(ps.x)
     _sweep_self_onesided_kernel_2d!(backend, _KA_WORKGROUP)(
-        device_view(ps), pfn, si.kernel, T(si.kernel.h), si._cell_size,
+        device_view(ps), pfn, si.kernel, T(si.kernel.h), si._grid_cutoff[], si._cell_size * si._cell_size,
         si._cell_start, SVector(si._mingridx), SVector(si._ngridx);
         ndrange = ps.n)
     KA.synchronize(backend)
@@ -156,7 +154,7 @@ function _sweep_self_ka!(si::SystemInteraction{T,3}, pfn::PFN) where {T,PFN}
     ps      = si.system_a
     backend = KA.get_backend(ps.x)
     _sweep_self_onesided_kernel_3d!(backend, _KA_WORKGROUP)(
-        device_view(ps), pfn, si.kernel, T(si.kernel.h), si._cell_size,
+        device_view(ps), pfn, si.kernel, T(si.kernel.h), si._grid_cutoff[], si._cell_size * si._cell_size,
         si._cell_start, SVector(si._mingridx), SVector(si._ngridx);
         ndrange = ps.n)
     KA.synchronize(backend)
@@ -169,10 +167,9 @@ end
 # arrays), so index collision between i and j has no meaning here — matches
 # _sweep_coupled_onesided!'s comment in Interaction.jl.
 
-@kernel function _sweep_coupled_onesided_kernel_2d!(ps_a, ps_b, pfn, kernel, h, cutoff, @Const(cell_start), mingridx, ngridx)
+@kernel function _sweep_coupled_onesided_kernel_2d!(ps_a, ps_b, pfn, kernel, h, cutoff, cutoff_sq, @Const(cell_start), mingridx, ngridx)
     i = @index(Global, Linear)
     @inbounds begin
-        cutoff_sq = cutoff * cutoff
         n_cells_y = ngridx[2]
         val_ndims = Val{2}()
         cell_idx  = _cell_1idx(ps_a.x[i], mingridx, cutoff, ngridx, val_ndims)
@@ -189,10 +186,9 @@ end
     end
 end
 
-@kernel function _sweep_coupled_onesided_kernel_3d!(ps_a, ps_b, pfn, kernel, h, cutoff, @Const(cell_start), mingridx, ngridx)
+@kernel function _sweep_coupled_onesided_kernel_3d!(ps_a, ps_b, pfn, kernel, h, cutoff, cutoff_sq, @Const(cell_start), mingridx, ngridx)
     i = @index(Global, Linear)
     @inbounds begin
-        cutoff_sq  = cutoff * cutoff
         n_cells_z  = ngridx[3]
         n_cells_y  = ngridx[2]
         n_cells_yz = n_cells_y * n_cells_z
@@ -220,7 +216,7 @@ function _sweep_coupled_ka!(si::SystemInteraction{T,2}, ps_b, pfn::PFN) where {T
     ps_a    = si.system_a
     backend = KA.get_backend(ps_a.x)
     _sweep_coupled_onesided_kernel_2d!(backend, _KA_WORKGROUP)(
-        device_view(ps_a), device_view(ps_b), pfn, si.kernel, T(si.kernel.h), si._cell_size,
+        device_view(ps_a), device_view(ps_b), pfn, si.kernel, T(si.kernel.h), si._grid_cutoff[], si._cell_size * si._cell_size,
         si._cell_start, SVector(si._mingridx), SVector(si._ngridx);
         ndrange = ps_a.n)
     KA.synchronize(backend)
@@ -231,7 +227,7 @@ function _sweep_coupled_ka!(si::SystemInteraction{T,3}, ps_b, pfn::PFN) where {T
     ps_a    = si.system_a
     backend = KA.get_backend(ps_a.x)
     _sweep_coupled_onesided_kernel_3d!(backend, _KA_WORKGROUP)(
-        device_view(ps_a), device_view(ps_b), pfn, si.kernel, T(si.kernel.h), si._cell_size,
+        device_view(ps_a), device_view(ps_b), pfn, si.kernel, T(si.kernel.h), si._grid_cutoff[], si._cell_size * si._cell_size,
         si._cell_start, SVector(si._mingridx), SVector(si._ngridx);
         ndrange = ps_a.n)
     KA.synchronize(backend)
@@ -260,7 +256,7 @@ function _sweep_coupled_ka_reverse!(si::SystemInteraction{T,2}, ps_b, pfn::PFN) 
     ps_a    = si.system_a
     backend = KA.get_backend(ps_b.x)
     _sweep_coupled_onesided_kernel_2d!(backend, _KA_WORKGROUP)(
-        device_view(ps_b), device_view(ps_a), pfn, si.kernel, T(si.kernel.h), si._cell_size,
+        device_view(ps_b), device_view(ps_a), pfn, si.kernel, T(si.kernel.h), si._grid_cutoff[], si._cell_size * si._cell_size,
         si._cell_start_a, SVector(si._mingridx), SVector(si._ngridx);
         ndrange = ps_b.n)
     KA.synchronize(backend)
@@ -271,7 +267,7 @@ function _sweep_coupled_ka_reverse!(si::SystemInteraction{T,3}, ps_b, pfn::PFN) 
     ps_a    = si.system_a
     backend = KA.get_backend(ps_b.x)
     _sweep_coupled_onesided_kernel_3d!(backend, _KA_WORKGROUP)(
-        device_view(ps_b), device_view(ps_a), pfn, si.kernel, T(si.kernel.h), si._cell_size,
+        device_view(ps_b), device_view(ps_a), pfn, si.kernel, T(si.kernel.h), si._grid_cutoff[], si._cell_size * si._cell_size,
         si._cell_start_a, SVector(si._mingridx), SVector(si._ngridx);
         ndrange = ps_b.n)
     KA.synchronize(backend)
@@ -289,6 +285,145 @@ function _sweep_coupled_ka_dispatch!(::WritesBoth, si, system_b, pfn)
     _sweep_coupled_ka!(si, system_b, pfn)
     _sweep_coupled_ka_reverse!(si, system_b, pfn)
     nothing
+end
+
+# ---------------------------------------------------------------------------
+# Coloured, two-sided, GPU sweep kernels (ColouredKA — internal benchmarking
+# spike, see docs/gpu-migration-plan.md and Backend.jl's ColouredKA comment).
+#
+# One kernel LAUNCH PER COLOUR, mirroring _sweep_self!/_sweep_coupled!'s host
+# colour loop (Interaction.jl) exactly, with `@batch for flat_idx in
+# 1:n_active` replaced by `@index(Global, Linear)`. Each kernel body reuses
+# _pair_self!/_pair_coupled! (Interaction.jl) verbatim — those are already
+# plain, backend-agnostic @inline functions (just array indexing + kernel
+# math), so the pair-evaluation logic is bit-identical to the CPU coloured
+# sweep, not merely equivalent. The two-sided *mutating* pfn contract
+# (`pfn(ps_a, i, j, dx, gx, w)` / `pfn(ps_a, ps_b, i, j, dx, gx, w)`) is used
+# directly — no pfn_contribution needed, unlike OnesidedKA.
+#
+# Safety argument for plain (non-atomic) `+=`/`-=` writes: identical to the
+# CPU coloured sweep's — active cells within one colour are separated by
+# ≥2/≥3 cells (see the colouring comments above _sweep_self!/_sweep_coupled!),
+# which is exactly the write-set-disjointness argument that makes concurrent
+# writes safe, independent of whether the concurrent execution substrate is
+# Polyester threads or GPU threads. What GPU adds is that colour N+1 must not
+# begin until colour N's writes are globally visible — enforced below by
+# `KA.synchronize` between every colour's launch (the same conservative
+# per-launch-synchronize style used throughout this file).
+#
+# 2D only (dambreak.jl's shape) — see the plan's scope note; 3D is
+# unimplemented on purpose, not an oversight.
+# ---------------------------------------------------------------------------
+
+@kernel function _sweep_self_coloured_ka_kernel_2d!(ps, pfn, kernel, h, cutoff, @Const(cell_start), n_cells_y, cell_x_begin, cell_y_begin, n_active_y)
+    flat_idx = @index(Global, Linear)
+    @inbounds begin
+        cutoff_sq = cutoff * cutoff
+        val_ndims = Val{2}()
+        step_x, step_y = divrem(flat_idx - 1, n_active_y)
+        cell_x   = cell_x_begin + step_x * 2
+        cell_y   = cell_y_begin + step_y * 3
+        cell_idx = (cell_x - 1) * n_cells_y + cell_y
+
+        pstart    = cell_start[cell_idx]
+        pend_same = cell_start[cell_idx + 1]
+        pend_next = cell_start[cell_idx + 2]
+
+        neighbour_cell_idx = cell_idx + n_cells_y - 1
+        neighbour_pstart = cell_start[neighbour_cell_idx]
+        neighbour_pend   = cell_start[neighbour_cell_idx + 3]
+
+        for particle_i in pstart:pend_same-1
+            for particle_j in particle_i+1:pend_next-1
+                _pair_self!(pfn, ps, particle_i, particle_j, kernel, h, cutoff_sq, val_ndims)
+            end
+            for particle_j in neighbour_pstart:neighbour_pend-1
+                _pair_self!(pfn, ps, particle_i, particle_j, kernel, h, cutoff_sq, val_ndims)
+            end
+        end
+    end
+end
+
+_sweep_self_coloured_ka!(si::SystemInteraction{T,2}, ::Nothing) where {T} = nothing
+_sweep_self_coloured_ka!(si::SystemInteraction{T,3}, ::Nothing) where {T} = nothing
+
+function _sweep_self_coloured_ka!(si::SystemInteraction{T,2}, pfn::PFN) where {T,PFN}
+    ps         = si.system_a
+    backend    = KA.get_backend(ps.x)
+    cell_start = si._cell_start
+    n_cells_y  = Int(si._ngridx[2])
+    n_cells_x  = Int(si._ngridx[1])
+    dv         = device_view(ps)
+    for colour in 0:5
+        cell_x_begin = colour ÷ 3 + 2
+        cell_y_begin = colour % 3 + 2
+        n_active_x = length(cell_x_begin:2:n_cells_x-1)
+        n_active_y = length(cell_y_begin:3:n_cells_y-1)
+        n_active_x * n_active_y == 0 && continue
+        _sweep_self_coloured_ka_kernel_2d!(backend, _KA_WORKGROUP)(
+            dv, pfn, si.kernel, T(si.kernel.h), si._cell_size,
+            cell_start, n_cells_y, cell_x_begin, cell_y_begin, n_active_y;
+            ndrange = n_active_x * n_active_y)
+        KA.synchronize(backend)
+    end
+    return nothing
+end
+
+@kernel function _sweep_coupled_coloured_ka_kernel_2d!(ps_a, ps_b, pfn, kernel, h, cutoff, @Const(cell_start), @Const(cell_start_a), n_cells_y, cell_x_begin, cell_y_begin, n_active_y)
+    flat_idx = @index(Global, Linear)
+    @inbounds begin
+        cutoff_sq = cutoff * cutoff
+        val_ndims = Val{2}()
+        step_x, step_y = divrem(flat_idx - 1, n_active_y)
+        cell_x   = cell_x_begin + step_x * 3
+        cell_y   = cell_y_begin + step_y * 3
+        cell_idx = (cell_x - 1) * n_cells_y + cell_y
+
+        sys_a_pstart = cell_start_a[cell_idx]
+        sys_a_pend   = cell_start_a[cell_idx + 1]
+        for particle_i in sys_a_pstart:sys_a_pend-1
+            for dx_cell in -1:1
+                neighbour_cell_idx = cell_idx + dx_cell * n_cells_y - 1
+                sys_b_pstart = cell_start[neighbour_cell_idx]
+                sys_b_pend   = cell_start[neighbour_cell_idx + 3]
+                for particle_j in sys_b_pstart:sys_b_pend-1
+                    _pair_coupled!(pfn, ps_a, ps_b, particle_i, particle_j, kernel, h, cutoff_sq, val_ndims)
+                end
+            end
+        end
+    end
+end
+
+_sweep_coupled_coloured_ka!(si::SystemInteraction{T,2}, system_b, ::Nothing) where {T} = nothing
+_sweep_coupled_coloured_ka!(si::SystemInteraction{T,3}, system_b, ::Nothing) where {T} = nothing
+
+function _sweep_coupled_coloured_ka!(si::SystemInteraction{T,2}, system_b, pfn::PFN) where {T,PFN}
+    ps_a         = si.system_a
+    backend      = KA.get_backend(ps_a.x)
+    cell_start   = si._cell_start
+    cell_start_a = si._cell_start_a
+    n_cells_y    = Int(si._ngridx[2])
+    cutoff       = si._cell_size
+    mingridx     = si._mingridx
+    cell_x_min = floor(Int, (si._mingridx_a[1] - mingridx[1]) / cutoff) + 1
+    cell_x_max = floor(Int, (si._maxgridx_a[1] - mingridx[1]) / cutoff) + 1
+    cell_y_min = floor(Int, (si._mingridx_a[2] - mingridx[2]) / cutoff) + 1
+    cell_y_max = floor(Int, (si._maxgridx_a[2] - mingridx[2]) / cutoff) + 1
+    dv_a = device_view(ps_a)
+    dv_b = device_view(system_b)
+    for colour in 0:8
+        cell_x_begin = colour ÷ 3 + cell_x_min
+        cell_y_begin = colour % 3 + cell_y_min
+        n_active_x = length(cell_x_begin:3:cell_x_max)
+        n_active_y = length(cell_y_begin:3:cell_y_max)
+        n_active_x * n_active_y == 0 && continue
+        _sweep_coupled_coloured_ka_kernel_2d!(backend, _KA_WORKGROUP)(
+            dv_a, dv_b, pfn, si.kernel, T(si.kernel.h), si._cell_size,
+            cell_start, cell_start_a, n_cells_y, cell_x_begin, cell_y_begin, n_active_y;
+            ndrange = n_active_x * n_active_y)
+        KA.synchronize(backend)
+    end
+    return nothing
 end
 
 # ---------------------------------------------------------------------------

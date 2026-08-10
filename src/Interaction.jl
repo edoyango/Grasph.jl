@@ -32,7 +32,8 @@ struct SystemInteraction{T<:AbstractFloat, ND, KT<:AbstractKernel{T,ND}, SA<:Abs
     _cell_start_a::CSA                  # same for system_a (coupled only); length = ncells+1
     _mingridx_a::MVector{ND,T}          # min position of system_a particles per dim (ndims,)
     _maxgridx_a::MVector{ND,T}          # max position of system_a particles per dim (ndims,)
-    _cell_size::T
+    _cell_size::T                       # TRUE physical interaction cutoff (kernel.interaction_length); never changes after construction. Used everywhere cutoff_sq is derived for the pairwise distance filter — NOT for cell-grid geometry.
+    _grid_cutoff::Base.RefValue{T}      # cell-partitioning pitch actually used by the current cell list (create_grid!'s cutoff+skin); equals _cell_size when skin=0. Used for cell-index derivation (_cell_1idx, coupled cell-index bounds) only.
     function SystemInteraction{T, ND, KT, SA, SB, PFNS, VPFN, CSA, MODE}(args...) where {T, ND, KT, SA, SB, PFNS, VPFN, CSA, MODE}
         ND isa Int || throw(ArgumentError("ND must be an Int, got $(typeof(ND))"))
         new{T, ND, KT, SA, SB, PFNS, VPFN, CSA, MODE}(args...)
@@ -70,6 +71,13 @@ Pass `ka=true` (requires `onesided=true`) to additionally run the one-sided
 sweep as a `KernelAbstractions.jl` kernel rather than a Polyester `@batch`
 loop — the same kernel source that runs on `system_a`'s array backend,
 `CPU()` or any GPU backend.
+
+`mode` is an internal escape hatch used by benchmarking code (see
+`docs/gpu-migration-plan.md`) to select an `ExecMode` directly, bypassing the
+`onesided`/`ka` derivation above — e.g. `ColouredKA()`, which runs the
+two-sided mutating pfn contract through KernelAbstractions.jl. Not part of
+the public `onesided`/`ka` contract; `nothing` (the default) preserves
+today's behaviour exactly.
 """
 function SystemInteraction(
     kernel::AbstractKernel,
@@ -79,6 +87,7 @@ function SystemInteraction(
     velocity_adjust_pairwise_fn = nothing,
     onesided::Bool = false,
     ka::Bool = false,
+    mode::Union{Nothing, ExecMode} = nothing,
 ) where {T<:AbstractFloat, ND}
     nd = Int(ND)
     kernel.ndims == nd || throw(ArgumentError(
@@ -89,7 +98,7 @@ function SystemInteraction(
         "ka=true requires onesided=true (the KernelAbstractions sweep only implements the one-sided protocol)"))
     pfns = pairwise_fn isa Tuple ? pairwise_fn : (pairwise_fn,)
     _check_functors_eltype(pfns, T, "pairwise functor")
-    mode = ka ? OnesidedKA() : onesided ? OnesidedCPU() : ColouredCPU()
+    mode = mode !== nothing ? mode : ka ? OnesidedKA() : onesided ? OnesidedCPU() : ColouredCPU()
     cell_start   = similar(system_a.x, Int, 0)
     cell_start_a = similar(system_a.x, Int, 0)
     SystemInteraction{
@@ -109,6 +118,7 @@ function SystemInteraction(
         MVector{nd,T}(undef),
         MVector{nd,T}(undef),
         T(kernel.interaction_length),
+        Ref(T(kernel.interaction_length)),
     )
 end
 
@@ -128,7 +138,7 @@ is_coupled(si::SystemInteraction) = si.system_b !== nothing
 # ---------------------------------------------------------------------------
 
 """
-    create_grid!(si::SystemInteraction)
+    create_grid!(si::SystemInteraction, skin::Real = 0)
 
 Build the CSR cell list used by `sweep!`.
 
@@ -136,13 +146,24 @@ Build the CSR cell list used by `sweep!`.
 `system_a` and `system_b` (if present) before this function, so that each
 cell's particles occupy a contiguous index range.
 
-Updates `si._mingridx`, `si._ngridx`, `si._cell_start`, and `si._cell_count`.
+Updates `si._mingridx`, `si._ngridx`, `si._cell_start`, `si._cell_count`, and
+`si._grid_cutoff`.
 
 The grid origin is extended by 2h beyond all particle positions so that
 neighbour-cell accesses in the sweep never go out of bounds.
+
+`skin` pads the cell-partitioning width to `si._cell_size + skin` (the
+Verlet-skin trick: internal, used by `time_integrate!`'s rebuild-cadence gate
+— see `docs/gpu-migration-plan.md`). This only widens the grid pitch used for
+cell indexing (`si._grid_cutoff`); the physical interaction cutoff
+(`si._cell_size`, used to derive `cutoff_sq` in every sweep) is untouched, so
+a nonzero skin never changes which pairs interact — only how many rebuild-free
+steps a stale cell list can tolerate before pairs could be missed. Default `0`
+reproduces today's exact behaviour (`si._grid_cutoff == si._cell_size`).
 """
-function create_grid!(si::SystemInteraction{T}) where {T}
-    cutoff = T(si.kernel.interaction_length)
+function create_grid!(si::SystemInteraction{T}, skin::Real = zero(T)) where {T}
+    cutoff = si._cell_size + T(skin)
+    si._grid_cutoff[] = cutoff
     _create_grid_impl!(si, si.system_b, cutoff)
     nothing
 end
@@ -377,6 +398,8 @@ _sweep_mode!(::OnesidedCPU, si, ::Nothing, pfn) = _sweep_self_onesided!(si, pfn)
 _sweep_mode!(::OnesidedCPU, si, system_b, pfn)  = _sweep_coupled_onesided_dispatch!(_onesided_shape(pfn, si.system_a, system_b), si, system_b, pfn)
 _sweep_mode!(::OnesidedKA,  si, ::Nothing, pfn) = _sweep_self_ka!(si, pfn)
 _sweep_mode!(::OnesidedKA,  si, system_b, pfn)  = _sweep_coupled_ka_dispatch!(_onesided_shape(pfn, si.system_a, system_b), si, system_b, pfn)
+_sweep_mode!(::ColouredKA,  si, ::Nothing, pfn) = _sweep_self_coloured_ka!(si, pfn)
+_sweep_mode!(::ColouredKA,  si, system_b, pfn)  = _sweep_coupled_coloured_ka!(si, system_b, pfn)
 
 # ---------------------------------------------------------------------------
 # One-sided coupled write-direction trait
@@ -928,7 +951,7 @@ function _sweep_self_onesided!(si::SystemInteraction{T,2}, pfn::PFN) where {T,PF
     cell_start = si._cell_start::AbstractVector{Int}
     n_cells_y  = Int(si._ngridx[2])
     mingridx   = si._mingridx
-    cutoff     = si._cell_size
+    cutoff     = si._grid_cutoff[]
     ngridx     = si._ngridx
     val_ndims  = Val{2}()
     n          = ps.n
@@ -959,7 +982,7 @@ function _sweep_self_onesided!(si::SystemInteraction{T,3}, pfn::PFN) where {T,PF
     n_cells_y  = Int(si._ngridx[2])
     n_cells_yz = n_cells_y * n_cells_z
     mingridx   = si._mingridx
-    cutoff     = si._cell_size
+    cutoff     = si._grid_cutoff[]
     ngridx     = si._ngridx
     val_ndims  = Val{3}()
     n          = ps.n
@@ -1000,7 +1023,7 @@ function _sweep_coupled_onesided!(si::SystemInteraction{T,2}, ps_b, pfn::PFN) wh
     cell_start = si._cell_start::AbstractVector{Int}
     n_cells_y  = Int(si._ngridx[2])
     mingridx   = si._mingridx
-    cutoff     = si._cell_size
+    cutoff     = si._grid_cutoff[]
     ngridx     = si._ngridx
     val_ndims  = Val{2}()
     n          = ps_a.n
@@ -1030,7 +1053,7 @@ function _sweep_coupled_onesided!(si::SystemInteraction{T,3}, ps_b, pfn::PFN) wh
     n_cells_y  = Int(si._ngridx[2])
     n_cells_yz = n_cells_y * n_cells_z
     mingridx   = si._mingridx
-    cutoff     = si._cell_size
+    cutoff     = si._grid_cutoff[]
     ngridx     = si._ngridx
     val_ndims  = Val{3}()
     n          = ps_a.n
@@ -1079,7 +1102,7 @@ function _sweep_coupled_onesided_reverse!(si::SystemInteraction{T,2}, ps_b, pfn:
     cell_start_a = si._cell_start_a::AbstractVector{Int}
     n_cells_y    = Int(si._ngridx[2])
     mingridx     = si._mingridx
-    cutoff       = si._cell_size
+    cutoff       = si._grid_cutoff[]
     ngridx       = si._ngridx
     val_ndims    = Val{2}()
     n            = ps_b.n
@@ -1109,7 +1132,7 @@ function _sweep_coupled_onesided_reverse!(si::SystemInteraction{T,3}, ps_b, pfn:
     n_cells_y    = Int(si._ngridx[2])
     n_cells_yz   = n_cells_y * n_cells_z
     mingridx     = si._mingridx
-    cutoff       = si._cell_size
+    cutoff       = si._grid_cutoff[]
     ngridx       = si._ngridx
     val_ndims    = Val{3}()
     n            = ps_b.n

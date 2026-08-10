@@ -1201,6 +1201,243 @@ to coloured for all 13 scripts, and no script's behavior changed.
 
    Suite: 1653/1653 (up from 1651 after item 9).
 
+11. **Coloured, two-sided GPU sweep — benchmarking spike (`ColouredKA`)** —
+    **done.** Items 8/10 finished wiring `onesided=true`/`ka=true` into every
+    script; item 2's crossover benchmark separately established that
+    one-sided GPU (`OnesidedKA`) beats CPU-coloured from `n_fluid ≈ 40,000`
+    on this hardware. Since the CPU comparison run earlier this session
+    (13 scripts, `onesided=true` vs. `onesided=false`, both on CPU) found
+    CPU-coloured consistently 1.1-2.4× faster per sweep than CPU-onesided —
+    expected, since coloured visits each pair once (half-shell,
+    Newton's-third-law reuse) vs. onesided's full-neighbour-list-per-particle
+    traversal (~2× the pairwise evaluations) — the natural question was
+    whether porting *that same* half-work colouring scheme to GPU (one
+    `@kernel` launch per colour, reusing the original two-sided *mutating*
+    pfn contract, not `pfn_contribution` — so zero pfn-conversion work,
+    unlike `OnesidedKA`) would also beat `OnesidedKA` on GPU, given this
+    GPU's already-established launch-overhead-bound (not compute-bound)
+    profile (item 2's ~8.3µs/launch finding).
+
+    Built as a 4th `ExecMode`, `ColouredKA` (`src/Backend.jl`), reachable
+    only via `SystemInteraction`'s new internal `mode::Union{Nothing,
+    ExecMode}=nothing` override kwarg (`src/Interaction.jl`) — deliberately
+    not a new public `onesided`/`ka` boolean combination, since this is a
+    benchmarking spike, not a proposed new default. The kernels
+    (`src/KAKernels.jl`, `_sweep_self_coloured_ka_kernel_2d!`/
+    `_sweep_coupled_coloured_ka_kernel_2d!`, 2D only — `dambreak.jl`'s shape,
+    matching what `bench/dambreak_scaling.jl` benchmarks) are a direct port
+    of the existing `ColouredCPU` colour loops (`_sweep_self!`/
+    `_sweep_coupled!`, `Interaction.jl`), one launch per colour instead of
+    one `@batch` pass per colour, `KA.synchronize` between every colour
+    (consecutive colours have overlapping write-sets by design; colours
+    within one launch don't, by the same cell-separation argument
+    `ColouredCPU`'s own comments already prove). Each kernel body reuses
+    `_pair_self!`/`_pair_coupled!` verbatim — already plain, backend-agnostic
+    `@inline` functions — so pair evaluation is bit-identical to
+    `ColouredCPU`'s, not merely equivalent; confirmed exactly on real CUDA
+    hardware (RTX 4060 Laptop): `max|Δdvdt| = max|Δdrhodt| = 0.0` (exact,
+    not just within tolerance) against a `ColouredCPU` oracle at both 1,600
+    and 40,000 particles, using `bench/dambreak_scaling.jl`'s own geometry.
+    (An earlier ad hoc test geometry produced a spurious `NaN` — traced to a
+    self-inflicted exact-position collision between a fluid particle and a
+    boundary particle, a `0/0` kernel-gradient singularity at `r=0` that
+    would hit *any* sweep mode identically, not a `ColouredKA`-specific bug;
+    not present in any real script or in `bench/dambreak_scaling.jl`'s
+    actual geometry.) Formalised as a new `test_gpu_cuda.jl` testset ("full
+    pipeline (sort+grid+sweep), ColouredKA self+coupled: CPU-coloured oracle
+    vs CUDA") using the file's existing random-fixture/`_byid`/sort-buffer
+    helpers; 3/3 passing on real CUDA. Suite: 1656/1656 (up from 1653).
+
+    `bench/dambreak_scaling.jl` extended with a 4th column (`gpu_col`),
+    reusing the existing `cpu_col`/`cpu_1s`/`gpu` (`OnesidedKA`) machinery —
+    run at the same default sizes as item 2's original table (RTX 4060
+    Laptop, same hardware):
+
+    | nfx | n_fluid | cpu_col µs | cpu_1s µs | gpu_1s µs | gpu_col µs | 1s/col | col/col | col/1s |
+    |---|---|---|---|---|---|---|---|---|
+    | 50  | 2,500   | 431.2   | 540.3   | 1332.1  | 6163.9  | 2.466 | 14.295 | 4.627 |
+    | 100 | 10,000  | 1361.9  | 2154.2  | 1659.2  | 10772.3 | 0.770 | 7.910  | 6.492 |
+    | 200 | 40,000  | 6860.8  | 9240.8  | 4524.5  | 11013.9 | 0.490 | 1.605  | 2.434 |
+    | 320 | 102,400 | 14565.9 | 27762.7 | 9200.6  | 11055.3 | 0.331 | 0.759  | 1.202 |
+    | 450 | 202,500 | 34395.5 | 45683.8 | 16967.1 | 11394.0 | 0.371 | 0.331  | 0.672 |
+
+    **The trade does not pay off at any size this migration actually
+    targets, and only barely starts to at the very top of the tested
+    range.** `gpu_col` is dramatically slower than `gpu_1s` at small/medium
+    scale (4.6× slower at dambreak.jl's own production size, 2,500
+    particles) and is nearly *flat* from `n_fluid = 10,000` through `202,500`
+    (10,772 → 11,394µs, barely moving across a 20× size increase) — the
+    signature of a cost dominated entirely by kernel-launch count, not
+    compute. `ColouredKA` issues 6 launches for the self interaction (2D) +
+    9 for the coupled interaction (2D) = 15 per `sweep!` call, vs. 1 each
+    (2 total) for `OnesidedKA` — a 7.5× multiplier on the same
+    ~8.3µs/launch floor item 2 already measured, which alone accounts for
+    most of the flat ~11ms plateau. `gpu_col` only overtakes `gpu_1s` at the
+    largest tested size (202,500 particles, 1.49× faster) — right at the
+    edge of the tested range, well past `OnesidedKA`'s own crossover against
+    CPU-coloured (`n_fluid ≈ 40,000`, item 2). Not investigated further
+    (extending `--sizes` toward the ~1M-particle range to see whether the
+    margin keeps growing past 202,500, the way item 2's `gpu_1s` margin did)
+    — out of scope per this item's plan, since the result already answers
+    the question the plan asked: on this hardware, at the particle counts
+    this migration's actual scripts run at, `OnesidedKA` remains the right
+    choice, and `ColouredKA` is not worth wiring into any script.
+
+    **Not wired into any script, and not intended to be** — this was
+    explicitly scoped as a benchmarking spike (see the plan this item
+    executed). `ColouredKA` stays reachable only via the internal `mode`
+    override, 2D/`FluidPfn`-self/`StaticBoundarySystem`-coupled only; no
+    ghosts, virtual particles, probes, 3D, or `RK4TimeIntegrator` support
+    was built, and none is planned unless a future, much-larger-scale result
+    changes this conclusion.
+
+12. **Persistent/cached grid + Verlet-skin rebuild cadence** — **done.**
+    First part of deferred item 1 below (fused sort gather/copyback
+    `Ref`-swap stays deferred — see "Not built" below). Item 11 confirmed
+    launch count, not compute, is what this hardware pays for; every
+    timestep before this item unconditionally paid for a full re-sort +
+    grid rebuild (`_sort_all_systems!` + `_prepare_grids!`,
+    `TimeIntegration.jl`) regardless of whether any particle had moved far
+    enough to invalidate the previous step's cell list. This item makes
+    that rebuild skippable.
+
+    **The correctness trap that shaped the design**: `si._cell_size`
+    (`SystemInteraction`, fixed at construction to `kernel.interaction_length`)
+    was doing double duty everywhere in the onesided sweep functions —
+    `cutoff_sq = si._cell_size^2` (the physical SPH interaction radius, fed
+    to `_pair_self_onesided!`/`_pair_coupled_onesided!`'s `r_sq < cutoff_sq`
+    filter) *and* `cutoff = si._cell_size` (the grid cell pitch, fed to
+    `_cell_1idx` for cell-index lookups). Naively widening cell size so the
+    grid tolerates a few steps of drift — the standard Verlet-skin trick —
+    would, with that conflation, have silently widened the *physical*
+    interaction radius too: a correctness bug, not a perf change. Fixed by
+    adding a second, mutable field, `_grid_cutoff::Base.RefValue{T}`
+    (`Interaction.jl`), set by `create_grid!(si, skin)` to
+    `si._cell_size + skin` and read by every grid-index call site; `_cell_size`
+    itself, and every `cutoff_sq` derived from it, is completely untouched —
+    `skin = 0` (the default) makes `_grid_cutoff[] == _cell_size`, so nothing
+    about existing behaviour changes unless `verlet_skin > 0` is explicitly
+    requested. The same split was threaded through the onesided KA kernels
+    (`KAKernels.jl`): each kernel now takes two scalar cutoff arguments
+    instead of one (grid pitch for `_cell_1idx`, `cutoff_sq` for the pairwise
+    filter) rather than deriving both from a single reused value.
+
+    **Scope, opt-in and deliberately narrow** — a new `verlet_skin::T = 0`
+    kwarg on `LeapFrogTimeIntegrator`/`RK4TimeIntegrator` (`TimeIntegration.jl`),
+    validated by `_validate_verlet_skin`:
+    - `verlet_skin == 0` (default) reproduces today's rebuild-every-step
+      behaviour exactly — zero risk to any of the 13 scripts.
+    - `verlet_skin > 0` requires every interaction to be `onesided=true`
+      (`OnesidedCPU`/`OnesidedKA`) — `ArgumentError` otherwise. The coloured
+      sweep's own `cutoff`/`cutoff_sq` split (same conflation, different
+      call sites, e.g. `_sweep_coupled!`'s `cell_x_min`/`cell_x_max`
+      derivation) was **not** fixed, since nothing exercises it under skin —
+      matches item 11's own precedent of touching only the code path the
+      GPU launch-count story is actually about.
+    - `verlet_skin > 0` requires empty `ghosts`/`virtual_systems` —
+      `ArgumentError` otherwise. Ghosts are fully regenerated from live
+      boundary positions every step regardless of skin
+      (`generate_ghosts!`); tracking their staleness is a separate,
+      unbuilt problem.
+    - `verlet_skin` must be `< 2 * min(interaction cutoff)` — the existing
+      `2*cutoff` bounding-box padding in `_create_grid_impl!` is what
+      guarantees a drifting particle can't walk off the edge of a stale
+      grid into an out-of-bounds cell index; skin has to stay inside that
+      headroom.
+
+    **Mechanism** (`time_integrate!`, both loops): one reference-position
+    buffer per tracked system (every system in `sys`, plus each
+    interaction's `system_b`), snapshotted right after every rebuild. Each
+    subsequent step computes `max_disp` (a `maximum(norm, ...)` reduction
+    per tracked system, reusing a preallocated scratch buffer — no
+    per-step GPU allocation) and skips `_sort_all_systems!` +
+    `_prepare_grids!` entirely whenever `2 * max_disp <= verlet_skin` — the
+    standard Verlet-list bound. `_maybe_save!` now returns whether it
+    measured probes this step (`_measure_probes!` re-sorts a probe source
+    system independently of the main gate, at save cadence); the caller
+    forces a full rebuild on the following step when it does, since that
+    re-sort invalidates the "same array index = same particle" assumption
+    the cached reference buffers depend on.
+
+    **Why a cached run reproduces an always-rebuild run exactly, not just
+    approximately**: `sort_particles!`'s permutation is a *stable* sort —
+    ties (particles still in the same cell) preserve whatever order they
+    already had. A particle's cell assignment under the padded grid can
+    only change by crossing a padded-cell boundary, which is exactly the
+    event `2*max_disp <= verlet_skin` guarantees hasn't happened. So
+    skipping the re-sort reproduces what re-running it *would* have
+    produced (a no-op, same order) bit-for-bit, and skipping `create_grid!`
+    likewise reproduces identical `_mingridx`/`_ngridx`/`_cell_start` —
+    confirmed empirically (see Validation below): every equivalence test
+    compares a `verlet_skin > 0` run against a `verlet_skin = 0` run and
+    finds exact or near-machine-epsilon agreement, not merely
+    tolerance-level agreement.
+
+    **Validation**: `test/test_verlet_skin.jl` (new, 27 tests) — all four
+    `ArgumentError` guards; `create_grid!(si, skin)`'s default-vs-explicit
+    `_grid_cutoff` behaviour; `LeapFrogTimeIntegrator`/`RK4TimeIntegrator`
+    equivalence (`verlet_skin > 0` vs `= 0`, compared by particle `id` since
+    the two runs re-sort a different number of times and can end up with
+    different index-to-particle mappings) under both tame motion (rebuild
+    only ever triggers once, at step 1) and fast motion (an imposed initial
+    velocity forces many rebuild-trigger events over the run, exercising the
+    skip/rebuild state machine's transitions, not just its initial branch);
+    the same equivalence check on `KA.CPU()` (`ka=true`); and the
+    probe-triggered forced-rebuild path across a save boundary. Every
+    equivalence check passed at the tight tolerance used
+    (`rtol=1e-9`), most at exact or near-machine-epsilon agreement, matching
+    the argument above. `test/test_gpu_cuda.jl` gained a new real-CUDA
+    testset ("verlet_skin > 0 (padded grid), self+coupled onesided: CPU
+    oracle vs CUDA") exercising the two-cutoff KA kernel argument split on
+    actual hardware, 8/8 passing (`_grid_cutoff`, `_cell_start`,
+    `_mingridx`/`_ngridx`, `dvdt`/`drhodt` all matching a CPU oracle).
+    Full suite: **1691/1691** (up from 1656 after item 11).
+
+    **Benchmark** (`bench/dambreak_scaling.jl`, extended with a 5th column,
+    `gpu_1s_skin` — `OnesidedKA` + `verlet_skin = 0.2 * cutoff` — run at the
+    same default sizes, same hardware, RTX 4060 Laptop):
+
+    | nfx | n_fluid | cpu_col µs | cpu_1s µs | gpu_1s µs | gpu_col µs | gpu_1s+skin µs | skin/1s |
+    |---|---|---|---|---|---|---|---|
+    | 50  | 2,500   | 329.5   | 556.5   | 1385.4  | 6129.5  | 890.4   | **0.643** |
+    | 100 | 10,000  | 1814.8  | 2921.1  | 1998.9  | 10952.4 | 1527.6  | **0.764** |
+    | 200 | 40,000  | 6689.1  | 10604.6 | 4525.1  | 12292.6 | 4337.8  | 0.959 |
+    | 320 | 102,400 | 13334.9 | 28426.9 | 9042.1  | 10941.5 | 9261.2  | 1.024 |
+    | 450 | 202,500 | 29141.5 | 55450.5 | 17083.8 | 11514.8 | 17154.6 | 1.004 |
+
+    (`skin/1s` = `gpu_1s+skin / gpu_1s`; below 1.0 means skin caching won.)
+
+    **A partial, genuinely useful win — unlike item 11's fully negative
+    result, this one lands right where it matters most**: at dambreak.jl's
+    actual production scale (`n_fluid = 2,500`, `nfx = 50`), skin caching
+    cuts `OnesidedKA`'s per-step cost by **1.56×** (1385→890µs), and still
+    by 1.31× at 10,000 particles — this benchmark's fluid block falls from
+    rest under gravity, so per-step displacement is tiny relative to a
+    `0.2*cutoff` skin margin and almost every step after the first skips the
+    rebuild entirely. The win shrinks as `n_fluid` grows (0.96× at 40,000,
+    roughly break-even from 100,000 up) because the fixed rebuild cost being
+    saved becomes a smaller fraction of a total that now scales with `n`,
+    while the displacement check itself (2 reduction kernels × 2 tracked
+    systems = 4 launches/step) is a fixed cost paid on *every* step,
+    skipped or not. It does **not** close the remaining gap to CPU-coloured
+    at dambreak's own scale (`gpu_1s+skin` at 890µs is still ~2.7× slower
+    than `cpu_col`'s 330µs) — this item narrows that gap, it doesn't erase
+    it. The crossover against CPU-coloured (item 2's `n_fluid ≈ 40,000` for
+    plain `OnesidedKA`) isn't materially moved by this item, since skin's
+    benefit is concentrated below that scale, not near it.
+
+    **Not built** (see "Explicitly deferred" below, which this item leaves
+    otherwise unchanged): fusing the sort's gather+copyback into a single
+    `Ref`-swap. Investigated during planning and descoped — it would require
+    every per-particle array field across the whole particle-system type
+    hierarchy to become a swappable container instead of a plain array
+    field, touching every `ps.x`/`ps.v`/... read site in the codebase, for a
+    benefit (removing 1 of 2 already-batched permutation-apply kernel
+    launches) that shrinks further now that most steps skip the sort
+    entirely. Ghost/virtual-aware staleness tracking, and any change to the
+    coloured sweep's grid-pitch handling, are also explicitly out of scope —
+    see the constructor guards above.
+
 ## Explicitly deferred (not started, not part of the current scope)
 
 - ~~**GPU (`ka=true`) support for any pfn converted in Phase C**~~ — items
@@ -1214,10 +1451,12 @@ to coloured for all 13 scripts, and no script's behavior changed.
 - ~~Wiring `GRASPH_BACKEND` into the 6 experiment scripts item 9 unblocked~~
   — **done, item 10.** All 13 experiment scripts now support
   `GRASPH_BACKEND=cuda`; nothing left deferred in this category.
-- Persistent/cached grid, Verlet-skin rebuild cadence, and fusing the sort's
-  gather+copyback into a single `Ref`-swap — all flagged during Phase B2 as
-  follow-ups once the crossover benchmark shows whether launch count is
-  actually the bottleneck at dambreak's scale; not built.
+- ~~Persistent/cached grid + Verlet-skin rebuild cadence~~ — **done, item
+  12.** Opt-in (`verlet_skin` kwarg, default `0`), onesided-only, no
+  ghosts/virtual — see item 12 for the scope guards and why. Fusing the
+  sort's gather+copyback into a single `Ref`-swap (the third part of this
+  originally-bundled bullet) stays deferred — investigated and explicitly
+  descoped in item 12 ("Not built"), not merely unstarted.
 - Morton/Z-order sort keys (packed lexicographic `UInt64` key shipped
   instead).
 - Explicit neighbour list (on-the-fly 27-cell scan is current approach).
@@ -1232,7 +1471,7 @@ to coloured for all 13 scripts, and no script's behavior changed.
   32 commits ahead of it (`12ac526`..`149c238`). Nothing on this branch has
   been pushed to any remote.
 - Run the full suite with `julia --project -e 'using Pkg; Pkg.test()'` —
-  should show `1653/1653` (834 through Phase B1, up to 935 after Phase B2's
+  should show `1691/1691` (834 through Phase B1, up to 935 after Phase B2's
   3D work, up to 1371 after Phase C, up to 1433 after item 5's `device_view`
   extension, up to 1466 after item 6's reverse-sweep KA kernel twin, up to
   1479 after also fixing the `FluidPfn` fluid-fluid `ka=true` dispatch gap
@@ -1242,8 +1481,11 @@ to coloured for all 13 scripts, and no script's behavior changed.
   adversarial-review test additions), up to 1651 after item 9
   (`ProbeParticleSystem`'s `device_view`/`Adapt` extension plus real-CUDA
   tests for the RK4/Virtual/Probe fixes), up to 1653 after item 10 (the
-  `VirtualParticleSystem` `w_sum` buffer-type regression test). `Pkg.test()`
-  resolves its own CUDA
+  `VirtualParticleSystem` `w_sum` buffer-type regression test), up to 1656
+  after item 11 (the `ColouredKA` self+coupled real-CUDA testset), up to 1691
+  after item 12 (`test/test_verlet_skin.jl`'s 27 new tests plus one new
+  real-CUDA testset in `test_gpu_cuda.jl`).
+  `Pkg.test()` resolves its own CUDA
   from `test/Project.toml` and picks up real hardware automatically when
   present (confirmed again this item) — no merged-throwaway-environment
   workaround needed for the test suite itself, only for running a top-level

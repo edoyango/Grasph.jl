@@ -10,12 +10,26 @@
 # aspect ratio and ~18-neighbour count so ns/particle/step is comparable
 # across sizes.
 #
-# Reports THREE columns: CPU-coloured (today's production default for every
+# Reports FIVE columns: CPU-coloured (today's production default for every
 # script), CPU-onesided (the same full-stencil algorithm the GPU runs, on
-# CPU), and GPU. The middle column is not optional — without it, a GPU
-# "speedup" over the coloured sweep can't be told apart from an artifact of
-# comparing against a half-shell algorithm that does half the pair
-# evaluations per step.
+# CPU), GPU-onesided (today's production GPU sweep, ka=true), GPU-coloured
+# (ColouredKA — see docs/gpu-migration-plan.md's coloured-GPU benchmarking
+# spike, Backend.jl/KAKernels.jl), and GPU-onesided-with-skin (ka=true plus
+# verlet_skin > 0 — docs/gpu-migration-plan.md deferred item 1: skips the
+# per-step sort + grid rebuild while no particle has moved far enough to
+# invalidate the current, skin-padded cell list). The cpu_1s column is not
+# optional — without it, a GPU "speedup" over the coloured sweep can't be
+# told apart from an artifact of comparing against a half-shell algorithm
+# that does half the pair evaluations per step. gpu_col answers a different
+# question: does porting that same half-work half-shell algorithm to GPU
+# (one kernel launch per colour, 6x/2D-self more launches than the single
+# onesided-KA launch) still win once launch overhead is paid 6x, or does
+# onesided-KA's single-launch/double-arithmetic shape win on this hardware?
+# gpu_1s_skin answers yet another question: given item 11 already showed this
+# GPU is launch-count-dominated rather than compute-bound, does removing the
+# sort+grid launches entirely on most steps (this benchmark's fluid block is
+# falling under gravity from rest, so displacement per step is tiny relative
+# to the skin margin) recover meaningfully more than gpu_1s already does?
 #
 # Prediction, from measurements recorded in docs/gpu-migration-plan.md: this
 # GPU (RTX 4060 Laptop, sm_89) has NO Float64 compute advantage over the
@@ -76,7 +90,7 @@ function _parse_args(args)
     return sizes, budget
 end
 
-function build(nfx; onesided=false, ka=false, backend=nothing)
+function build(nfx; onesided=false, ka=false, mode=nothing, backend=nothing, verlet_skin_frac=0.0)
     dx_spacing = 0.5
     h_sph = 1.2 * dx_spacing
     rho0 = 1000.0
@@ -134,10 +148,11 @@ function build(nfx; onesided=false, ka=false, backend=nothing)
 
     static_boundary = StaticBoundarySystem(boundary, dx_spacing)
     fi = SystemInteraction(kernel, FluidPfn(art_visc_alpha, art_visc_beta, h_sph), fluid;
-                           onesided = onesided, ka = ka)
+                           onesided = onesided, ka = ka, mode = mode)
     fbi = SystemInteraction(kernel, FluidPfn(art_visc_alpha, art_visc_beta, h_sph), fluid, static_boundary;
-                            onesided = onesided, ka = ka)
-    integrator = LeapFrogTimeIntegrator([fluid, boundary], [fi, fbi])
+                            onesided = onesided, ka = ka, mode = mode)
+    verlet_skin = verlet_skin_frac * kernel.interaction_length
+    integrator = LeapFrogTimeIntegrator([fluid, boundary], [fi, fbi]; verlet_skin = verlet_skin)
     return integrator, n_fluid, n_boundary
 end
 
@@ -162,9 +177,9 @@ function main()
     println("=== dambreak.jl scaling benchmark — ", Dates.now(), " ===")
     println("CUDA available: ", HAVE_CUDA)
     println()
-    @printf("%6s %10s %10s %8s | %12s %12s %12s | %9s %9s\n",
-            "nfx", "n_fluid", "n_bnd", "steps", "cpu_col us", "cpu_1s us", "gpu us",
-            "gpu/col", "gpu/1s")
+    @printf("%6s %10s %10s %8s | %12s %12s %12s %12s %12s | %9s %9s %9s %9s\n",
+            "nfx", "n_fluid", "n_bnd", "steps", "cpu_col us", "cpu_1s us", "gpu_1s us", "gpu_col us", "gpu_1s+skin us",
+            "1s/col", "col/col", "col/1s", "skin/1s")
 
     rows = NamedTuple[]
     for nfx in sizes
@@ -178,28 +193,60 @@ function main()
         t_1s = us_per_step(integ_1s, nsteps)
 
         t_gpu = NaN
+        t_gpu_col = NaN
+        t_gpu_skin = NaN
         if HAVE_CUDA
             integ_gpu, _, _ = build(nfx; onesided=true, ka=true, backend=CUDABackend())
             t_gpu = us_per_step(integ_gpu, nsteps; sync = () -> CUDA.synchronize())
+
+            integ_gpu_col, _, _ = build(nfx; mode=Grasph.ColouredKA(), backend=CUDABackend())
+            t_gpu_col = us_per_step(integ_gpu_col, nsteps; sync = () -> CUDA.synchronize())
+
+            integ_gpu_skin, _, _ = build(nfx; onesided=true, ka=true, backend=CUDABackend(), verlet_skin_frac=0.2)
+            t_gpu_skin = us_per_step(integ_gpu_skin, nsteps; sync = () -> CUDA.synchronize())
         end
 
-        @printf("%6d %10d %10d %8d | %12.1f %12.1f %12.1f | %9.3f %9.3f\n",
-                nfx, n_fluid, n_bnd, nsteps, t_col, t_1s, t_gpu, t_gpu / t_col, t_gpu / t_1s)
-        push!(rows, (; nfx, n_fluid, n_bnd, t_col, t_1s, t_gpu))
+        @printf("%6d %10d %10d %8d | %12.1f %12.1f %12.1f %12.1f %12.1f | %9.3f %9.3f %9.3f %9.3f\n",
+                nfx, n_fluid, n_bnd, nsteps, t_col, t_1s, t_gpu, t_gpu_col, t_gpu_skin,
+                t_gpu / t_1s, t_gpu_col / t_col, t_gpu_col / t_gpu, t_gpu_skin / t_gpu)
+        push!(rows, (; nfx, n_fluid, n_bnd, t_col, t_1s, t_gpu, t_gpu_col, t_gpu_skin))
     end
 
     println()
     if HAVE_CUDA
         crossed = findfirst(r -> r.t_gpu < r.t_col, rows)
         if crossed === nothing
-            println("GPU did not beat the CPU coloured sweep at any tested size (up to n_fluid = ",
+            println("GPU-onesided did not beat the CPU coloured sweep at any tested size (up to n_fluid = ",
                     rows[end].n_fluid, "). Extend --sizes to look further, or see the hardware notes")
             println("in docs/gpu-migration-plan.md — this GPU has no measured FP64 throughput edge over")
             println("the CPU, so any win here would come from launch-count amortisation at larger n.")
         else
-            println("GPU became faster than the CPU coloured sweep at n_fluid ≈ ", rows[crossed].n_fluid,
+            println("GPU-onesided became faster than the CPU coloured sweep at n_fluid ≈ ", rows[crossed].n_fluid,
                     " (nfx = ", rows[crossed].nfx, ").")
         end
+
+        crossed_col_vs_col = findfirst(r -> r.t_gpu_col < r.t_col, rows)
+        if crossed_col_vs_col === nothing
+            println("GPU-coloured (ColouredKA) did not beat the CPU coloured sweep at any tested size.")
+        else
+            println("GPU-coloured (ColouredKA) became faster than the CPU coloured sweep at n_fluid ≈ ",
+                    rows[crossed_col_vs_col].n_fluid, " (nfx = ", rows[crossed_col_vs_col].nfx, ").")
+        end
+
+        crossed_col_vs_1s = findfirst(r -> r.t_gpu_col < r.t_gpu, rows)
+        if crossed_col_vs_1s === nothing
+            println("GPU-coloured (ColouredKA) did not beat GPU-onesided at any tested size — the extra",
+                    " 6x/2D-self kernel launches never pay for themselves on this hardware.")
+        else
+            println("GPU-coloured (ColouredKA) became faster than GPU-onesided at n_fluid ≈ ",
+                    rows[crossed_col_vs_1s].n_fluid, " (nfx = ", rows[crossed_col_vs_1s].nfx, ").")
+        end
+
+        skin_speedup = [r.t_gpu / r.t_gpu_skin for r in rows]
+        best_i = argmax(skin_speedup)
+        println("GPU-onesided-with-skin (verlet_skin_frac=0.2) vs plain GPU-onesided: ",
+                round(minimum(skin_speedup); digits=3), "x-", round(maximum(skin_speedup); digits=3),
+                "x across tested sizes (best at n_fluid ≈ ", rows[best_i].n_fluid, ").")
     else
         println("CUDA not available on this machine — CPU-coloured vs CPU-onesided columns only.")
     end
@@ -209,9 +256,9 @@ function main()
     mkpath(outdir)
     outpath = joinpath(outdir, "dambreak_scaling_$(Dates.format(Dates.now(), "yyyymmdd_HHMMSS")).csv")
     open(outpath, "w") do io
-        println(io, "nfx,n_fluid,n_bnd,cpu_coloured_us,cpu_onesided_us,gpu_us")
+        println(io, "nfx,n_fluid,n_bnd,cpu_coloured_us,cpu_onesided_us,gpu_onesided_us,gpu_coloured_us,gpu_onesided_skin_us")
         for r in rows
-            println(io, "$(r.nfx),$(r.n_fluid),$(r.n_bnd),$(r.t_col),$(r.t_1s),$(r.t_gpu)")
+            println(io, "$(r.nfx),$(r.n_fluid),$(r.n_bnd),$(r.t_col),$(r.t_1s),$(r.t_gpu),$(r.t_gpu_col),$(r.t_gpu_skin)")
         end
     end
     println("\nWrote ", outpath)
