@@ -2262,7 +2262,109 @@ to coloured for all 13 scripts, and no script's behavior changed.
     algorithms' cost profiles differ enough (half the pair evaluations,
     plus whatever colour-bucket bookkeeping overhead a real implementation
     would add) that only measuring the real thing would give a trustworthy
-    answer.
+    answer. *(Update, extended-sizes follow-up just below: at `n_fluid` in
+    the millions rather than the hundreds-of-thousands tested above,
+    `cpu_nlist` actually reverses and starts beating `cpu_col` — this
+    "may not be worth it" judgment call was only ever supported by data up
+    to 202,500 particles.)*
+
+    **Extended sizes, up to this GPU's memory limit — A100 server hardware,
+    follow-up.** Item 13/14's own extended-size runs stopped at `n_fluid =
+    3,240,000` (`nfx = 1800`), noting VRAM "is not the binding constraint...
+    wall clock is." True for the 5-column benchmark those items ran, but
+    `gpu_nlist` (this item) adds an extra array that scales with `n` (the
+    explicit candidate list) on top of every other mode's arrays, and
+    `bench/dambreak_scaling.jl` builds *four* GPU integrators per size point
+    (`gpu_1s`, `gpu_col`, `gpu_1s+skin`, `gpu_nlist`) as separate local
+    bindings that — before this item's script fix — all stayed
+    simultaneously resident (nothing freed one before building the next), so
+    peak device memory was their *sum*, not just the largest one. That made
+    `n_fluid` in the low millions the real ceiling on this A100 long before
+    its 40GB was actually full.
+
+    **Script fix**: `bench/dambreak_scaling.jl` now drops each GPU
+    integrator (`= nothing; GC.gc(); CUDA.reclaim()`) immediately after
+    timing it, before building the next mode. Peak memory per size point is
+    now bounded by the single heaviest mode (`gpu_nlist`) rather than the
+    sum of all four.
+
+    **Memory measurement**: `FluidParticleSystem` is ~96 bytes/particle
+    host-side (`id`, `x`, `v`, `v_adjustment`, `rho`, `dvdt`, `drhodt`, `p`);
+    `build()` constructs *two* `SystemInteraction`s per mode (self +
+    boundary-coupled), each with its own grid/sort scratch and — for
+    `NeighbourListKA` — its own candidate-list array (~26 padded neighbours
+    × 8 bytes ≈ 208 bytes/particle at this benchmark's
+    `verlet_skin_frac=0.2`). Measured directly, not just estimated, by
+    building `gpu_nlist` alone at increasing `nfx` and reading
+    `CUDA.total_memory() - CUDA.available_memory()`:
+
+    | nfx | n_fluid | GPU memory used | % of 39.5 GiB total |
+    |---|---|---|---|
+    | 1,800 | 3,240,000 | 1.95 GiB | 4.9% |
+    | 2,430 | 5,904,900 | 3.17 GiB | 8.0% |
+    | 3,280 | 10,758,400 | 5.32 GiB | 13.5% |
+    | 4,428 | 19,607,184 | 9.32 GiB | 23.6% |
+    | 5,978 | 35,736,484 | 16.54 GiB | 41.9% |
+    | 8,070 | 65,124,900 | 29.76 GiB | 75.4% |
+    | 8,716 | 75,968,656 | 34.64 GiB | 87.7% |
+
+    ~490 bytes/particle, consistent across the whole range. At 87.7% of this
+    A100's 40GB (~4.9 GiB kept as a safety margin — not run to actual
+    failure), `nfx = 8,716` (`n_fluid ≈ 76M`) was picked as the safe ceiling
+    for the timed benchmark below — **26× past item 13/14's own previous
+    extended-size maximum.**
+
+    **Full 7-column benchmark at these sizes** (`-t 26`, `--budget 5e7`,
+    same A100):
+
+    | nfx | n_fluid | cpu_col µs | cpu_1s µs | cpu_nlist µs | gpu_1s µs | gpu_col µs | gpu_1s+skin µs | gpu_nlist µs | cnl/col | skin/1s | nlist/skin |
+    |---|---|---|---|---|---|---|---|---|---|---|---|
+    | 1,800 | 3,240,000 | 179,294.8 | 210,120.3 | 166,958.8 | 30,149.9 | 41,670.5 | 19,090.0 | 10,106.9 | 0.931 | 0.633 | 0.529 |
+    | 2,500 | 6,250,000 | 348,291.8 | 416,193.6 | 342,115.3 | 52,665.8 | 78,383.1 | 25,684.7 | 14,494.0 | 0.982 | 0.488 | 0.564 |
+    | 3,500 | 12,250,000 | 686,246.3 | 848,160.9 | 672,390.7 | 106,079.1 | 158,869.8 | 56,865.7 | 35,512.0 | 0.980 | 0.536 | 0.624 |
+    | 5,000 | 25,000,000 | 1,416,018.4 | 1,687,053.7 | 1,322,738.7 | 229,017.2 | 339,841.5 | 116,245.8 | 75,166.7 | 0.934 | 0.508 | 0.647 |
+    | 7,000 | 49,000,000 | 2,739,852.6 | 3,276,556.6 | 2,551,059.8 | 514,681.9 | 764,188.1 | 252,036.4 | 153,558.2 | 0.931 | 0.490 | 0.609 |
+    | 8,700 | 75,690,000 | 4,192,892.4 | 5,068,825.6 | 3,832,255.9 | 845,161.5 | 1,188,703.0 | 411,528.6 | 256,895.9 | 0.914 | 0.487 | 0.624 |
+
+    (`cnl/col` = `cpu_nlist / cpu_col`; `skin/1s` = `gpu_1s+skin / gpu_1s`;
+    `nlist/skin` = `gpu_nlist / gpu_1s+skin` — below 1.0 means the left side
+    won, same convention as every other table in this item.)
+
+    **The GPU story holds, unchanged, all the way to 76M particles**:
+    `gpu_col` never beats `gpu_1s` (item 11's conclusion stands at every
+    scale tested so far); skin caching stays a strong 1.55-2.05× win
+    (`skin/1s` 0.487-0.633, no laptop-style taper — matches item 13's
+    server-hardware finding); `gpu_nlist` stays a robust 1.55-1.89× win over
+    `gpu_1s+skin` (`nlist/skin` 0.529-0.647) — a slightly smaller margin than
+    the 1.17-2.43× measured at the smaller default sizes above, but nowhere
+    close to crossing 1.0. At `n_fluid = 75,690,000`, `gpu_nlist` (256,896
+    µs/step ≈ 257 ms) is **16.3× faster than `cpu_col`** (4,192,892 µs/step ≈
+    4.19 s) — the largest measured GPU margin in this entire document.
+
+    **A genuine surprise on the CPU side: `cpu_nlist` beats `cpu_col` at
+    every one of these sizes** (`cnl/col` 0.914-0.982, i.e. 1.8-8.6% faster)
+    — the opposite of the CPU-side table's own conclusion above (`cpu_nlist`
+    never beats `cpu_col` at any tested size, true for `n_fluid ≤ 202,500`).
+    The crossover sits somewhere between 202,500 and 3,240,000 particles —
+    not narrowed down further here, but the reversal itself is real and
+    consistent across all six extended points, with the widest margin (8.6%)
+    at the largest size tested. Likely mechanism: `cpu_col`'s structural
+    half-the-pair-evaluations advantage (item 8) is a *fixed* per-pair-
+    evaluation win, while `cpu_nlist`'s cell-stencil-walk avoidance is a cost
+    that (per this item's own GPU-side finding) scales *with* problem size —
+    at large enough `n`, removing a growing cost eventually outweighs a
+    fixed evaluation-count multiplier. This wasn't predicted by this item's
+    own CPU-side analysis above and is worth flagging for anyone extending
+    `NeighbourListKA` toward production: a persistent-pairs version of
+    `ColouredCPU` itself might be worth the investment after all at the
+    scales this benchmark previously had no data for — softening, not
+    reversing, the "not worth the complexity" judgment call made above.
+
+    **Reproducing**: `bench/dambreak_scaling.jl --sizes
+    1800,2500,3500,5000,7000,8700 --budget 5e7 -t 26` (or via
+    `bench/run_scaling_benchmark.sh`, passing those as trailing args). Not
+    run past `nfx = 8,700` — the next geometric step would have crossed this
+    A100's measured safety margin.
 
     **Not built** (see "Explicitly deferred" below): 3D; `WritesB`/
     `WritesBoth`/coupled-reverse shapes; a hand-written CPU-Polyester

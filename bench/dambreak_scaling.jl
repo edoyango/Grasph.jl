@@ -228,17 +228,31 @@ function main()
         t_gpu_skin = NaN
         t_gpu_nlist = NaN
         if HAVE_CUDA
+            # Each build below is dropped and reclaimed (GC.gc(); CUDA.reclaim())
+            # before the next one starts. Without this, all four GPU
+            # integrators for a size point stay simultaneously live (each is a
+            # distinct local binding referenced again by the printf/push! below
+            # the loop), so peak device memory is their SUM, not just the
+            # largest one (gpu_nlist, which carries an extra candidate-list
+            # array — see docs/gpu-migration-plan.md item 16's memory note).
+            # That sum was the actual ceiling on how large --sizes could go
+            # before an out-of-memory error, well short of this GPU's real
+            # capacity.
             integ_gpu, _, _ = build(nfx; onesided=true, ka=true, backend=CUDABackend())
             t_gpu = us_per_step(integ_gpu, nsteps; sync = () -> CUDA.synchronize())
+            integ_gpu = nothing; GC.gc(); CUDA.reclaim()
 
             integ_gpu_col, _, _ = build(nfx; mode=Grasph.ColouredKA(), backend=CUDABackend())
             t_gpu_col = us_per_step(integ_gpu_col, nsteps; sync = () -> CUDA.synchronize())
+            integ_gpu_col = nothing; GC.gc(); CUDA.reclaim()
 
             integ_gpu_skin, _, _ = build(nfx; onesided=true, ka=true, backend=CUDABackend(), verlet_skin_frac=0.2)
             t_gpu_skin = us_per_step(integ_gpu_skin, nsteps; sync = () -> CUDA.synchronize())
+            integ_gpu_skin = nothing; GC.gc(); CUDA.reclaim()
 
             integ_gpu_nlist, _, _ = build(nfx; mode=Grasph.NeighbourListKA(), backend=CUDABackend(), verlet_skin_frac=0.2)
             t_gpu_nlist = us_per_step(integ_gpu_nlist, nsteps; sync = () -> CUDA.synchronize())
+            integ_gpu_nlist = nothing; GC.gc(); CUDA.reclaim()
         end
 
         @printf("%6d %10d %10d %8d | %12.1f %12.1f %12.1f %12.1f %12.1f %12.1f %12.1f | %9.3f %9.3f %9.3f %9.3f %9.3f %9.3f %9.3f\n",
