@@ -260,6 +260,61 @@ else
             @test maximum(abs.(fluid_cpu.drhodt[oc] .- fluid_gpu_h.drhodt[og])) < 1e-10 * drhodt_scale
         end
 
+        @testset "full pipeline (sort+grid+sweep), NeighbourListKA self+coupled: onesided CPU oracle vs CUDA" begin
+            # NeighbourListKA (docs/gpu-migration-plan.md's explicit-neighbour-
+            # list benchmarking spike, Backend.jl) reuses the *same* onesided
+            # candidate-visitation shape as OnesidedCPU/OnesidedKA (both call
+            # _pair_self_onesided!/_pair_coupled_onesided! — see KAKernels.jl),
+            # just with candidates read from a cached flat list instead of a
+            # fresh cell-stencil walk, so the CPU oracle here is plain
+            # `onesided=true` (Polyester), same as the "self"/"coupled"
+            # testsets above — not ColouredCPU (different pair-visitation
+            # order, different rtol regime).
+            CUDA.allowscalar(false)
+            rng = MersenneTwister(204)
+            h = 0.08
+            kernel = CubicSplineKernel(h; ndims=2)
+            cutoff = kernel.interaction_length
+            pfn = FluidPfn(0.03, 0.0, h)
+
+            n_fluid, n_bnd = 1500, 600
+            fluid_cpu = _gpucuda_random_fluid(rng, n_fluid, 2; L=3.0)
+            bnd_cpu   = _gpucuda_random_boundary(rng, n_bnd, 2; L=3.0)
+            static_bnd_cpu = StaticBoundarySystem(bnd_cpu, 0.03)
+
+            fluid_gpu = adapt(CUDABackend(), deepcopy(fluid_cpu))
+            bnd_gpu   = adapt(CUDABackend(), deepcopy(bnd_cpu))
+            static_bnd_gpu = StaticBoundarySystem(bnd_gpu, 0.03)
+
+            pbb, kbb, scb = _gpucuda_sortbufs_cpu(bnd_cpu)
+            sort_particles!(bnd_cpu, cutoff, pbb, kbb, scb)
+            pb2, kb2, sc2 = _gpucuda_sortbufs_cpu(fluid_cpu)
+            sort_particles!(fluid_cpu, cutoff, pb2, kb2, sc2)
+            si_self_cpu = SystemInteraction(kernel, pfn, fluid_cpu; onesided=true)
+            si_cpl_cpu  = SystemInteraction(kernel, pfn, fluid_cpu, static_bnd_cpu; onesided=true)
+            create_grid!(si_self_cpu); create_grid!(si_cpl_cpu)
+            sweep!(si_self_cpu); sweep!(si_cpl_cpu)
+
+            pbbg, kbbg, scbg = _gpucuda_sortbufs_gpu(bnd_gpu)
+            sort_particles!(bnd_gpu, cutoff, pbbg, kbbg, scbg)
+            pb2g, kb2g, sc2g = _gpucuda_sortbufs_gpu(fluid_gpu)
+            sort_particles!(fluid_gpu, cutoff, pb2g, kb2g, sc2g)
+            si_self_gpu = SystemInteraction(kernel, pfn, fluid_gpu; mode=Grasph.NeighbourListKA())
+            si_cpl_gpu  = SystemInteraction(kernel, pfn, fluid_gpu, static_bnd_gpu; mode=Grasph.NeighbourListKA())
+            create_grid!(si_self_gpu); Grasph._maybe_build_neighbour_list!(si_self_gpu)
+            create_grid!(si_cpl_gpu); Grasph._maybe_build_neighbour_list!(si_cpl_gpu)
+            sweep!(si_self_gpu); sweep!(si_cpl_gpu)
+
+            @test Array(si_self_gpu._cell_start) == si_self_cpu._cell_start
+
+            fluid_gpu_h = adapt(Array, fluid_gpu)
+            oc, og = _byid(fluid_cpu), _byid(fluid_gpu_h)
+            dvdt_scale = max(maximum(norm.(fluid_cpu.dvdt)), 1.0)
+            drhodt_scale = max(maximum(abs.(fluid_cpu.drhodt)), 1.0)
+            @test maximum(norm.(fluid_cpu.dvdt[oc] .- fluid_gpu_h.dvdt[og])) < 1e-10 * dvdt_scale
+            @test maximum(abs.(fluid_cpu.drhodt[oc] .- fluid_gpu_h.drhodt[og])) < 1e-10 * drhodt_scale
+        end
+
         @testset "full pipeline (sort+grid+sweep), verlet_skin > 0 (padded grid), self+coupled onesided: CPU oracle vs CUDA" begin
             # docs/gpu-migration-plan.md deferred item 1: create_grid!(si, skin)
             # widens the cell-partitioning pitch (si._grid_cutoff) while

@@ -1869,6 +1869,329 @@ to coloured for all 13 scripts, and no script's behavior changed.
     new benchmark script; the raw `*.log`/`*.time` files live under a
     scratch directory outside the repo, not `bench-output/`.
 
+15. **Unify pairwise-functor authoring — one implementation per pfn, not
+    two (`src/PairwiseFunctors.jl`) — done.** Items 11/13 confirmed
+    `ColouredCPU` durably beats every onesided path on CPU, and the user
+    wants to keep both `ColouredCPU` (CPU default) and `OnesidedKA` (GPU
+    default) as permanent options. The obstacle: every "writes both sides"
+    pfn had two independently hand-written implementations of the same
+    physics — a mutating two-sided callable
+    `(f::Pfn)(ps_a, [ps_b,] i, j, dx, gx, w)` for `ColouredCPU`/`ColouredKA`,
+    and a value-returning `pfn_contribution(f, ps_a, ps_b, i, j, dx, gx, w)`
+    for `OnesidedCPU`/`OnesidedKA` — the file's own comments already called
+    the latter *"line-for-line the same arithmetic... no new physics"* as
+    the former. 25 mutating methods across 8 pfn structs (`StrainRatePfn`,
+    `StrainRateVorticityPfn`, `FluidPfn`, `CauchyFluidPfn`, `XSPHPfn`,
+    `InterpolateFieldFn`, `NeighborCountFn`, `FluidSolidPfn`) carried this
+    tax, and every future pfn would keep paying it.
+
+    **Design**: a new `abstract type AbstractPairwiseFunctor end` (every pfn
+    struct now subtypes it) carries two generic methods that give any
+    subtype a working `ColouredCPU`/`ColouredKA` mutating callable for free,
+    by delegating into the pfn's own `pfn_contribution`/`_onesided_shape` —
+    the sweep engine itself (`_pair_self!`, `_pair_coupled!`,
+    `_sweep_self!`, `_sweep_coupled!` in `Interaction.jl`, all of
+    `KAKernels.jl`, `sweep!`'s docstring, and every test-only closure pfn)
+    is **completely untouched**, since it still just calls
+    `pfn(ps_a, [ps_b,] i, j, dx, gx, w)` polymorphically — that call now
+    transparently reaches either a real pfn's generic delegate or an
+    unmodified closure's own body. All 25 hand-written mutating methods are
+    deleted; net **-318 lines**.
+
+    **A performance trap found — and fixed — during this item's own
+    verification, not left for someone else to find**: the first version of
+    this design derived every "both sides" case (every self-interaction,
+    plus `FluidPfn`/`FluidSolidPfn`/`XSPHPfn`'s `WritesBoth` coupled cases)
+    by calling `pfn_contribution` **twice** (once per side, roles/sign
+    swapped) — correct, but each call independently recomputes the shared
+    per-pair arithmetic (viscosity, pressure combination, density-diffusion
+    terms) that a hand-written mutating method computes **once** and reuses
+    for both writes. Benchmarking this first version (same-session,
+    same-machine `git stash` comparison against the unmodified pre-refactor
+    code, to eliminate cross-session hardware/thermal drift as a confound —
+    see "Benchmark" below) showed a real, reproducible **~20-32% `cpu_col`
+    regression** at dambreak.jl's own shape — far more than "a small fraction
+    of the onesided-coloured gap" this item's plan predicted, because
+    `dambreak_scaling.jl`'s `cpu_col` is dominated entirely by `FluidPfn`'s
+    self-interaction (its coupled `StaticBoundarySystem` interaction was
+    already one-sided even before this item), and the self case is exactly
+    where the double-computation hit hardest.
+
+    Fixed by introducing `pfn_contribution_pair(f, ps, i, j, dx, gx, w) ->
+    (acc_i, acc_j)` (self arity) and `pfn_contribution_pair(f, ps_a, ps_b, i,
+    j, dx, gx, w) -> (acc_a, acc_b)` (coupled arity) as the authoring surface
+    for exactly the cases that need it — every self-interaction, plus the
+    `WritesBoth` coupled cases — computing the shared terms once and
+    returning both sides, mirroring what the original hand-written mutating
+    methods did (their bodies were reused almost verbatim, restructured from
+    `ps.field[i] +=`/`ps.field[j] +=` into a returned pair). Two fully
+    generic methods, `pfn_contribution(f::AbstractPairwiseFunctor, ...) =
+    first(pfn_contribution_pair(f, ...))` (self and coupled arities), derive
+    the plain single-sided `pfn_contribution` the onesided sweep needs — so a
+    `WritesBoth`/self pfn only ever authors the pair version, never both.
+    `WritesA`/`WritesB`-only cases (no "other side" to share computation
+    with) are untouched — they were never part of the regression and keep
+    their original directly-authored `pfn_contribution`. This is why the fix
+    is scoped to `PairwiseFunctors.jl` alone: the generic delegates'
+    *structure* (self vs. coupled-with-shape-dispatch) didn't change, only
+    which function they call to get "both sides" — one `pfn_contribution_pair`
+    call instead of two `pfn_contribution` calls.
+
+    **Two gaps this exposed**, both `WritesBoth`-shaped coupled mutating
+    methods with no `pfn_contribution`/`pfn_contribution_pair` counterpart at
+    all (deleting them outright would silently drop `ColouredCPU` support for
+    combinations that used to at least run, even if incorrectly — see
+    `FluidSolidPfn` below):
+    - `XSPHPfn`'s real-real (two distinct `FluidParticleSystem`s) case —
+      **filled**, narrowly typed to `FluidParticleSystem, FluidParticleSystem`
+      (the pfn's own docstring already named this as the intended fallback
+      shape), mirroring `FluidPfn`'s existing fluid-fluid pattern exactly
+      (host + `DeviceSystem` `ka=true` twin). New equivalence test via the
+      existing `_compare_coupled_writesboth` helper
+      (`test/test_onesided_sweep.jl`).
+    - `CauchyFluidPfn`'s real-real case — **left unfilled, deliberately**.
+      Unlike `XSPHPfn`, nothing in this pfn's own comments suggests a
+      specific narrow real-system type pair to anchor a `WritesBoth`
+      override to, and a loosely-typed
+      `AbstractParticleSystem, AbstractParticleSystem` override — the only
+      alternative — would incorrectly also match, and silently steal
+      dispatch from, its own ghost/virtual/boundary coupled cases (all of
+      which are `AbstractParticleSystem` subtypes too). Confirmed via grep
+      this combination is unused by all 13 scripts and untested; documented
+      in-place as an explicit design decision, not a silent gap.
+
+    **`FluidSolidPfn`'s mutating method — a confirmed dormant correctness
+    fix, not a live behaviour change**: its (now-deleted) mutating method was
+    loosely typed `(AbstractParticleSystem, AbstractParticleSystem)` and
+    silently assumed `ps_a` was always the fluid (reading `ps_a.p` for the
+    shared pressure term unconditionally) — wrong if ever called with the
+    solid in `ps_a`. Its `pfn_contribution`/`pfn_contribution_pair` methods
+    were already narrowly typed per real system type *by design* (a comment
+    predating this item wanted a mistyped call to throw `MethodError` rather
+    than silently use the wrong side's pressure), and are therefore already
+    order-independent — the new generic delegate inherits that correctness
+    for free. Checked all 13 scripts: `FluidSolidPfn` has exactly one call
+    site (`DambreakWall.jl:221`), already fluid-first, so this fixes a
+    latent bug nothing currently triggers, not a behaviour change to any
+    script's actual physics.
+
+    **Validation**: full suite **1615/1615** (down from 1691 — not a
+    coverage loss: `test_onesided_sweep.jl`'s old
+    `"pfn_contribution swap-antisymmetry (FluidPfn self)"` testset used the
+    mutating callable as an independent "ground truth" to check
+    `pfn_contribution` against; once the mutating callable became a thin
+    delegate *around* `pfn_contribution`, that comparison became circular
+    (~76 assertions removed, the new `XSPHPfn` `WritesBoth` test added ~4)
+    — the property it checked is now structurally guaranteed by
+    construction, not something that could silently drift between two
+    independent implementations). Every other existing testset — all
+    `WritesA`/`WritesB`/`WritesBoth` equivalence tests, all 8
+    `test_onesided_integration_*.jl` end-to-end per-script comparisons, the
+    `ColouredKA` real-CUDA oracle testset (`test_gpu_cuda.jl`, whose oracle
+    is `ColouredCPU` and therefore exercises this refactor too) — passed
+    unchanged, at their existing tolerances.
+
+    **Benchmark**: `bench/dambreak_scaling.jl`'s `cpu_col`/`cpu_1s` columns,
+    measured same-session/same-machine via `git stash` (unmodified code) vs.
+    the final `pfn_contribution_pair` design, RTX 4060 Laptop / AMD Ryzen 7
+    8845HS, `-t 1`:
+
+    | n_fluid | cpu_col before µs | cpu_col after µs | Δ | cpu_1s before µs | cpu_1s after µs | Δ |
+    |---|---|---|---|---|---|---|
+    | 2,500   | 432.0   | 426.3   | -1%  | 542.4   | 730.6   | +35% |
+    | 10,000  | 1,260.3 | 1,705.1 | +35% | 2,170.3 | 2,188.7 | +1%  |
+    | 40,000  | 5,299.3 | 6,910.5 | +30% | 9,017.2 | 9,123.0 | +1%  |
+    | 102,400 | 15,466.1| 16,985.9| +10% | 24,967.4| 24,248.3| -3%  |
+    | 202,500 | 29,327.4| 26,099.2| -11% | 53,093.7| 55,274.9| +4%  |
+
+    The clean, systematic ~20-32%-at-every-size inflation the *first*
+    (pre-`pfn_contribution_pair`) design produced — reproduced identically
+    across two separate runs — is gone. What's left is noisy and
+    inconsistent in direction (worse at 10k/40k, flat-to-better at
+    2.5k/102k/202k), which would normally be hard to read past — except the
+    **`cpu_1s` column is a built-in noise control**: `OnesidedCPU`'s sweep
+    code was not touched by either version of this item, so any swing in
+    `cpu_1s` between these two runs is pure measurement noise, not a code
+    effect. It swings by up to **+35%** (at 2,500) on exactly the same
+    hardware, same session, provably-unchanged code — comparable in size to
+    `cpu_col`'s own remaining swings. This laptop's `auto-cpufreq` power/
+    thermal governor is the likely source (matches item 13's own "~15-25%
+    run-to-run noise band" finding, here somewhat larger). Taken together:
+    the fix is verified **structurally correct by direct code inspection**
+    (the self/`WritesBoth` delegates now call `pfn_contribution_pair` once,
+    computing shared terms once — mechanistically identical in cost shape to
+    the original hand-written mutating methods, unlike the first design's
+    two independent `pfn_contribution` calls), and the clean systematic bias
+    the first design produced is gone; pinning an exact residual percentage
+    on this specific laptop isn't possible past its own noise floor. Server
+    hardware (item 13's A100/V100/H200 access) would give a cleaner number
+    if ever needed — not pursued here since the mechanistic fix is already
+    verified sound and the systematic regression is confirmed gone.
+
+    **Not built or changed**: no change to `Interaction.jl`, `KAKernels.jl`,
+    `Backend.jl`, or any experiment script — confirmed by the design itself
+    (the sweep engine's call sites are untouched) and by the full suite
+    passing unchanged. `test_onesided_sweep.jl`'s only changes are the
+    circular-test removal and the new `XSPHPfn` `WritesBoth` test noted
+    above.
+
+16. **Explicit neighbour list — GPU benchmarking spike (`NeighbourListKA`) —
+    done, a real win.** The last remaining line in "Explicitly deferred"
+    below: "Explicit neighbour list (on-the-fly 27-cell scan is current
+    approach)." Item 12 (Verlet-skin) already caches the CSR cell-to-particle
+    grid across steps while nothing has moved far enough to invalidate it,
+    but confirmed by direct code reading (`_sweep_self_onesided_kernel_2d!`
+    et al., `KAKernels.jl`) — every sweep call, on every backend, in every
+    mode, still re-derives its candidate pairs from scratch by walking the
+    full 9-cell (2D) neighbourhood and re-applying the `r_sq < cutoff_sq`
+    filter, whether or not the grid itself was rebuilt that step. This item
+    closes that gap: cache an explicit, over-inclusive candidate pair list
+    at `_grid_cutoff` radius (the same skin-padded radius Verlet-skin's grid
+    already uses) at each rebuild, and have the per-step sweep walk that
+    flat list instead of re-deriving candidates from the cell grid.
+
+    **Scoped as a spike, not a production feature, on purpose** — this
+    follows item 11's (`ColouredKA`) own precedent exactly: build the
+    smallest version that gives a real-hardware answer before investing in
+    a full production matrix, since this GPU's own established cost profile
+    (launch-count-bound, not compute-bound — item 2/11) made it genuinely
+    unclear whether removing cell-traversal *compute* (as opposed to
+    *launches*) would be worth anything here. Built as a 5th `ExecMode`,
+    `NeighbourListKA` (`src/Backend.jl`), reachable only via
+    `SystemInteraction`'s internal `mode` override kwarg — not a new public
+    `onesided`/`ka` boolean, same reasoning as `ColouredKA`. Self +
+    one coupled (`WritesA`, `FluidPfn` fluid+`StaticBoundarySystem` —
+    `bench/dambreak_scaling.jl`'s own shape) only, 2D only; a `WritesB`/
+    `WritesBoth` pfn under this mode's coupled sweep throws a clear error
+    rather than silently using an incomplete candidate list (verified by a
+    dedicated regression test).
+
+    **Mechanism**: two new `SystemInteraction` fields, `_nbr_start`/`_nbr_idx`
+    (`src/Interaction.jl`) — the same CSR-offsets-plus-flat-array shape
+    `_cell_start` already uses, capacity-preallocated and grown via the
+    *existing* `_resize_scratches!` helper (`Sorting.jl`, unchanged, first
+    built for ghosts in item 7). Built by two new `@kernel` passes per shape
+    (`src/KAKernels.jl`): a count pass (one thread per particle, re-walks the
+    same 9-cell stencil the onesided sweep kernels already use, but at the
+    padded `_grid_cutoff` radius, writing its own candidate count to a
+    register-local accumulator — no atomics, each thread owns exactly one
+    output slot) and a scatter pass (re-walks the identical stencil, writing
+    each candidate index into its thread's exclusive destination range,
+    fixed by a host-side `cumsum!` between the two passes — the same
+    primitive `GhostParticleSystem`'s GPU path already uses for its own
+    flag→offset step, item 7). This is the CSR/ragged-output analogue of
+    ghosts' flat flag+`cumsum!`+scatter compaction, adapted by adding the
+    count pass a flat 1-to-1 compaction doesn't need. The *consuming* sweep
+    kernels are a flat loop over the cached range calling the **existing,
+    unmodified** `_pair_self_onesided!`/`_pair_coupled_onesided!` — these
+    already apply the tight, unpadded `cutoff_sq` filter internally, so
+    consuming an over-inclusive cached candidate list changes nothing about
+    the physics, only how candidates are found; zero pfn/physics
+    duplication. The rebuild hook (`_maybe_build_neighbour_list!`,
+    dispatched on `ExecMode`, no-op for every other mode) is called from
+    `_prepare_grids!` (`TimeIntegration.jl`) immediately after the existing
+    `create_grid!(si, skin)` — the cached list is rebuilt exactly when (and
+    only when) the grid itself rebuilds, inheriting Verlet-skin's
+    rebuild-cadence gate for free with no new skin parameter.
+    `_validate_verlet_skin`'s mode check was widened by one `Union` member
+    (`OnesidedCPU`/`OnesidedKA`/`NeighbourListKA`) so `verlet_skin > 0` — the
+    entire point, since a list rebuilt every step has no reuse benefit — can
+    be requested for this mode through the normal
+    `LeapFrogTimeIntegrator`/`RK4TimeIntegrator` constructor path, letting
+    this be benchmarked through the exact same `time_integrate!`/
+    `bench/dambreak_scaling.jl` harness every other column already uses.
+
+    Written entirely as `@kernel function`s (no hand-written Polyester
+    twin): the same kernel source already runs correctly on `KA.CPU()`
+    (a cheap, deterministic Tier-1 correctness oracle, no GPU needed) and
+    `CUDABackend()` (the real benchmark), exactly how every existing
+    `OnesidedKA` kernel already serves both roles — `OnesidedCPU` is already
+    established (item 8) as strictly slower than `ColouredCPU` at every
+    scale, so this has no CPU production case to serve.
+
+    **Validation**: `test/test_neighbour_list.jl` (new) — single-sweep
+    equivalence on `KA.CPU()` against the `onesided=true, ka=true` oracle
+    (self and coupled, several `(n, L)` shapes including a dense cluster,
+    tight `rtol`); the `WritesB`/`WritesBoth` guard-error test; and two
+    multi-step `time_integrate!` equivalence tests (tame and fast motion,
+    mirroring `test_verlet_skin.jl`'s own pattern exactly) comparing a
+    `verlet_skin > 0, mode=NeighbourListKA()` run against a
+    `verlet_skin = 0` (rebuild-every-step, definitely-correct) oracle by
+    particle id at `rtol=1e-9` — the stronger, more direct comparison than
+    chaining through `OnesidedKA`'s own skin-verified-elsewhere equivalence.
+    `test/test_gpu_cuda.jl` gained a new testset mirroring `ColouredKA`'s own
+    entry exactly ("full pipeline (sort+grid+sweep), NeighbourListKA
+    self+coupled: onesided CPU oracle vs CUDA"), self+coupled, on real CUDA
+    hardware. Full suite: **1645/1645** (up from 1615 after item 15).
+
+    **Benchmark** (`bench/dambreak_scaling.jl`, extended with a 6th column,
+    `gpu_nlist` — `NeighbourListKA` + `verlet_skin = 0.2 * cutoff`, same skin
+    fraction as `gpu_1s_skin` for a fair comparison — run at the same
+    default sizes, same hardware, RTX 4060 Laptop):
+
+    | nfx | n_fluid | cpu_col µs | cpu_1s µs | gpu_1s µs | gpu_col µs | gpu_1s+skin µs | gpu_nlist µs | nlist/skin | nlist/1s |
+    |---|---|---|---|---|---|---|---|---|---|
+    | 50  | 2,500   | 427.8   | 730.7   | 1217.6  | 6050.8  | 861.2   | 596.7  | 0.693 | 0.490 |
+    | 100 | 10,000  | 1263.8  | 2946.4  | 1679.0  | 11039.4 | 1437.2  | 803.3  | 0.559 | 0.478 |
+    | 200 | 40,000  | 6905.3  | 10086.0 | 4551.3  | 11039.9 | 4358.8  | 1944.3 | 0.446 | 0.427 |
+    | 320 | 102,400 | 13117.0 | 28023.3 | 9270.4  | 12248.5 | 9148.4  | 4038.2 | 0.441 | 0.436 |
+    | 450 | 202,500 | 26352.6 | 55559.0 | 17162.9 | 11286.6 | 17059.0 | 7248.8 | 0.425 | 0.422 |
+
+    (`nlist/skin` = `gpu_nlist / gpu_1s+skin`; `nlist/1s` = `gpu_nlist /
+    gpu_1s`; below 1.0 means the neighbour list won.)
+
+    **A real, clean win — unlike item 11's (`ColouredKA`) clean loss, and
+    stronger than item 12's (Verlet-skin alone) partial, scale-fading win.**
+    `NeighbourListKA` beats plain `gpu_1s` (today's production GPU sweep) by
+    a consistent **2.0-2.4×** across the *entire* tested range — and unlike
+    Verlet-skin alone (whose own advantage over plain `gpu_1s` shrank from
+    1.72× at 2,500 particles to roughly break-even at 40,000+, since the
+    fixed per-step displacement-check cost stops mattering once the *rest*
+    of the step dominates but the *saved* rebuild cost is also a shrinking
+    fraction of a growing total), this item's margin over `gpu_1s+skin`
+    itself *holds steady or widens* with scale (0.693 at 2,500 down to 0.425
+    at 202,500) — because what it additionally removes (cell-stencil-walk
+    compute: cell-index arithmetic, redundant near-empty-cell visits) scales
+    with problem size the same way the rest of the sweep does, unlike the
+    displacement check's fixed per-step cost. This **moves the crossover
+    against CPU-coloured substantially left**: plain `gpu_1s`'s own crossover
+    was `n_fluid ≈ 40,000` (item 2); `gpu_nlist` already beats `cpu_col` by
+    10,000 particles (1.57× faster) and is losing by only 1.4× at
+    `dambreak.jl`'s own production scale (2,500) — versus `gpu_1s` alone
+    losing by 3.6× there. By 202,500 particles `gpu_nlist` is 3.6× faster
+    than CPU-coloured and clearly the fastest of every GPU mode tested,
+    including `gpu_col` (`ColouredKA`).
+
+    **This is the strongest positive GPU result recorded in this document**
+    — the mechanistic story behind it (item 2/11 established this hardware
+    is launch-count-bound, not compute-bound) predicted at best a modest
+    win; the measured 2×+ speedup this consistent across a 100× size range
+    suggests cell-stencil-walk compute (not just launch count) was a bigger
+    real cost than the launch-overhead framing alone implied — a genuine,
+    if narrow, update to that mechanistic model, not just a confirmation of
+    it. Given the strength and consistency of the result, extending this
+    spike toward a production feature (3D, `WritesB`/`WritesBoth`/
+    coupled-reverse shapes, wiring into scripts) looks like a good
+    candidate for follow-up — unlike item 11, which closed its own question
+    outright. Not pursued further in this item, matching its scope as a
+    spike: the question this item asked ("is this worth anything on this
+    hardware") now has a clear "yes," which is where a spike's job ends.
+
+    **Reproducing this on other hardware**: `bench/run_scaling_benchmark.sh`
+    (new) wraps the throwaway-merged-environment setup ("Environment notes"
+    above) and `bench/dambreak_scaling.jl` into one script, with an optional
+    `--before <git-ref>` flag that safely (stash + restore, never discards
+    work) runs the benchmark against another ref before switching back and
+    running the current checkout, for a direct before/after comparison on
+    server hardware (A100/H200) — the natural next step per item 13's own
+    precedent, not run in this item since only the laptop was available.
+
+    **Not built** (see "Explicitly deferred" below): 3D; `WritesB`/
+    `WritesBoth`/coupled-reverse shapes; a hand-written CPU-Polyester
+    build/consume path (no CPU production case exists — `OnesidedCPU` is
+    already slower than `ColouredCPU` everywhere, item 8); wiring into any
+    of the 13 production scripts; ghosts/virtual particles/probes/RK4.
+
 ## Explicitly deferred (not started, not part of the current scope)
 
 - ~~**GPU (`ka=true`) support for any pfn converted in Phase C**~~ — items
@@ -1890,7 +2213,13 @@ to coloured for all 13 scripts, and no script's behavior changed.
   descoped in item 12 ("Not built"), not merely unstarted.
 - Morton/Z-order sort keys (packed lexicographic `UInt64` key shipped
   instead).
-- Explicit neighbour list (on-the-fly 27-cell scan is current approach).
+- ~~Explicit neighbour list (on-the-fly 27-cell scan is current
+  approach).~~ — **done as a benchmarking spike, item 16** (`NeighbourListKA`)
+  — a real, consistent 2.0-2.4× win over today's production GPU sweep.
+  Self + one coupled (`WritesA`) shape, 2D only, reachable only via the
+  internal `mode` override — extending to a production feature (3D, other
+  coupled shapes, script wiring) is flagged as a good follow-up candidate in
+  item 16, not built there.
 - Float32/mixed precision (Float64 retained per the GPU-target decision —
   though note the hardware section above: this machine gets zero benefit
   from that decision either way).
@@ -1902,7 +2231,7 @@ to coloured for all 13 scripts, and no script's behavior changed.
   32 commits ahead of it (`12ac526`..`149c238`). Nothing on this branch has
   been pushed to any remote.
 - Run the full suite with `julia --project -e 'using Pkg; Pkg.test()'` —
-  should show `1691/1691` (834 through Phase B1, up to 935 after Phase B2's
+  should show `1645/1645` (834 through Phase B1, up to 935 after Phase B2's
   3D work, up to 1371 after Phase C, up to 1433 after item 5's `device_view`
   extension, up to 1466 after item 6's reverse-sweep KA kernel twin, up to
   1479 after also fixing the `FluidPfn` fluid-fluid `ka=true` dispatch gap
@@ -1915,7 +2244,14 @@ to coloured for all 13 scripts, and no script's behavior changed.
   `VirtualParticleSystem` `w_sum` buffer-type regression test), up to 1656
   after item 11 (the `ColouredKA` self+coupled real-CUDA testset), up to 1691
   after item 12 (`test/test_verlet_skin.jl`'s 27 new tests plus one new
-  real-CUDA testset in `test_gpu_cuda.jl`).
+  real-CUDA testset in `test_gpu_cuda.jl`), down to 1615 after item 15 —
+  not a coverage loss: item 15 deleted a ~76-assertion test that became
+  circular once `PairwiseFunctors.jl`'s mutating callables became thin
+  delegates around `pfn_contribution` (see item 15), and added a ~4-assertion
+  replacement for the newly-filled `XSPHPfn` `WritesBoth` case; every other
+  testset (including all real-CUDA ones) is unchanged. Up to **1645** after
+  item 16 (`test/test_neighbour_list.jl`, new, plus one new real-CUDA
+  testset in `test_gpu_cuda.jl`).
   `Pkg.test()` resolves its own CUDA
   from `test/Project.toml` and picks up real hardware automatically when
   present (confirmed again this item) — no merged-throwaway-environment

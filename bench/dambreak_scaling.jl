@@ -10,26 +10,36 @@
 # aspect ratio and ~18-neighbour count so ns/particle/step is comparable
 # across sizes.
 #
-# Reports FIVE columns: CPU-coloured (today's production default for every
+# Reports SIX columns: CPU-coloured (today's production default for every
 # script), CPU-onesided (the same full-stencil algorithm the GPU runs, on
 # CPU), GPU-onesided (today's production GPU sweep, ka=true), GPU-coloured
 # (ColouredKA — see docs/gpu-migration-plan.md's coloured-GPU benchmarking
-# spike, Backend.jl/KAKernels.jl), and GPU-onesided-with-skin (ka=true plus
+# spike, Backend.jl/KAKernels.jl), GPU-onesided-with-skin (ka=true plus
 # verlet_skin > 0 — docs/gpu-migration-plan.md deferred item 1: skips the
 # per-step sort + grid rebuild while no particle has moved far enough to
-# invalidate the current, skin-padded cell list). The cpu_1s column is not
-# optional — without it, a GPU "speedup" over the coloured sweep can't be
-# told apart from an artifact of comparing against a half-shell algorithm
-# that does half the pair evaluations per step. gpu_col answers a different
-# question: does porting that same half-work half-shell algorithm to GPU
-# (one kernel launch per colour, 6x/2D-self more launches than the single
-# onesided-KA launch) still win once launch overhead is paid 6x, or does
-# onesided-KA's single-launch/double-arithmetic shape win on this hardware?
-# gpu_1s_skin answers yet another question: given item 11 already showed this
-# GPU is launch-count-dominated rather than compute-bound, does removing the
+# invalidate the current, skin-padded cell list), and GPU-neighbour-list
+# (NeighbourListKA — docs/gpu-migration-plan.md's explicit-neighbour-list
+# benchmarking spike: caches an explicit, over-inclusive candidate pair list
+# at each of the same skin-gated rebuilds gpu_1s_skin already uses, and has
+# the per-step sweep consume that flat list instead of re-deriving candidates
+# from the cell grid every step). The cpu_1s column is not optional — without
+# it, a GPU "speedup" over the coloured sweep can't be told apart from an
+# artifact of comparing against a half-shell algorithm that does half the
+# pair evaluations per step. gpu_col answers a different question: does
+# porting that same half-work half-shell algorithm to GPU (one kernel launch
+# per colour, 6x/2D-self more launches than the single onesided-KA launch)
+# still win once launch overhead is paid 6x, or does onesided-KA's
+# single-launch/double-arithmetic shape win on this hardware? gpu_1s_skin
+# answers yet another question: given item 11 already showed this GPU is
+# launch-count-dominated rather than compute-bound, does removing the
 # sort+grid launches entirely on most steps (this benchmark's fluid block is
 # falling under gravity from rest, so displacement per step is tiny relative
 # to the skin margin) recover meaningfully more than gpu_1s already does?
+# gpu_nlist answers a further question on top of that: given the same
+# skin-gated rebuild cadence gpu_1s_skin already pays for, does ALSO removing
+# the cell-stencil-walk compute on every step (not just the sort+grid
+# launches) recover anything more — on hardware item 2/11 already established
+# is launch-count-bound, not compute-bound?
 #
 # Prediction, from measurements recorded in docs/gpu-migration-plan.md: this
 # GPU (RTX 4060 Laptop, sm_89) has NO Float64 compute advantage over the
@@ -182,9 +192,9 @@ function main()
         println("GPU: ", CUDA.name(CUDA.device()), "  (CUDA.jl v", pkgversion(CUDA), ")")
     end
     println()
-    @printf("%6s %10s %10s %8s | %12s %12s %12s %12s %12s | %9s %9s %9s %9s\n",
-            "nfx", "n_fluid", "n_bnd", "steps", "cpu_col us", "cpu_1s us", "gpu_1s us", "gpu_col us", "gpu_1s+skin us",
-            "1s/col", "col/col", "col/1s", "skin/1s")
+    @printf("%6s %10s %10s %8s | %12s %12s %12s %12s %12s %12s | %9s %9s %9s %9s %9s\n",
+            "nfx", "n_fluid", "n_bnd", "steps", "cpu_col us", "cpu_1s us", "gpu_1s us", "gpu_col us", "gpu_1s+skin us", "gpu_nlist us",
+            "1s/col", "col/col", "col/1s", "skin/1s", "nlist/skin")
 
     rows = NamedTuple[]
     for nfx in sizes
@@ -200,6 +210,7 @@ function main()
         t_gpu = NaN
         t_gpu_col = NaN
         t_gpu_skin = NaN
+        t_gpu_nlist = NaN
         if HAVE_CUDA
             integ_gpu, _, _ = build(nfx; onesided=true, ka=true, backend=CUDABackend())
             t_gpu = us_per_step(integ_gpu, nsteps; sync = () -> CUDA.synchronize())
@@ -209,12 +220,15 @@ function main()
 
             integ_gpu_skin, _, _ = build(nfx; onesided=true, ka=true, backend=CUDABackend(), verlet_skin_frac=0.2)
             t_gpu_skin = us_per_step(integ_gpu_skin, nsteps; sync = () -> CUDA.synchronize())
+
+            integ_gpu_nlist, _, _ = build(nfx; mode=Grasph.NeighbourListKA(), backend=CUDABackend(), verlet_skin_frac=0.2)
+            t_gpu_nlist = us_per_step(integ_gpu_nlist, nsteps; sync = () -> CUDA.synchronize())
         end
 
-        @printf("%6d %10d %10d %8d | %12.1f %12.1f %12.1f %12.1f %12.1f | %9.3f %9.3f %9.3f %9.3f\n",
-                nfx, n_fluid, n_bnd, nsteps, t_col, t_1s, t_gpu, t_gpu_col, t_gpu_skin,
-                t_gpu / t_1s, t_gpu_col / t_col, t_gpu_col / t_gpu, t_gpu_skin / t_gpu)
-        push!(rows, (; nfx, n_fluid, n_bnd, t_col, t_1s, t_gpu, t_gpu_col, t_gpu_skin))
+        @printf("%6d %10d %10d %8d | %12.1f %12.1f %12.1f %12.1f %12.1f %12.1f | %9.3f %9.3f %9.3f %9.3f %9.3f\n",
+                nfx, n_fluid, n_bnd, nsteps, t_col, t_1s, t_gpu, t_gpu_col, t_gpu_skin, t_gpu_nlist,
+                t_gpu / t_1s, t_gpu_col / t_col, t_gpu_col / t_gpu, t_gpu_skin / t_gpu, t_gpu_nlist / t_gpu_skin)
+        push!(rows, (; nfx, n_fluid, n_bnd, t_col, t_1s, t_gpu, t_gpu_col, t_gpu_skin, t_gpu_nlist))
     end
 
     println()
@@ -252,6 +266,12 @@ function main()
         println("GPU-onesided-with-skin (verlet_skin_frac=0.2) vs plain GPU-onesided: ",
                 round(minimum(skin_speedup); digits=3), "x-", round(maximum(skin_speedup); digits=3),
                 "x across tested sizes (best at n_fluid ≈ ", rows[best_i].n_fluid, ").")
+
+        nlist_speedup = [r.t_gpu_skin / r.t_gpu_nlist for r in rows]
+        best_j = argmax(nlist_speedup)
+        println("GPU-neighbour-list (NeighbourListKA, same verlet_skin_frac=0.2) vs GPU-onesided-with-skin: ",
+                round(minimum(nlist_speedup); digits=3), "x-", round(maximum(nlist_speedup); digits=3),
+                "x across tested sizes (best at n_fluid ≈ ", rows[best_j].n_fluid, ").")
     else
         println("CUDA not available on this machine — CPU-coloured vs CPU-onesided columns only.")
     end
@@ -261,9 +281,9 @@ function main()
     mkpath(outdir)
     outpath = joinpath(outdir, "dambreak_scaling_$(Dates.format(Dates.now(), "yyyymmdd_HHMMSS")).csv")
     open(outpath, "w") do io
-        println(io, "nfx,n_fluid,n_bnd,cpu_coloured_us,cpu_onesided_us,gpu_onesided_us,gpu_coloured_us,gpu_onesided_skin_us")
+        println(io, "nfx,n_fluid,n_bnd,cpu_coloured_us,cpu_onesided_us,gpu_onesided_us,gpu_coloured_us,gpu_onesided_skin_us,gpu_neighbour_list_us")
         for r in rows
-            println(io, "$(r.nfx),$(r.n_fluid),$(r.n_bnd),$(r.t_col),$(r.t_1s),$(r.t_gpu),$(r.t_gpu_col),$(r.t_gpu_skin)")
+            println(io, "$(r.nfx),$(r.n_fluid),$(r.n_bnd),$(r.t_col),$(r.t_1s),$(r.t_gpu),$(r.t_gpu_col),$(r.t_gpu_skin),$(r.t_gpu_nlist)")
         end
     end
     println("\nWrote ", outpath)

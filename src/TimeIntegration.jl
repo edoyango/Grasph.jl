@@ -19,7 +19,10 @@ abstract type AbstractTimeIntegrator end
 # sort+grid rebuild on steps where no tracked particle has moved far enough to
 # invalidate the current cell list — see docs/gpu-migration-plan.md, deferred
 # item 1). Scope is deliberately narrow: only the onesided sweep modes
-# (OnesidedCPU/OnesidedKA) have the grid-pitch/physical-cutoff split needed
+# (OnesidedCPU/OnesidedKA), plus the NeighbourListKA benchmarking spike
+# (which reuses the same grid-pitch/physical-cutoff split and additionally
+# needs verlet_skin>0 for its cached candidate list to ever be reused across
+# more than one step), have the grid-pitch/physical-cutoff split needed
 # for a widened, staleness-tolerant cell list (Interaction.jl, KAKernels.jl);
 # ghosts are regenerated from live boundary positions every step regardless of
 # skin, and virtual systems aren't tracked either, so both are rejected
@@ -32,7 +35,7 @@ function _validate_verlet_skin(verlet_skin, ints, gsts, vsys, T)
         "verlet_skin > 0 is not supported together with ghosts (generate_ghosts! regenerates them from live boundary positions every step, regardless of skin)"))
     isempty(vsys) || throw(ArgumentError(
         "verlet_skin > 0 is not supported together with virtual_systems (not tracked by the rebuild-cadence displacement check)"))
-    all(inter -> _exec_mode(inter) isa Union{OnesidedCPU,OnesidedKA}, ints) || throw(ArgumentError(
+    all(inter -> _exec_mode(inter) isa Union{OnesidedCPU,OnesidedKA,NeighbourListKA}, ints) || throw(ArgumentError(
         "verlet_skin > 0 requires every interaction to use onesided=true (OnesidedCPU/OnesidedKA) — the coloured sweep's grid-pitch/cutoff split is not implemented"))
     min_cutoff = T(minimum(inter._cell_size for inter in ints))
     T(verlet_skin) < 2*min_cutoff || throw(ArgumentError(
@@ -422,7 +425,10 @@ function _prepare_grids!(ghosts, virtual_sys, ints, sort_cutoff, sort_perm_buf, 
         sort_particles!(vps, sort_cutoff, sort_perm_buf, sort_key_buf, virtual_scratches[i])
     end
     for (i, inter) in enumerate(ints)
-        @timeit to inter_labels[i].grid @timeit to inter_labels[i].name create_grid!(inter, skin)
+        @timeit to inter_labels[i].grid @timeit to inter_labels[i].name begin
+            create_grid!(inter, skin)
+            _maybe_build_neighbour_list!(inter)
+        end
     end
 end
 

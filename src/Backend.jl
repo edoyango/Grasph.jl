@@ -13,13 +13,23 @@
 # arithmetic (as ColouredCPU does over OnesidedCPU) is still a net win once
 # it costs 6-27x more kernel launches on a GPU. Not wired into any script;
 # reachable only via SystemInteraction's internal `mode` override kwarg.
+# NeighbourListKA is a second internal benchmarking spike (see
+# docs/gpu-migration-plan.md, "Explicit neighbour list"): it caches an
+# explicit, over-inclusive candidate pair list at each Verlet-skin rebuild
+# and has the per-step sweep walk that flat list instead of re-deriving
+# candidates from the cell grid every step — answering whether removing
+# cell-traversal compute (not launches) is worth anything on hardware whose
+# cost is dominated by launch count, not compute. Self + one coupled
+# (WritesA) shape only, 2D only; not wired into any script; reachable only
+# via SystemInteraction's internal `mode` override kwarg.
 # ---------------------------------------------------------------------------
 
 abstract type ExecMode end
-struct ColouredCPU <: ExecMode end
-struct OnesidedCPU <: ExecMode end
-struct OnesidedKA  <: ExecMode end
-struct ColouredKA  <: ExecMode end
+struct ColouredCPU      <: ExecMode end
+struct OnesidedCPU      <: ExecMode end
+struct OnesidedKA       <: ExecMode end
+struct ColouredKA       <: ExecMode end
+struct NeighbourListKA  <: ExecMode end
 
 # ---------------------------------------------------------------------------
 # Host copy-back for paths that cannot run on a GPU-resident system: HDF5's C

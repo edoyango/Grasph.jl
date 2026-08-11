@@ -14,19 +14,25 @@ using Random
 # the existing coloured half-shell/coupled sweep as an independent oracle,
 # via:
 #
-#   1. Swap-antisymmetry:  pfn_contribution(pfn,ps,i,j,...) combined with
-#      pfn_contribution(pfn,ps,j,i,...) must reproduce the two-sided
-#      mutating method's effect on both particles exactly — this is the
-#      structural property the whole one-sided rewrite depends on.
-#   2. Self-pair exclusion: a particle must never pair with itself in the
+#   1. Self-pair exclusion: a particle must never pair with itself in the
 #      full same-cell scan (unlike the half-shell's i<j ordering, which made
 #      this impossible by construction).
-#   3. Full-sweep equivalence: onesided=true vs onesided=false on identical
+#   2. Full-sweep equivalence: onesided=true vs onesided=false on identical
 #      particle clouds, built through the real sort_particles!/create_grid!
 #      path (not manually-injected CSR arrays), in 2D and 3D, self and
 #      coupled (fluid <-> StaticBoundarySystem).
-#   4. Short-run trajectory equivalence: a real LeapFrogTimeIntegrator run
+#   3. Short-run trajectory equivalence: a real LeapFrogTimeIntegrator run
 #      over many steps, comparing accumulated drift.
+#
+# Note: this file used to also carry a "swap-antisymmetry" test comparing
+# pfn_contribution(pfn,ps,i,j,...)/pfn_contribution(pfn,ps,j,i,...) against
+# FluidPfn's two-sided *mutating* callable as an independent "ground truth".
+# Since PairwiseFunctors.jl's mutating callables are now themselves generic
+# delegates that call pfn_contribution (see AbstractPairwiseFunctor), that
+# comparison became circular (pfn_contribution compared against a thin
+# wrapper of itself) and was removed — the property it checked is now
+# structurally guaranteed by construction, not something that can silently
+# drift between two independent implementations.
 # ---------------------------------------------------------------------------
 
 _sortbufs(ps::Grasph.AbstractParticleSystem) =
@@ -59,49 +65,8 @@ end
 # 1. Swap-antisymmetry
 # ---------------------------------------------------------------------------
 
-@testset "pfn_contribution swap-antisymmetry (FluidPfn self)" begin
-    rng = MersenneTwister(1)
-    h = 0.1
-    kernel = CubicSplineKernel(h; ndims=2)
-    pfn = FluidPfn(0.03, 0.0, h)
-
-    for trial in 1:20
-        ps = _random_fluid(rng, 2, 2; L=0.05)   # small L: guarantee within cutoff
-
-        # Ground truth: the existing two-sided mutating method.
-        xi, xj = ps.x[1], ps.x[2]
-        dx = xi - xj
-        r  = norm(dx)
-        r < 1e-8 && continue   # skip degenerate coincident draw
-        q  = r / h
-        gx = (Grasph.kernel_dw_dq(kernel, q) / (r * h)) * dx
-        w  = Grasph.kernel_w(kernel, q)
-
-        fill!(ps.dvdt, zero(SVector{2,Float64})); ps.drhodt .= 0.0
-        pfn(ps, 1, 2, dx, gx, w)   # two-sided mutating call
-        expected_dvdt_1, expected_dvdt_2   = ps.dvdt[1], ps.dvdt[2]
-        expected_drho_1, expected_drho_2   = ps.drhodt[1], ps.drhodt[2]
-
-        # One-sided: contribution to 1 from 2, and contribution to 2 from 1
-        # (computed from the ACTUALLY swapped pair, not just negated dx/gx).
-        c1 = pfn_contribution(pfn, ps, 1, 2, dx, gx, w)
-
-        dx_ji = xj - xi
-        r_ji  = norm(dx_ji)
-        q_ji  = r_ji / h
-        gx_ji = (Grasph.kernel_dw_dq(kernel, q_ji) / (r_ji * h)) * dx_ji
-        w_ji  = Grasph.kernel_w(kernel, q_ji)
-        c2 = pfn_contribution(pfn, ps, 2, 1, dx_ji, gx_ji, w_ji)
-
-        @test c1.dvdt   ≈ expected_dvdt_1 atol=1e-13
-        @test c2.dvdt   ≈ expected_dvdt_2 atol=1e-13
-        @test c1.drhodt ≈ expected_drho_1 atol=1e-10
-        @test c2.drhodt ≈ expected_drho_2 atol=1e-10
-    end
-end
-
 # ---------------------------------------------------------------------------
-# 2. Self-pair exclusion
+# 1. Self-pair exclusion
 # ---------------------------------------------------------------------------
 
 @testset "onesided self sweep never pairs a particle with itself" begin
@@ -1063,6 +1028,32 @@ end
     pfn = FluidSolidPfn(0.03, 0.0, 0.08)
     for ndims in (2, 3)
         _compare_coupled_writesboth(rng, pfn, _random_fluid_a, _random_wall, (:dvdt, :drhodt), (:dvdt, :drhodt), 250, 150, ndims)
+    end
+end
+
+# XSPHPfn's real-real (WritesBoth) coupled method is confirmed dead code (no
+# script currently pairs two distinct real FluidParticleSystems via
+# velocity_adjust_pairwise_fn — see the pfn's own docstring), but it now has
+# a pfn_contribution/_onesided_shape counterpart (mirroring FluidPfn's own
+# fluid-fluid pattern) where none existed before this refactor. Covering it
+# here closes that gap the same way the FluidPfn/FluidSolidPfn cases above
+# already are.
+_random_fluid_a_xsph(rng, n, ndims; L=1.0) =
+    let ps = _random_fluid_a(rng, n, ndims; L=L)
+        fill!(ps.v_adjustment, zero(SVector{ndims,Float64}))
+        ps
+    end
+_random_fluid_b_xsph(rng, n, ndims; L=1.0) =
+    let ps = _random_fluid_b(rng, n, ndims; L=L)
+        fill!(ps.v_adjustment, zero(SVector{ndims,Float64}))
+        ps
+    end
+
+@testset "onesided=true XSPHPfn fluid-fluid (WritesBoth) matches coloured sweep" begin
+    rng = MersenneTwister(63)
+    pfn = XSPHPfn(0.5)
+    for ndims in (2, 3)
+        _compare_coupled_writesboth(rng, pfn, _random_fluid_a_xsph, _random_fluid_b_xsph, (:v_adjustment,), (:v_adjustment,), 250, 200, ndims)
     end
 end
 

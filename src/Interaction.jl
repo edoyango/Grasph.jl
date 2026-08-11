@@ -34,6 +34,8 @@ struct SystemInteraction{T<:AbstractFloat, ND, KT<:AbstractKernel{T,ND}, SA<:Abs
     _maxgridx_a::MVector{ND,T}          # max position of system_a particles per dim (ndims,)
     _cell_size::T                       # TRUE physical interaction cutoff (kernel.interaction_length); never changes after construction. Used everywhere cutoff_sq is derived for the pairwise distance filter — NOT for cell-grid geometry.
     _grid_cutoff::Base.RefValue{T}      # cell-partitioning pitch actually used by the current cell list (create_grid!'s cutoff+skin); equals _cell_size when skin=0. Used for cell-index derivation (_cell_1idx, coupled cell-index bounds) only.
+    _nbr_start::CSA                     # NeighbourListKA only (see docs/gpu-migration-plan.md): CSR offsets into _nbr_idx, same convention as _cell_start; length = system_a.n + 1. Empty/unused for every other mode.
+    _nbr_idx::CSA                       # NeighbourListKA only: flat, capacity-preallocated candidate-neighbour-index array built at _grid_cutoff radius (over-inclusive), consumed by the nlist sweep kernels. Empty/unused for every other mode.
     function SystemInteraction{T, ND, KT, SA, SB, PFNS, VPFN, CSA, MODE}(args...) where {T, ND, KT, SA, SB, PFNS, VPFN, CSA, MODE}
         ND isa Int || throw(ArgumentError("ND must be an Int, got $(typeof(ND))"))
         new{T, ND, KT, SA, SB, PFNS, VPFN, CSA, MODE}(args...)
@@ -101,6 +103,8 @@ function SystemInteraction(
     mode = mode !== nothing ? mode : ka ? OnesidedKA() : onesided ? OnesidedCPU() : ColouredCPU()
     cell_start   = similar(system_a.x, Int, 0)
     cell_start_a = similar(system_a.x, Int, 0)
+    nbr_start    = similar(system_a.x, Int, 0)
+    nbr_idx      = similar(system_a.x, Int, 0)
     SystemInteraction{
         T, nd, typeof(kernel),
         typeof(system_a), typeof(system_b), typeof(pfns), typeof(velocity_adjust_pairwise_fn),
@@ -119,6 +123,8 @@ function SystemInteraction(
         MVector{nd,T}(undef),
         T(kernel.interaction_length),
         Ref(T(kernel.interaction_length)),
+        nbr_start,
+        nbr_idx,
     )
 end
 
@@ -400,6 +406,32 @@ _sweep_mode!(::OnesidedKA,  si, ::Nothing, pfn) = _sweep_self_ka!(si, pfn)
 _sweep_mode!(::OnesidedKA,  si, system_b, pfn)  = _sweep_coupled_ka_dispatch!(_onesided_shape(pfn, si.system_a, system_b), si, system_b, pfn)
 _sweep_mode!(::ColouredKA,  si, ::Nothing, pfn) = _sweep_self_coloured_ka!(si, pfn)
 _sweep_mode!(::ColouredKA,  si, system_b, pfn)  = _sweep_coupled_coloured_ka!(si, system_b, pfn)
+_sweep_mode!(::NeighbourListKA, si, ::Nothing, pfn) = _sweep_self_nlist!(si, pfn)
+function _sweep_mode!(::NeighbourListKA, si, system_b, pfn)
+    _onesided_shape(pfn, si.system_a, system_b) isa WritesA || error(
+        "NeighbourListKA coupled sweep only supports WritesA-shaped pfns " *
+        "(this is a benchmarking spike — see docs/gpu-migration-plan.md, " *
+        "\"Explicit neighbour list\"); got $(_onesided_shape(pfn, si.system_a, system_b)) " *
+        "for $(typeof(pfn))")
+    _sweep_coupled_nlist!(si, system_b, pfn)
+end
+
+# ---------------------------------------------------------------------------
+# NeighbourListKA rebuild hook — called once per interaction from
+# _prepare_grids! (TimeIntegration.jl), immediately after create_grid!, so
+# the cached candidate list is rebuilt exactly when (and only when) the cell
+# grid itself rebuilds. No-op for every other mode.
+# ---------------------------------------------------------------------------
+
+_maybe_build_neighbour_list!(si::SystemInteraction) = _maybe_build_neighbour_list!(_exec_mode(si), si)
+_maybe_build_neighbour_list!(::ExecMode, si) = nothing
+function _maybe_build_neighbour_list!(::NeighbourListKA, si)
+    if si.system_b === nothing
+        _build_neighbour_list_self!(si)
+    else
+        _build_neighbour_list_coupled!(si, si.system_b)
+    end
+end
 
 # ---------------------------------------------------------------------------
 # One-sided coupled write-direction trait

@@ -22,6 +22,7 @@ using Grasph
     include("test_onesided_integration_cantilever.jl")
     include("test_ka_cpu.jl")
     include("test_verlet_skin.jl")
+    include("test_neighbour_list.jl")
     include("test_cpu_path_guard.jl")
     include("test_gpu_cuda.jl")
     include("test_gpu_dambreak.jl")

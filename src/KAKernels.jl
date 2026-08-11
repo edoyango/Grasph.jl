@@ -427,6 +427,259 @@ function _sweep_coupled_coloured_ka!(si::SystemInteraction{T,2}, system_b, pfn::
 end
 
 # ---------------------------------------------------------------------------
+# Explicit neighbour list — internal benchmarking spike (NeighbourListKA, see
+# docs/gpu-migration-plan.md and Backend.jl's NeighbourListKA comment).
+#
+# Build: two passes per interaction (count, then scatter), each a per-thread
+# re-walk of the *same* 9-cell stencil the onesided sweep kernels above
+# already use, but filtered at the padded _grid_cutoff radius (an
+# over-inclusive superset, valid until the next Verlet-skin rebuild) instead
+# of the tight physical cutoff, and with the "call pfn_contribution" step
+# replaced by "count a candidate" / "write a candidate index". No atomics
+# anywhere: each thread owns exactly one output slot in the count pass (its
+# own `nbr_count[i]`) and exactly one exclusive destination range in the
+# scatter pass (`nbr_start[i]:nbr_start[i+1]-1`, fixed by the host-side
+# `cumsum!` between the two passes) — the CSR/ragged-output analogue of
+# GhostParticleSystem's flat flag+cumsum!+scatter GPU pattern below, adapted
+# by adding the count pass a flat 1-to-1 compaction doesn't need.
+#
+# Consume: one flat loop over the cached `nbr_start[i]:nbr_start[i+1]-1`
+# range per thread instead of a cell-stencil walk, calling the *same*
+# _pair_self_onesided!/_pair_coupled_onesided! (Interaction.jl) the onesided
+# kernels above call — these already apply the tight, unpadded
+# `r_sq < cutoff_sq` filter internally, so consuming an over-inclusive
+# candidate list changes nothing about the physics, only how candidates are
+# found. Zero pfn/physics duplication.
+#
+# Self + one coupled (WritesA) shape only, 2D only — see the plan this
+# implements (docs/gpu-migration-plan.md) for why this is scoped as a spike,
+# not a production feature.
+# ---------------------------------------------------------------------------
+
+@kernel function _nbr_count_self_kernel_2d!(nbr_count, @Const(x), cutoff, cutoff_sq, @Const(cell_start), mingridx, ngridx)
+    i = @index(Global, Linear)
+    @inbounds begin
+        n_cells_y = ngridx[2]
+        val_ndims = Val{2}()
+        cell_idx  = _cell_1idx(x[i], mingridx, cutoff, ngridx, val_ndims)
+        count = 0
+        for dx_cell in -1:1
+            neighbour_cell_idx = cell_idx + dx_cell * n_cells_y - 1
+            pstart = cell_start[neighbour_cell_idx]
+            pend   = cell_start[neighbour_cell_idx + 3]
+            for j in pstart:pend-1
+                j == i && continue
+                dxv = x[i] - x[j]
+                dot(dxv, dxv) < cutoff_sq && (count += 1)
+            end
+        end
+        nbr_count[i] = count
+    end
+end
+
+@kernel function _nbr_scatter_self_kernel_2d!(nbr_idx, @Const(nbr_start), @Const(x), cutoff, cutoff_sq, @Const(cell_start), mingridx, ngridx)
+    i = @index(Global, Linear)
+    @inbounds begin
+        n_cells_y = ngridx[2]
+        val_ndims = Val{2}()
+        cell_idx  = _cell_1idx(x[i], mingridx, cutoff, ngridx, val_ndims)
+        dest = nbr_start[i]
+        for dx_cell in -1:1
+            neighbour_cell_idx = cell_idx + dx_cell * n_cells_y - 1
+            pstart = cell_start[neighbour_cell_idx]
+            pend   = cell_start[neighbour_cell_idx + 3]
+            for j in pstart:pend-1
+                j == i && continue
+                dxv = x[i] - x[j]
+                if dot(dxv, dxv) < cutoff_sq
+                    nbr_idx[dest] = j
+                    dest += 1
+                end
+            end
+        end
+    end
+end
+
+# No `j == i` guard: ps_a and ps_b are distinct systems, matching the
+# coupled onesided kernels' own comment above.
+@kernel function _nbr_count_coupled_kernel_2d!(nbr_count, @Const(xa), @Const(xb), cutoff, cutoff_sq, @Const(cell_start), mingridx, ngridx)
+    i = @index(Global, Linear)
+    @inbounds begin
+        n_cells_y = ngridx[2]
+        val_ndims = Val{2}()
+        cell_idx  = _cell_1idx(xa[i], mingridx, cutoff, ngridx, val_ndims)
+        count = 0
+        for dx_cell in -1:1
+            neighbour_cell_idx = cell_idx + dx_cell * n_cells_y - 1
+            pstart = cell_start[neighbour_cell_idx]
+            pend   = cell_start[neighbour_cell_idx + 3]
+            for j in pstart:pend-1
+                dxv = xa[i] - xb[j]
+                dot(dxv, dxv) < cutoff_sq && (count += 1)
+            end
+        end
+        nbr_count[i] = count
+    end
+end
+
+@kernel function _nbr_scatter_coupled_kernel_2d!(nbr_idx, @Const(nbr_start), @Const(xa), @Const(xb), cutoff, cutoff_sq, @Const(cell_start), mingridx, ngridx)
+    i = @index(Global, Linear)
+    @inbounds begin
+        n_cells_y = ngridx[2]
+        val_ndims = Val{2}()
+        cell_idx  = _cell_1idx(xa[i], mingridx, cutoff, ngridx, val_ndims)
+        dest = nbr_start[i]
+        for dx_cell in -1:1
+            neighbour_cell_idx = cell_idx + dx_cell * n_cells_y - 1
+            pstart = cell_start[neighbour_cell_idx]
+            pend   = cell_start[neighbour_cell_idx + 3]
+            for j in pstart:pend-1
+                dxv = xa[i] - xb[j]
+                if dot(dxv, dxv) < cutoff_sq
+                    nbr_idx[dest] = j
+                    dest += 1
+                end
+            end
+        end
+    end
+end
+
+# --- build launchers ---
+#
+# Both self and coupled share si._nbr_start/si._nbr_idx (one SystemInteraction
+# is exclusively self or exclusively coupled, never both — the same duality
+# _cell_start already has). nbr_start[1] and the +=1 shift are written via
+# broadcasting views (not scalar indexing) so this stays allowscalar(false)-safe
+# on CuArray. total is pulled back to host the same way GhostParticles.jl's GPU
+# path pulls its own compaction total (`Array(view(...))[1]`).
+
+function _build_neighbour_list_self!(si::SystemInteraction{T,2}) where {T}
+    ps = si.system_a
+    n  = ps.n
+    nbr_start = si._nbr_start
+    resize!(nbr_start, n + 1)
+    if n == 0
+        fill!(nbr_start, 1)
+        return nothing
+    end
+    backend   = KA.get_backend(ps.x)
+    cutoff    = si._grid_cutoff[]
+    cutoff_sq = cutoff * cutoff
+    mingridx  = SVector(si._mingridx)
+    ngridx    = SVector(si._ngridx)
+
+    _nbr_count_self_kernel_2d!(backend, _KA_WORKGROUP)(
+        view(nbr_start, 2:n+1), ps.x, cutoff, cutoff_sq, si._cell_start, mingridx, ngridx;
+        ndrange = n)
+    KA.synchronize(backend)
+    fill!(view(nbr_start, 1:1), 1)
+    cumsum!(view(nbr_start, 2:n+1), view(nbr_start, 2:n+1))
+    view(nbr_start, 2:n+1) .+= 1
+
+    total = Int(Array(view(nbr_start, n+1:n+1))[1]) - 1
+    _resize_scratches!((si._nbr_idx,), total)
+    if total > 0
+        _nbr_scatter_self_kernel_2d!(backend, _KA_WORKGROUP)(
+            si._nbr_idx, nbr_start, ps.x, cutoff, cutoff_sq, si._cell_start, mingridx, ngridx;
+            ndrange = n)
+        KA.synchronize(backend)
+    end
+    return nothing
+end
+
+function _build_neighbour_list_coupled!(si::SystemInteraction{T,2}, ps_b) where {T}
+    ps_a = si.system_a
+    n    = ps_a.n
+    nbr_start = si._nbr_start
+    resize!(nbr_start, n + 1)
+    if n == 0
+        fill!(nbr_start, 1)
+        return nothing
+    end
+    backend   = KA.get_backend(ps_a.x)
+    cutoff    = si._grid_cutoff[]
+    cutoff_sq = cutoff * cutoff
+    mingridx  = SVector(si._mingridx)
+    ngridx    = SVector(si._ngridx)
+
+    _nbr_count_coupled_kernel_2d!(backend, _KA_WORKGROUP)(
+        view(nbr_start, 2:n+1), ps_a.x, ps_b.x, cutoff, cutoff_sq, si._cell_start, mingridx, ngridx;
+        ndrange = n)
+    KA.synchronize(backend)
+    fill!(view(nbr_start, 1:1), 1)
+    cumsum!(view(nbr_start, 2:n+1), view(nbr_start, 2:n+1))
+    view(nbr_start, 2:n+1) .+= 1
+
+    total = Int(Array(view(nbr_start, n+1:n+1))[1]) - 1
+    _resize_scratches!((si._nbr_idx,), total)
+    if total > 0
+        _nbr_scatter_coupled_kernel_2d!(backend, _KA_WORKGROUP)(
+            si._nbr_idx, nbr_start, ps_a.x, ps_b.x, cutoff, cutoff_sq, si._cell_start, mingridx, ngridx;
+            ndrange = n)
+        KA.synchronize(backend)
+    end
+    return nothing
+end
+
+# --- consume: sweep kernels ---
+
+@kernel function _sweep_self_nlist_kernel_2d!(ps, pfn, kernel, h, cutoff_sq, @Const(nbr_start), @Const(nbr_idx))
+    i = @index(Global, Linear)
+    @inbounds begin
+        val_ndims = Val{2}()
+        acc = _onesided_zero_self(pfn, ps, i)
+        pstart = nbr_start[i]
+        pend   = nbr_start[i+1] - 1
+        for k in pstart:pend
+            j = nbr_idx[k]
+            acc = _pair_self_onesided!(pfn, ps, i, j, kernel, h, cutoff_sq, val_ndims, acc)
+        end
+        _onesided_writeback_self!(pfn, ps, i, acc)
+    end
+end
+
+@kernel function _sweep_coupled_nlist_kernel_2d!(ps_a, ps_b, pfn, kernel, h, cutoff_sq, @Const(nbr_start), @Const(nbr_idx))
+    i = @index(Global, Linear)
+    @inbounds begin
+        val_ndims = Val{2}()
+        acc = _onesided_zero_coupled(pfn, ps_a, ps_b, i)
+        pstart = nbr_start[i]
+        pend   = nbr_start[i+1] - 1
+        for k in pstart:pend
+            j = nbr_idx[k]
+            acc = _pair_coupled_onesided!(pfn, ps_a, ps_b, i, j, kernel, h, cutoff_sq, val_ndims, acc)
+        end
+        _onesided_writeback_coupled!(pfn, ps_a, ps_b, i, acc)
+    end
+end
+
+_sweep_self_nlist!(si::SystemInteraction{T,2}, ::Nothing) where {T} = nothing
+
+function _sweep_self_nlist!(si::SystemInteraction{T,2}, pfn::PFN) where {T,PFN}
+    ps      = si.system_a
+    backend = KA.get_backend(ps.x)
+    _sweep_self_nlist_kernel_2d!(backend, _KA_WORKGROUP)(
+        device_view(ps), pfn, si.kernel, T(si.kernel.h), si._cell_size * si._cell_size,
+        si._nbr_start, si._nbr_idx;
+        ndrange = ps.n)
+    KA.synchronize(backend)
+    return nothing
+end
+
+_sweep_coupled_nlist!(si::SystemInteraction{T,2}, ps_b, ::Nothing) where {T} = nothing
+
+function _sweep_coupled_nlist!(si::SystemInteraction{T,2}, ps_b, pfn::PFN) where {T,PFN}
+    ps_a    = si.system_a
+    backend = KA.get_backend(ps_a.x)
+    _sweep_coupled_nlist_kernel_2d!(backend, _KA_WORKGROUP)(
+        device_view(ps_a), device_view(ps_b), pfn, si.kernel, T(si.kernel.h), si._cell_size * si._cell_size,
+        si._nbr_start, si._nbr_idx;
+        ndrange = ps_a.n)
+    KA.synchronize(backend)
+    return nothing
+end
+
+# ---------------------------------------------------------------------------
 # Ghost kernels — GPU (item 7). GhostParticleSystem's owned arrays are
 # capacity-preallocated (see GhostParticles.jl's generate_ghosts! GPU path),
 # so every kernel below is bounded by an explicit `n`/`ndrange` argument
