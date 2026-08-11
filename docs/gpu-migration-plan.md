@@ -2186,11 +2186,91 @@ to coloured for all 13 scripts, and no script's behavior changed.
     server hardware (A100/H200) — the natural next step per item 13's own
     precedent, not run in this item since only the laptop was available.
 
+    To reproduce both tables on this page (GPU and CPU) in one run, at the
+    default sizes (`nfx = 50,100,200,320,450`, matching every row above and
+    below exactly):
+
+    ```
+    bench/run_scaling_benchmark.sh
+    ```
+
+    All seven columns — `cpu_col`, `cpu_1s`, `gpu_1s`, `gpu_col`,
+    `gpu_1s_skin`, `gpu_nlist`, `cpu_nlist` — come out of this single
+    invocation: the CPU columns always run, and the GPU columns run
+    automatically whenever `CUDA.functional()` is true on that machine
+    (skipped with a printed warning otherwise, so a CUDA-less machine still
+    reproduces the CPU-only table below on its own). To A/B against another
+    commit instead of just recording fresh numbers (e.g. the state before
+    this item landed), add `--before <git-ref>`, e.g. `--before 1c60d3a`
+    (the commit right before item 16's work began).
+
+    **CPU-side check, same session, direct follow-up**: does persistent-pairs
+    caching help *CPU* at all, independent of the coloured-vs-onesided
+    question? Since the build/consume kernels are plain `@kernel function`s
+    (no hand-written Polyester twin — see "Not built" below), they already
+    run correctly on `KA.CPU()` for free; `bench/dambreak_scaling.jl` gained
+    a 7th column, `cpu_nlist` (`NeighbourListKA` on the plain `Vector`
+    backend, same `verlet_skin_frac=0.2`, no CUDA involved), same hardware:
+
+    | nfx | n_fluid | cpu_col µs | cpu_1s µs | cpu_nlist µs | cnl/col | cnl/1s |
+    |---|---|---|---|---|---|---|
+    | 50  | 2,500   | 435.2   | 540.9   | 455.3   | 1.046 | 0.842 |
+    | 100 | 10,000  | 1566.3  | 2163.2  | 1822.3  | 1.163 | 0.842 |
+    | 200 | 40,000  | 6467.5  | 8674.0  | 8957.2  | 1.385 | 1.033 |
+    | 320 | 102,400 | 17474.5 | 27254.5 | 19472.4 | 1.114 | 0.715 |
+    | 450 | 202,500 | 26894.3 | 52442.3 | 38120.6 | 1.417 | 0.727 |
+
+    (`cnl/col` = `cpu_nlist / cpu_col`; `cnl/1s` = `cpu_nlist / cpu_1s`;
+    below 1.0 means the neighbour list won. **Important caveat on `cpu_nlist`
+    itself**: it is still `_pair_self_onesided!`/`_pair_coupled_onesided!`'s
+    *one-sided* candidate shape — full neighbourhood per particle, no
+    Newton's-third-law reuse — not `cpu_col`'s half-shell two-sided
+    algorithm. This column answers "does avoiding the cell-stencil walk help
+    CPU at all," not "would a persistent-pairs version of the coloured
+    sweep beat today's coloured sweep" — those are different questions; see
+    below for why the latter isn't built.)
+
+    **A real but modest win over plain CPU-onesided that never closes the
+    gap to CPU-coloured — the opposite profile from the GPU result above.**
+    `cpu_nlist` beats plain `cpu_1s` by a real, if noisier, margin at most
+    sizes (16-28% faster; the `n_fluid=40,000` point is within this laptop's
+    established run-to-run noise floor — see item 15's own noise-control
+    discussion — not a genuine reversal), confirming the cell-stencil-walk
+    cost the GPU result removed is a real cost on CPU too, just a much
+    smaller fraction of the total: Polyester's `@batch`-parallelised,
+    cache-friendly sequential cell traversal is already efficient, unlike
+    thousands of GPU threads each redundantly re-deriving cell indices.
+    `cpu_nlist` never beats `cpu_col` at any tested size (`cnl/col` always
+    `> 1`, from 4.6% to 42% slower, noisily) — the one-sided shape's
+    structural 2× pair-evaluation disadvantage (item 8's original finding)
+    is not something removing the cell-walk touches at all, and it dominates
+    on CPU where the walk itself was cheap to begin with. **This confirms
+    the user's own original observation that motivated items 15-16 in the
+    first place** (2-sided coloured is durably superior on CPU) rather than
+    changing it — persistent pairs are a GPU-specific win here, not a
+    general one.
+
+    A *true* persistent-pairs version of `ColouredCPU` itself — caching
+    pairs grouped by colour, since colour-partitioned cell traversal is what
+    makes the coloured sweep's parallel two-sided writes race-free without
+    atomics on Polyester, a materially different data structure from this
+    item's per-particle CSR — was not built. This CPU-onesided data point is
+    at least suggestive that its likely payoff is smaller than the GPU
+    result and may not be worth the added complexity and the risk of
+    touching `ColouredCPU` (the actual production default for all 13
+    scripts), but it doesn't settle the question either way — the two
+    algorithms' cost profiles differ enough (half the pair evaluations,
+    plus whatever colour-bucket bookkeeping overhead a real implementation
+    would add) that only measuring the real thing would give a trustworthy
+    answer.
+
     **Not built** (see "Explicitly deferred" below): 3D; `WritesB`/
     `WritesBoth`/coupled-reverse shapes; a hand-written CPU-Polyester
     build/consume path (no CPU production case exists — `OnesidedCPU` is
-    already slower than `ColouredCPU` everywhere, item 8); wiring into any
-    of the 13 production scripts; ghosts/virtual particles/probes/RK4.
+    already slower than `ColouredCPU` everywhere, item 8); a persistent-pairs
+    version of `ColouredCPU` itself (see the CPU-side check just above);
+    wiring into any of the 13 production scripts; ghosts/virtual
+    particles/probes/RK4.
 
 ## Explicitly deferred (not started, not part of the current scope)
 

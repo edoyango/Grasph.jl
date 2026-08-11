@@ -41,6 +41,19 @@
 # launches) recover anything more — on hardware item 2/11 already established
 # is launch-count-bound, not compute-bound?
 #
+# A SEVENTH column, cpu_nlist, runs NeighbourListKA on the CPU array backend
+# (KA.CPU(), no CUDA involved — the same kernels already used for gpu_nlist
+# are backend-generic) to ask a CPU-side version of the same question: does
+# skipping the cell-stencil walk help even without a GPU's redundant-
+# per-thread-scalar-math cost profile? NOTE: this is still the *one-sided*
+# candidate-list shape (_pair_self_onesided!/_pair_coupled_onesided!, full
+# neighbourhood per particle) — NOT cpu_col's half-shell, Newton's-third-law
+# two-sided algorithm. A persistent-pairs version of the *coloured* sweep
+# would need colour-grouped pair caching (colour-partitioning is what makes
+# ColouredCPU's parallel two-sided writes race-free without atomics) and
+# isn't built; cpu_nlist only answers whether cell-walk avoidance helps
+# CPU at all, using the one-sided algorithm already on hand.
+#
 # Prediction, from measurements recorded in docs/gpu-migration-plan.md: this
 # GPU (RTX 4060 Laptop, sm_89) has NO Float64 compute advantage over the
 # 16-core CPU (0.138 vs 0.143-0.311 TFLOP/s) and pays a flat ~8.3us/kernel-
@@ -192,9 +205,9 @@ function main()
         println("GPU: ", CUDA.name(CUDA.device()), "  (CUDA.jl v", pkgversion(CUDA), ")")
     end
     println()
-    @printf("%6s %10s %10s %8s | %12s %12s %12s %12s %12s %12s | %9s %9s %9s %9s %9s\n",
-            "nfx", "n_fluid", "n_bnd", "steps", "cpu_col us", "cpu_1s us", "gpu_1s us", "gpu_col us", "gpu_1s+skin us", "gpu_nlist us",
-            "1s/col", "col/col", "col/1s", "skin/1s", "nlist/skin")
+    @printf("%6s %10s %10s %8s | %12s %12s %12s %12s %12s %12s %12s | %9s %9s %9s %9s %9s %9s %9s\n",
+            "nfx", "n_fluid", "n_bnd", "steps", "cpu_col us", "cpu_1s us", "cpu_nlist us", "gpu_1s us", "gpu_col us", "gpu_1s+skin us", "gpu_nlist us",
+            "1s/col", "col/col", "col/1s", "skin/1s", "nlist/skin", "cnl/col", "gnl/cnl")
 
     rows = NamedTuple[]
     for nfx in sizes
@@ -206,6 +219,9 @@ function main()
 
         integ_1s, _, _ = build(nfx; onesided=true, ka=false)
         t_1s = us_per_step(integ_1s, nsteps)
+
+        integ_cpu_nlist, _, _ = build(nfx; mode=Grasph.NeighbourListKA(), verlet_skin_frac=0.2)
+        t_cpu_nlist = us_per_step(integ_cpu_nlist, nsteps)
 
         t_gpu = NaN
         t_gpu_col = NaN
@@ -225,13 +241,22 @@ function main()
             t_gpu_nlist = us_per_step(integ_gpu_nlist, nsteps; sync = () -> CUDA.synchronize())
         end
 
-        @printf("%6d %10d %10d %8d | %12.1f %12.1f %12.1f %12.1f %12.1f %12.1f | %9.3f %9.3f %9.3f %9.3f %9.3f\n",
-                nfx, n_fluid, n_bnd, nsteps, t_col, t_1s, t_gpu, t_gpu_col, t_gpu_skin, t_gpu_nlist,
-                t_gpu / t_1s, t_gpu_col / t_col, t_gpu_col / t_gpu, t_gpu_skin / t_gpu, t_gpu_nlist / t_gpu_skin)
-        push!(rows, (; nfx, n_fluid, n_bnd, t_col, t_1s, t_gpu, t_gpu_col, t_gpu_skin, t_gpu_nlist))
+        @printf("%6d %10d %10d %8d | %12.1f %12.1f %12.1f %12.1f %12.1f %12.1f %12.1f | %9.3f %9.3f %9.3f %9.3f %9.3f %9.3f %9.3f\n",
+                nfx, n_fluid, n_bnd, nsteps, t_col, t_1s, t_cpu_nlist, t_gpu, t_gpu_col, t_gpu_skin, t_gpu_nlist,
+                t_gpu / t_1s, t_gpu_col / t_col, t_gpu_col / t_gpu, t_gpu_skin / t_gpu, t_gpu_nlist / t_gpu_skin,
+                t_cpu_nlist / t_col, t_gpu_nlist / t_cpu_nlist)
+        push!(rows, (; nfx, n_fluid, n_bnd, t_col, t_1s, t_cpu_nlist, t_gpu, t_gpu_col, t_gpu_skin, t_gpu_nlist))
     end
 
     println()
+    cpu_nlist_speedup = [r.t_col / r.t_cpu_nlist for r in rows]
+    best_k = argmax(cpu_nlist_speedup)
+    println("CPU-onesided-with-persistent-pairs (NeighbourListKA on KA.CPU(), verlet_skin_frac=0.2) vs",
+            " CPU-coloured: ", round(minimum(cpu_nlist_speedup); digits=3), "x-",
+            round(maximum(cpu_nlist_speedup); digits=3), "x across tested sizes (best at n_fluid ≈ ",
+            rows[best_k].n_fluid, "). NOTE: cpu_nlist is the one-sided candidate shape, not cpu_col's",
+            " half-shell two-sided algorithm — see this file's header comment.")
+
     if HAVE_CUDA
         crossed = findfirst(r -> r.t_gpu < r.t_col, rows)
         if crossed === nothing
@@ -281,9 +306,9 @@ function main()
     mkpath(outdir)
     outpath = joinpath(outdir, "dambreak_scaling_$(Dates.format(Dates.now(), "yyyymmdd_HHMMSS")).csv")
     open(outpath, "w") do io
-        println(io, "nfx,n_fluid,n_bnd,cpu_coloured_us,cpu_onesided_us,gpu_onesided_us,gpu_coloured_us,gpu_onesided_skin_us,gpu_neighbour_list_us")
+        println(io, "nfx,n_fluid,n_bnd,cpu_coloured_us,cpu_onesided_us,cpu_neighbour_list_us,gpu_onesided_us,gpu_coloured_us,gpu_onesided_skin_us,gpu_neighbour_list_us")
         for r in rows
-            println(io, "$(r.nfx),$(r.n_fluid),$(r.n_bnd),$(r.t_col),$(r.t_1s),$(r.t_gpu),$(r.t_gpu_col),$(r.t_gpu_skin),$(r.t_gpu_nlist)")
+            println(io, "$(r.nfx),$(r.n_fluid),$(r.n_bnd),$(r.t_col),$(r.t_1s),$(r.t_cpu_nlist),$(r.t_gpu),$(r.t_gpu_col),$(r.t_gpu_skin),$(r.t_gpu_nlist)")
         end
     end
     println("\nWrote ", outpath)
