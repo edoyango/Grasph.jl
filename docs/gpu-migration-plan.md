@@ -2666,6 +2666,43 @@ to coloured for all 13 scripts, and no script's behavior changed.
     measurement, and should be treated as such by anyone building on top of
     it.
 
+    **Before/after check on item 16's own 2D/`WritesA` benchmark.** This
+    item's change to `_maybe_build_neighbour_list!` (now building the
+    reverse candidate list unconditionally, even for a pure-`WritesA`
+    coupled interaction that never consumes it) touches the exact rebuild
+    path item 16's headline numbers were measured on, so "performance not
+    re-measured" above doesn't mean "performance definitely unaffected" for
+    that case — it's shared code. Ran `bench/run_scaling_benchmark.sh
+    --before 77ba170` (the commit immediately before this item) on the same
+    RTX 4060 Laptop, same default sizes:
+
+    | nfx | n_fluid | gpu_nlist before (µs) | gpu_nlist after (µs) | Δ | nlist/skin before | nlist/skin after | nlist/1s speedup, before → after |
+    |---|---|---|---|---|---|---|---|
+    | 50  | 2,500   | 593.5  | 657.6  | +10.8% | 0.685 | 0.802 | 2.21× → 2.10× |
+    | 100 | 10,000  | 737.9  | 789.4  | +7.0%  | 0.545 | 0.551 | 2.43× → 2.21× |
+    | 200 | 40,000  | 1935.0 | 1954.7 | +1.0%  | 0.444 | 0.448 | 2.34× → 2.33× |
+    | 320 | 102,400 | 4039.7 | 4041.8 | +0.05% | 0.441 | 0.441 | 2.27× → 2.27× |
+    | 450 | 202,500 | 7241.9 | 7246.5 | +0.06% | 0.424 | 0.425 | 2.36× → 2.36× |
+
+    **Headline claim holds**: `gpu_nlist` is still a consistent 2.0-2.4×
+    over plain `gpu_1s`, before and after, at every size. **One honest,
+    real cost**: at `dambreak.jl`'s own actual production scale (2,500
+    particles), the new unconditional reverse-list build adds a real
+    ~11% to `gpu_nlist`'s own time (its margin over `gpu_1s+skin` widens
+    from 0.685 to 0.802×) — two extra kernel launches (reverse count +
+    scatter) matter proportionally more when total per-rebuild/per-step
+    work is smallest. This shrinks to noise level (≤1%, no larger than the
+    ~5-6% run-to-run swing this same laptop shows on the *unrelated*,
+    untouched `gpu_1s+skin` column at these same small sizes) by 40,000
+    particles, and is gone (<0.1%) by 102,400+. Since this cost is paid
+    even when the attached pfn is `WritesA`-only and never touches the
+    reverse list — true for every one of the 13 production scripts, were
+    any to opt in — a future refinement could skip building
+    `_nbr_start_a`/`_nbr_idx_a` when a coupled interaction's `_onesided_shape`
+    is statically `WritesA`. Not built here: item 17's scope was
+    correctness, the cost is small, and it shrinks with scale rather than
+    growing, so it didn't seem worth the added complexity yet.
+
     **Not built** (still, by explicit user choice): wiring
     `neighbour_list=true` into any of the 13 production scripts, or
     changing any script's default backend selection — matching
