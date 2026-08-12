@@ -2855,6 +2855,111 @@ to coloured for all 13 scripts, and no script's behavior changed.
     `main` rather than merged in, since a documented clean loss isn't meant
     to land in production.
 
+    **Addendum: asymmetric `(Kx, Ky)` follow-up — fixes the padding, not
+    the sweep.** A natural follow-up question: is the symmetric padding
+    actually required by Z-order hashing itself, or just by this spike's
+    choice to force one shared tile width `K` across both axes? It's the
+    latter. `_build_morton_grid` already computed each axis's own smallest
+    enclosing dyadic interval independently (`_dyadic_K`, XOR +
+    `leading_zeros`) before unifying them via `K = max(Kx, Ky)` — throwing
+    away information it didn't need to. The fix removes that unification:
+    `cell_start` becomes `2^Kx * 2^Ky + 1` (a product of each axis's own
+    width) instead of `2^max(Kx,Ky)` squared, and the stencil walk masks
+    each axis to its own width.
+
+    The reason this stays correct without touching the global sort key
+    (`_pos_to_key_morton`, `_sort_particles_morton!` — both unchanged):
+    that key already interleaves both axes' bits at fixed absolute output
+    positions (bit `i` of an axis always lands at `2i` or `2i+1`,
+    independent of any grid's shape). Restricting a comparison of two such
+    keys to points sharing one tile — where `x` varies over `Kx` bits and
+    `y` over `Ky` (say `Kx > Ky`) — reduces bit-by-bit from the top to
+    exactly the standard "unbalanced Morton" construction: compare `x`'s
+    excess bits first (uninterleaved, more significant, since `y`'s bits up
+    there are constant within the tile and contribute nothing), then the
+    fully interleaved low `min(Kx,Ky)` bits of both. A grid-local index
+    built that way (`_cell_1idx_morton`, now taking `Kx`/`Ky` independently,
+    via a new 4-arg `_morton_interleave2(cx, cy, Kx, Ky)` overload that
+    reduces to the original 2-arg call exactly when `Kx == Ky`) is
+    therefore guaranteed order-consistent with the unchanged global key,
+    without either one needing to know the other's split in advance — the
+    same "different formula, same order" relationship the row-major scheme
+    already has with its own local index, just proven fresh for the
+    asymmetric case. Full derivation and code in `src/MortonCellList.jl`'s
+    file header and `_morton_interleave2`'s 4-arg method.
+
+    Validation: `test/test_morton_spike.jl` gained 4 hand-computed
+    asymmetric-interleave cases and a regression guard (`Kx != Ky` is
+    explicitly asserted on the elongated-16:1 fixture — without it, a bug
+    that silently fell back to `Kx == Ky` everywhere would still pass every
+    other test in the file). Full suite: **4711/4711**. The existing
+    equivalence testset (Morton sweep vs. `OnesidedCPU` oracle,
+    `rtol=1e-12`, all three box shapes) needed no changes and still passes,
+    confirming the asymmetric CSR still finds the same candidate pairs as
+    the row-major grid.
+
+    Benchmark (`bench/morton_cell_list.jl`, same protocol as the base
+    result; run twice to separate real signal from this laptop's own
+    timing noise — the pad ratios below are a pure function of the domain's
+    box/cutoff geometry, not a measurement, and came back bit-identical
+    both runs; grid-build and sweep *timings* did not, see below). Pad
+    ratio (`cell_start` padded vs. actual `ncells`), before (item 18) vs.
+    after this follow-up:
+
+    | shape, nfx | pad ratio before | pad ratio after | `(Kx, Ky)` |
+    |---|---|---|---|
+    | dambreak, 100 | 30.2× | 7.6× | (8, 6) |
+    | dambreak, 320 | 55.0× | 13.7× | (10, 8) |
+    | dambreak, 450 | 28.5× | 7.1× | (10, 8) |
+    | elongated 16:1, 50 | 74.4× | 4.7× | (8, 4) |
+    | elongated 16:1, 200 | 124.1× | 7.8× | (10, 6) |
+    | elongated 16:1, 320 | 51.3× | 3.2× | (10, 6) |
+    | **elongated 16:1, 450** | **436.3×** | **27.3×** | **(12, 8)** |
+
+    (Square 1:1 is an internal control, not a fix target: `Kx == Ky` at
+    every size there, so it runs the exact same code path as the original
+    symmetric version and its pad ratios are unchanged, as expected.) The
+    worst case in this whole spike — elongated domain, largest size — drops
+    from a 436× blowup to 27×: still real padding (the tile is still a
+    power of two per axis, so up to just under 2× waste per axis is
+    inherent to any dyadic scheme), but over an order of magnitude better,
+    and no longer the dominant cost. Grid-build time improves alongside it
+    at the same rows (e.g. elongated/200: 68.8× → ~1.9×; elongated/450:
+    54.3× → ~2.6×), though individual `grid_x` timings varied more between
+    the two runs than the pad ratios did (session's laptop, single-threaded,
+    no isolation from background load — the same caveat item 18's own
+    `sort_x` numbers already carried).
+
+    Sweep ratio is the real test of the hypothesis that this fix is
+    orthogonal to item 18's dominant loss (the row-major merge trick, which
+    asymmetric bit widths do nothing to restore). It holds: sweep stays in
+    the same **~1.3-1.4× slower** band at nearly every shape and size,
+    matching the base result almost exactly. The two rows that were
+    previously anomalous — elongated/200 (was 1.77×) and elongated/450 (was
+    1.09×, an artifact of the 436× padding distorting that row's own
+    timing) — now sit at 1.35-1.36× and 1.14-1.31× respectively, back in
+    line with everything else once the padding blowup that was corrupting
+    their measurement is gone. One mild, reproducible exception:
+    dambreak/450 sweep came in at 1.7-1.8× across both runs, somewhat above
+    the rest of the data — noted, not chased further; it doesn't change the
+    verdict below either way.
+
+    **Verdict: fixes the padding/build losses, leaves the sweep loss
+    untouched, so the overall result is still a loss** — sweep time
+    dominates total build+sweep cost at every size tested in item 18, and
+    sweep is exactly what this follow-up doesn't touch. What changes is
+    *why* it's a loss: no longer "a clean loss with a catastrophic memory
+    blowup on realistic domain shapes," but "a clean ~35% sweep-cost loss,
+    full stop" — the padding pathology was a fixable artifact of forcing
+    axes to share one tile width, not a fundamental property of Morton/
+    Z-order keys, and is now fixed. The core finding stands: losing the
+    row-major merge trick costs more than Morton's cache-locality gain
+    recovers, for this algorithm, on this hardware. `_build_morton_grid`,
+    `_cell_1idx_morton`, and `_sweep_self_onesided_morton!` now take `Kx`,
+    `Ky` independently rather than one shared `K`; `_pos_to_key_morton` and
+    `_sort_particles_morton!` are unchanged. Same branch, same "not built"
+    scope as above — no new production surface.
+
 ## Explicitly deferred (not started, not part of the current scope)
 
 - ~~**GPU (`ka=true`) support for any pfn converted in Phase C**~~ — items
@@ -2901,7 +3006,7 @@ to coloured for all 13 scripts, and no script's behavior changed.
   32 commits ahead of it (`12ac526`..`149c238`). Nothing on this branch has
   been pushed to any remote.
 - Run the full suite with `julia --project -e 'using Pkg; Pkg.test()'` —
-  should show `4706/4706` (834 through Phase B1, up to 935 after Phase B2's
+  should show `1692/1692` on `onesided-sweep-gpu-prep` itself (834 through Phase B1, up to 935 after Phase B2's
   3D work, up to 1371 after Phase C, up to 1433 after item 5's `device_view`
   extension, up to 1466 after item 6's reverse-sweep KA kernel twin, up to
   1479 after also fixing the `FluidPfn` fluid-fluid `ka=true` dispatch gap
@@ -2924,8 +3029,17 @@ to coloured for all 13 scripts, and no script's behavior changed.
   testset in `test_gpu_cuda.jl`). Up to **1692** after item 17 (3D +
   `WritesB`/`WritesBoth` + public-API coverage added to both
   `test_neighbour_list.jl` and `test_gpu_cuda.jl`'s `NeighbourListKA`
-  testsets). Up to **4706** after item 18 (`test/test_morton_spike.jl`, new
-  — CPU-only, no real-CUDA testset since the Morton spike is CPU-only).
+  testsets). **1692 is `onesided-sweep-gpu-prep`'s own count through item
+  17** — item 18 (`test/test_morton_spike.jl`) and its asymmetric-`(Kx,
+  Ky)` addendum only ever landed on `morton-cell-list-spike` (branched off
+  this one at 1692), not on `onesided-sweep-gpu-prep` itself: this section
+  of the doc is kept in sync across both branches as the record of the
+  spike, but the spike's own code/tests are not, per its "Not built" note.
+  Check out `morton-cell-list-spike` to actually run item 18's tests —
+  there, `Pkg.test()` should show `4706/4706` right after item 18
+  (`test/test_morton_spike.jl`, new — CPU-only, no real-CUDA testset since
+  the Morton spike is CPU-only), and `4711/4711` after the addendum (4 new
+  hand-computed interleave cases plus the `Kx != Ky` regression guard).
   `Pkg.test()` resolves its own CUDA
   from `test/Project.toml` and picks up real hardware automatically when
   present (confirmed again this item) — no merged-throwaway-environment
