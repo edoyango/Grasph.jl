@@ -2715,6 +2715,146 @@ to coloured for all 13 scripts, and no script's behavior changed.
     larger feature (colour-grouped pair caching, not per-particle CSR) and
     stays out of scope here.
 
+18. **Morton/Z-order cell list — spiked, clean loss, not pursued further.**
+    Morton/Z-order sort keys sat in "Explicitly deferred" since the original
+    planning interview, which picked today's row-major packed-`UInt64` key
+    specifically for being order-preserving vs. the old `SVector` comparator
+    key — deferred pending an actual measurement, not rejected. The user
+    asked to try implementing it.
+
+    **Architectural risk, found by direct code reading before writing any
+    code.** Every production sweep kernel — `ColouredCPU` (the actual
+    default), `OnesidedCPU`, `OnesidedKA`, `ColouredKA`, and every
+    `NeighbourListKA` build kernel — exploits row-major contiguity twice: a
+    cheap stride add to reach an adjacent grid row/plane
+    (`cell_idx + dx_cell*n_cells_y`), and a "3 cells in a row are contiguous"
+    merge that turns 9/27 per-particle cell lookups into 3/9 range-reads
+    (`Interaction.jl:1013-1026` for onesided; `Interaction.jl:583-599`/
+    `775-803` for `ColouredCPU`, which merges even more aggressively). Morton
+    breaks both — three spatially-adjacent cells along an axis are not
+    contiguous in Z-order. This codebase's real domains are also elongated,
+    not square (`dambreak.jl` 1.875:1, `dambreak_3d.jl` ≈6:1:3.2,
+    `GranularColumnCollapse3D.jl` 16:1), and a naive equal-bit-width Morton
+    code pads every axis to match the widest, which is expensive. Asymmetric
+    per-axis padding would fix that, but breaks a correctness invariant
+    `test/test_sorting.jl` already enforces: `sort_particles!`'s key (global,
+    position-only, shared by every grid a particle array might feed) and a
+    grid's own flat cell index must induce the same relative order, which is
+    only guaranteed when every axis shares one Morton tile size — i.e.
+    symmetric padding is the price of correctness with a grid-independent
+    shared sort key, not a choice. Per the user's explicit choice (asked via
+    `AskUserQuestion` after this analysis was shown): build a real, correct,
+    honestly-scoped spike anyway, narrowed to 2D self-interaction on CPU,
+    isolating the one-sided algorithm (matching item 16's own precedent for
+    isolating a cache-locality question from the coloured-vs-onesided one).
+
+    **Mechanism** (`src/MortonCellList.jl`, new, entirely additive — zero
+    changes to `SystemInteraction`, `create_grid!`, `_cell_1idx`, or any
+    `ExecMode`): a bit-interleaved Morton key (`_pos_to_key_morton`,
+    `_morton_interleave2`) and matching grid-relative flat index
+    (`_cell_1idx_morton`), a Morton-ordered sort (`_sort_particles_morton!`)
+    and CSR build (`_build_morton_grid`), and a Morton twin of the
+    self-interaction onesided sweep (`_sweep_self_onesided_morton!`) whose
+    stencil walk does 9 independent single-cell lookups instead of the
+    row-major merge trick's 3 range-reads — the actual mechanism under test.
+    `_build_morton_grid` finds the tile size/origin via the standard
+    "smallest enclosing dyadic interval" construction (XOR the bias-shifted
+    min/max bounding-box corners per axis, `K` = position of the highest
+    differing bit — the textbook-correct way to find a `2^K`-aligned tile
+    containing an interval regardless of where it sits relative to tile
+    boundaries). This replaced a first attempt that snapped the min corner
+    down to progressively larger tiles looking for a fit, which does not
+    converge in general — worth recording since it isn't obvious upfront:
+    snapping a fixed small corner down to an ever-larger tile can move the
+    tile's start just as fast as its width grows, never closing the gap.
+    Also had to introduce a Morton-only bias constant (`_MORTON_BIAS`, an
+    alternating-bit pattern) instead of reusing Sorting.jl's own `_KEY_BIAS`
+    (`=2^20`, a bare power of two): every domain in this codebase starts at
+    or near raw coordinate 0, and a round power-of-two bias puts 0 exactly
+    on a tile boundary at *every* scale simultaneously, so any bounding box
+    straddling raw 0 (all of them, once the usual 2-cell halo goes negative)
+    straddled that boundary at every `K`, forcing `K` to 21 for even a
+    14-cell span — found by running this file's own test suite before this
+    fix.
+
+    **Validation**: `test/test_morton_spike.jl` (new) — a hand-computed
+    interleave unit test, a CSR self-consistency check (every particle in a
+    cell's range actually maps to that cell under `_cell_1idx_morton`), and
+    a full equivalence test comparing `_sweep_self_onesided_morton!` against
+    the existing, already-trusted `OnesidedCPU` self-sweep oracle
+    (`rtol=1e-12`) — across three box shapes (near-square, dambreak's own
+    1.875:1, and a deliberately elongated 16:1 matching
+    `GranularColumnCollapse3D`'s real ratio, to exercise the padding logic
+    for real). Full suite: **4706/4706**, confirming zero effect on any
+    existing mode.
+
+    **Benchmark** (`bench/morton_cell_list.jl`, new — a standalone
+    sort/grid-build/sweep comparison, not folded into `dambreak_scaling.jl`,
+    since Morton isn't wired into any integrator): same three box shapes,
+    `nfx ∈ {50,100,200,320,450}` (`n = nfx²`, matching `dambreak_scaling.jl`'s
+    own convention), 10 reps per point, this session's laptop (AMD Ryzen 7
+    8845HS). Sort uses `sortperm!`'s default algorithm rather than
+    `sort_particles!`'s production `InsertionSort` choice for both keys —
+    `InsertionSort` is deliberately fast-pathed for the *nearly-sorted* data
+    production code actually feeds it step-to-step (item 12's rationale),
+    and this benchmark instead builds a fresh, genuinely-random cloud every
+    rep, InsertionSort's textbook O(n²) worst case; using it unmodified
+    first gave 10-second "builds" at 200k particles that were an artifact of
+    the wrong algorithm for this access pattern, not a real signal (caught
+    before recording any of the numbers below).
+
+    Sweep (self-interaction, one-sided) — Morton vs. row-major, all three
+    shapes and every size:
+
+    | shape | nfx=50 | 100 | 200 | 320 | 450 |
+    |---|---|---|---|---|---|
+    | square 1:1 | 1.36× | 1.34× | 1.34× | 1.35× | 1.33× |
+    | dambreak 1.875:1 | 1.37× | 1.34× | 1.34× | 1.34× | 1.35× |
+    | elongated 16:1 | 1.41× | 1.36× | 1.77× | 1.34× | 1.09× |
+
+    `cell_start` padding (`(2^K)²` vs. actual `ncells`) and grid-build time,
+    at the two extremes:
+
+    | shape, nfx | pad ratio | grid-build ratio |
+    |---|---|---|
+    | square, 450 | 28.4× | 2.81× |
+    | dambreak, 450 | 28.5× | 3.92× |
+    | elongated 16:1, 200 | 124.1× | 68.8× |
+    | elongated 16:1, 450 | 436.3× | 54.3× |
+
+    Sort itself showed no consistent story either way (0.82×-1.70×) — sort
+    cost is dominated by the general-purpose algorithm, not which key scheme
+    feeds it, so this is noise, not a Morton effect.
+
+    **A clean loss, exactly as the architectural analysis predicted —
+    matching `ColouredKA` (item 11)'s own fate, not `NeighbourListKA`
+    (items 16-17)'s.** The sweep — the actual mechanism under test, isolated
+    from sort/build noise — is a remarkably consistent **33-41% slower**
+    under Morton, at every size and every shape: losing the row-major merge
+    trick (3 range-reads → 9 separate lookups) costs more than Morton's
+    cache-locality gain recovers, on this hardware, for this algorithm. The
+    grid build is worse still, and the elongated domain — this codebase's
+    actual, common shape, not a contrived worst case — makes it dramatically
+    worse: a 436× padding blowup and a 54× slower grid build at the largest
+    size tested. There is no shape or size in this data where Morton wins on
+    any of the three phases measured. Given the architectural analysis
+    already predicted this outcome before any code was written, and the
+    measurement confirms it cleanly across every axis, this is not treated
+    as a partial or inconclusive result requiring further tuning — matching
+    item 11's own precedent for a decisive negative spike result.
+
+    **Not built**: nothing beyond this spike. `src/MortonCellList.jl` and
+    `test/test_morton_spike.jl` are kept in the tree as a record of the
+    result and the reusable correctness construction (the dyadic-interval
+    tile-finding method in particular may be useful if a future spatial
+    feature needs it), but are not wired into `SystemInteraction`, any
+    `ExecMode`, or any production script, and no further extension (3D, GPU,
+    coupled interactions, porting `ColouredCPU`'s own colour-partitioning
+    scheme to Morton space) is planned. Committed on its own branch,
+    `morton-cell-list-spike`, kept separate from `onesided-sweep-gpu-prep`/
+    `main` rather than merged in, since a documented clean loss isn't meant
+    to land in production.
+
 ## Explicitly deferred (not started, not part of the current scope)
 
 - ~~**GPU (`ka=true`) support for any pfn converted in Phase C**~~ — items
@@ -2734,8 +2874,13 @@ to coloured for all 13 scripts, and no script's behavior changed.
   sort's gather+copyback into a single `Ref`-swap (the third part of this
   originally-bundled bullet) stays deferred — investigated and explicitly
   descoped in item 12 ("Not built"), not merely unstarted.
-- Morton/Z-order sort keys (packed lexicographic `UInt64` key shipped
-  instead).
+- ~~Morton/Z-order sort keys (packed lexicographic `UInt64` key shipped
+  instead).~~ — **spiked, item 18: a clean loss, not pursued further.**
+  Breaks two load-bearing row-major optimizations every sweep kernel
+  (including `ColouredCPU`, the production default) relies on; measured
+  33-41% slower sweeps and up to 436× cell-list memory padding on this
+  codebase's own elongated domain shapes. Kept in `src/MortonCellList.jl` as
+  a record, not wired into anything.
 - ~~Explicit neighbour list (on-the-fly 27-cell scan is current
   approach).~~ — **done, items 16-17** (`NeighbourListKA`) — a real,
   consistent 2.0-2.4× win over today's production GPU sweep (item 16,
@@ -2756,7 +2901,7 @@ to coloured for all 13 scripts, and no script's behavior changed.
   32 commits ahead of it (`12ac526`..`149c238`). Nothing on this branch has
   been pushed to any remote.
 - Run the full suite with `julia --project -e 'using Pkg; Pkg.test()'` —
-  should show `1692/1692` (834 through Phase B1, up to 935 after Phase B2's
+  should show `4706/4706` (834 through Phase B1, up to 935 after Phase B2's
   3D work, up to 1371 after Phase C, up to 1433 after item 5's `device_view`
   extension, up to 1466 after item 6's reverse-sweep KA kernel twin, up to
   1479 after also fixing the `FluidPfn` fluid-fluid `ka=true` dispatch gap
@@ -2779,7 +2924,8 @@ to coloured for all 13 scripts, and no script's behavior changed.
   testset in `test_gpu_cuda.jl`). Up to **1692** after item 17 (3D +
   `WritesB`/`WritesBoth` + public-API coverage added to both
   `test_neighbour_list.jl` and `test_gpu_cuda.jl`'s `NeighbourListKA`
-  testsets).
+  testsets). Up to **4706** after item 18 (`test/test_morton_spike.jl`, new
+  — CPU-only, no real-CUDA testset since the Morton spike is CPU-only).
   `Pkg.test()` resolves its own CUDA
   from `test/Project.toml` and picks up real hardware automatically when
   present (confirmed again this item) — no merged-throwaway-environment
