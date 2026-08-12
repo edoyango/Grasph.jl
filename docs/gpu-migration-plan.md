@@ -2266,7 +2266,12 @@ to coloured for all 13 scripts, and no script's behavior changed.
     the millions rather than the hundreds-of-thousands tested above,
     `cpu_nlist` actually reverses and starts beating `cpu_col` — this
     "may not be worth it" judgment call was only ever supported by data up
-    to 202,500 particles.)*
+    to 202,500 particles.)* *(Second update, server-hardware follow-up
+    further below: at these same small default sizes but on a 12-thread
+    server CPU rather than this single-threaded-ish laptop, `cpu_nlist` is
+    not just unable to beat `cpu_col` — it is 10-27x* slower*, a far
+    starker "not worth it" than this laptop's own 4.6-42% — see "A new,
+    thread-count-specific finding" further below.)*
 
     **Extended sizes, up to this GPU's memory limit — A100 server hardware,
     follow-up.** Item 13/14's own extended-size runs stopped at `n_fluid =
@@ -2365,6 +2370,216 @@ to coloured for all 13 scripts, and no script's behavior changed.
     `bench/run_scaling_benchmark.sh`, passing those as trailing args). Not
     run past `nfx = 8,700` — the next geometric step would have crossed this
     A100's measured safety margin.
+
+    **Second round on server hardware — H200 + V100, via direct PBS job
+    submission — done.** Item 13's server-hardware validation reused SSH
+    access into an already-running *interactive* PBS job; this round instead
+    submits its own *batch* jobs (`qsub -q gpuhopper`/`qsub -q gpuvolta -P
+    tm70 -l ncpus=12,ngpus=1,mem=64GB,walltime=2:00:00,storage=scratch/tm70`),
+    reusing the same shared NFS `~/.julia` depot and `benchenv` item 13 built
+    (including that item's V100/CUDA-13 `ptxas` fix — still in effect,
+    unchanged). Both landed jobs ran both this item's default-size table
+    (reproducing the laptop table above) and its extended-size,
+    memory-limit-seeking table (reproducing A100's push above), via
+    `bench/run_scaling_benchmark.sh` with `JULIA_NUM_THREADS=12` (the job's
+    allocated core count — `Sys.CPU_THREADS` reports 96 on both underlying
+    nodes, but only 12 are cgroup-allocated to the job). H200 landed on
+    `gadi-gpu-h200-0017` (the same physical node item 13's H200 run used) —
+    Intel Xeon Gold 6542Y, NVIDIA H200 (143,771 MiB ≈ 140.4 GiB VRAM per
+    `nvidia-smi`), driver 580.173.02, CUDA.jl v5.8.5. V100 landed on
+    `gadi-gpu-v100-0011` — Intel Xeon Platinum 8268 @ 2.90GHz, Tesla
+    V100-SXM2-32GB, same driver/CUDA.jl version.
+
+    **Default sizes** (`nfx = 50,100,200,320,450`, `-t 12`, all seven
+    columns in one run — this session's dambreak_scaling.jl already merges
+    `cpu_nlist` into the main table, unlike the two separate tables above):
+
+    H200:
+
+    | nfx | n_fluid | cpu_col µs | cpu_1s µs | cpu_nlist µs | gpu_1s µs | gpu_col µs | gpu_1s+skin µs | gpu_nlist µs | cnl/col | skin/1s | nlist/skin |
+    |---|---|---|---|---|---|---|---|---|---|---|---|
+    | 50  | 2,500   | 158.1   | 176.0   | 2,212.7  | 780.0   | 3,631.6 | 556.3  | 365.4 | 13.995 | 0.713 | 0.657 |
+    | 100 | 10,000  | 714.4   | 582.6   | 13,041.1 | 855.2   | 4,575.0 | 381.0  | 296.4 | 18.256 | 0.445 | 0.778 |
+    | 200 | 40,000  | 2,842.9 | 3,842.3 | 54,577.8 | 1,018.9 | 5,004.3 | 409.3  | 304.3 | 19.198 | 0.402 | 0.743 |
+    | 320 | 102,400 | 5,809.1 | 8,439.6 | 85,023.8 | 1,371.4 | 5,094.8 | 617.9  | 338.0 | 14.636 | 0.451 | 0.547 |
+    | 450 | 202,500 | 9,542.1 | 14,616.2| 105,655.3| 2,225.0 | 5,113.9 | 1,120.4| 478.4 | 11.073 | 0.504 | 0.427 |
+
+    V100:
+
+    | nfx | n_fluid | cpu_col µs | cpu_1s µs | cpu_nlist µs | gpu_1s µs | gpu_col µs | gpu_1s+skin µs | gpu_nlist µs | cnl/col | skin/1s | nlist/skin |
+    |---|---|---|---|---|---|---|---|---|---|---|---|
+    | 50  | 2,500   | 209.5   | 219.3   | 5,724.5  | 1,221.8 | 4,560.5 | 519.9  | 446.4 | 27.330 | 0.426 | 0.859 |
+    | 100 | 10,000  | 736.8   | 935.3   | 36,493.6 | 1,426.0 | 5,174.7 | 567.6  | 478.9 | 49.529 | 0.398 | 0.844 |
+    | 200 | 40,000  | 3,943.3 | 5,800.2 | 66,373.3 | 1,677.6 | 5,584.1 | 599.4  | 521.0 | 16.832 | 0.357 | 0.869 |
+    | 320 | 102,400 | 8,755.5 | 13,105.7| 62,888.9 | 2,221.1 | 6,587.9 | 943.1  | 838.0 | 7.183  | 0.425 | 0.889 |
+    | 450 | 202,500 | 14,838.7| 21,247.2| 66,643.7 | 2,901.6 | 7,915.1 | 1,384.1| 1,140.9| 4.491 | 0.477 | 0.824 |
+
+    (Same convention as every other table in this item: `cnl/col` =
+    `cpu_nlist / cpu_col`, `skin/1s` = `gpu_1s+skin / gpu_1s`, `nlist/skin` =
+    `gpu_nlist / gpu_1s+skin`, below 1.0 means the left side won.) GPU-side
+    story is unchanged yet again: `gpu_col` never beats `gpu_1s` on either
+    machine; skin caching (0.357-0.713 on both) and `gpu_nlist` on top of it
+    (0.427-0.889) both stay clear wins at every size, same order of
+    magnitude as the laptop table above.
+
+    **A new, thread-count-specific finding: `cpu_nlist` collapses at small
+    sizes on a many-core CPU — 10-27x slower than `cpu_col`, not the
+    16-28%-slower-than-`cpu_1s` this document's own CPU-side-check table
+    (above) found.** `cnl/col` at `nfx=50` is 13.995 on H200 and a striking
+    **27.330 on V100** — `cpu_nlist` there costs 5,724.5µs against `cpu_col`'s
+    209.5µs, an order of magnitude worse than anything else measured on
+    either server GPU's CPU side. The laptop's own CPU-side-check table
+    never showed anything like this (worst case there was `cpu_1s`-relative
+    +35% laptop noise, item 15; `cpu_nlist` itself was always within a few
+    tens of percent of `cpu_col`/`cpu_1s`). The one variable that changed:
+    `JULIA_NUM_THREADS=12` here, versus whatever the laptop table above used
+    (not explicitly re-stated at the time, unlike item 15's explicit `-t 1`).
+    `cpu_col`/`cpu_1s` are hand-written Polyester `@batch` code and scale
+    with thread count as expected (this session's `cpu_col` at `nfx=450` is
+    9,542.1µs on H200 vs. the laptop's own 26,894.3µs — a real ~2.8x
+    multi-core speedup); `NeighbourListKA`'s build/consume kernels, by
+    contrast, are plain `@kernel function`s with no hand-written Polyester
+    twin (this item's own design choice, "Not built" above) — dispatched
+    through KernelAbstractions' `KA.CPU()` backend, which most plausibly pays
+    a *fixed* thread-pool synchronization cost per kernel launch (this
+    item's rebuild-then-consume design issues at least three separate
+    `@kernel` launches — count pass, scatter pass, consuming sweep — every
+    time the skin-gated grid rebuilds, on top of the ordinary per-step sweep
+    launch) that scales with allocated thread count and is negligible at 1
+    thread but dominates at 12 when the actual per-particle work is this
+    small. This is a plausible mechanism, not a code-level diagnosis — no
+    profiling was done to confirm it — but it is consistent with every
+    number below: the anomaly's *absolute* size barely grows across the
+    whole default-size range (2,212.7µs to 105,655.3µs on H200, i.e. roughly
+    tracking `n_fluid` the way a real per-particle cost would, not staying
+    perfectly fixed) while its *relative* size (`cnl/col`) shrinks
+    monotonically as `n_fluid` grows (13.995 → 18.256 → 19.198 → 14.636 →
+    11.073 on H200) — exactly the signature of a fixed-ish per-launch cost
+    being amortised over a growing amount of real work. It vanishes
+    entirely at the extended sizes below (`cnl/col` returns to ≈1 on both
+    machines), which fits the same story: enough real per-particle work
+    eventually swamps a fixed per-launch cost, same shape as item 12's own
+    skin-caching taper, just far more extreme here at this thread count.
+    Nothing here changes this item's own "not worth the complexity" verdict
+    on a persistent-pairs `ColouredCPU` — if anything it strengthens it for
+    any machine running many threads at dambreak.jl's own small production
+    scale.
+
+    **Extended sizes, up to each GPU's own measured memory limit** (same
+    `~490 bytes/particle` `gpu_nlist` ratio and safety-margin method A100's
+    own extended-size section above used, but measured fresh per machine via
+    `CUDA.total_memory()` rather than reusing A100's number: H200 measured
+    150,393,585,664 bytes ≈ 140.07 GiB, giving a computed safe ceiling of
+    `nfx = 15,172`; V100 measured 34,072,559,616 bytes ≈ 31.73 GiB, giving
+    `nfx = 7,221`. Both machines' six `--sizes` points reuse A100's own
+    fractions-of-ceiling — `1800,2500,3500,5000,7000,8700 / 8716` — scaled to
+    each machine's own ceiling, so all three server GPUs' rows below sit at
+    matching *relative* memory pressure, not arbitrary absolute sizes):
+
+    H200 (`--sizes 3133,4352,6092,8704,12185,15144 --budget 5e7`):
+
+    | nfx | n_fluid | cpu_col µs | cpu_1s µs | cpu_nlist µs | gpu_1s µs | gpu_col µs | gpu_1s+skin µs | gpu_nlist µs | cnl/col | skin/1s | nlist/skin |
+    |---|---|---|---|---|---|---|---|---|---|---|---|
+    | 3,133  | 9,815,689   | 524,305.9   | 603,593.8   | 768,811.6   | 51,322.2   | 62,703.5   | 27,197.8  | 15,997.4 | 1.466 | 0.530 | 0.588 |
+    | 4,352  | 18,939,904  | 869,524.5   | 962,659.5   | 1,135,851.8 | 103,252.8  | 123,835.1  | 52,834.3  | 33,157.9 | 1.306 | 0.512 | 0.628 |
+    | 6,092  | 37,112,464  | 1,819,585.2 | 1,936,306.7 | 1,974,094.6 | 217,145.5  | 257,067.8  | 105,147.1 | 68,689.2 | 1.085 | 0.484 | 0.653 |
+    | 8,704  | 75,759,616  | 3,256,119.2 | 3,781,274.8 | 3,402,441.4 | 470,350.8  | 550,315.5  | 223,212.8 | 152,845.2| 1.045 | 0.475 | 0.685 |
+    | 12,185 | 148,474,225 | 6,483,766.6 | 7,267,505.1 | 6,378,996.4 | 1,000,322.2| 1,157,814.6| 458,588.4 | 322,301.0| 0.984 | 0.458 | 0.703 |
+    | 15,144 | 229,340,736 | 9,633,231.8 | 11,025,120.6| 9,758,338.7 | 1,535,296.1| 1,852,548.9| 717,024.8 | 467,836.4| 1.013 | 0.467 | 0.652 |
+
+    V100 (`--sizes 1491,2071,2900,4142,5799,7208 --budget 5e7`):
+
+    | nfx | n_fluid | cpu_col µs | cpu_1s µs | cpu_nlist µs | gpu_1s µs | gpu_col µs | gpu_1s+skin µs | gpu_nlist µs | cnl/col | skin/1s | nlist/skin |
+    |---|---|---|---|---|---|---|---|---|---|---|---|
+    | 1,491 | 2,223,081  | 150,382.9   | 183,244.7   | 186,254.5   | 28,826.0   | 72,451.2   | 11,579.6  | 10,324.4 | 1.239 | 0.402 | 0.892 |
+    | 2,071 | 4,289,041  | 277,543.0   | 350,028.9   | 326,660.9   | 53,859.1   | 143,155.7  | 23,233.6  | 21,820.6 | 1.177 | 0.431 | 0.939 |
+    | 2,900 | 8,410,000  | 551,983.0   | 683,059.5   | 628,078.3   | 109,863.2  | 282,775.3  | 52,038.4  | 53,872.8 | 1.138 | 0.474 | 1.035 |
+    | 4,142 | 17,156,164 | 1,156,109.4 | 1,431,979.2 | 1,207,871.3 | 238,356.5  | 603,383.6  | 113,411.7 | 120,296.3| 1.045 | 0.476 | 1.061 |
+    | 5,799 | 33,628,401 | 2,206,927.1 | 2,787,932.8 | 2,343,185.5 | 490,483.9  | 1,193,427.7| 226,520.7 | 241,535.7| 1.062 | 0.462 | 1.066 |
+    | 7,208 | 51,955,264 | 3,246,567.7 | 4,068,245.3 | 3,832,545.9 | 742,337.2  | 1,860,363.1| 348,636.8 | 358,745.0| 1.180 | 0.470 | 1.029 |
+
+    **The GPU story holds on all three server GPUs tested (A100/H200/V100),
+    at every scale tested so far**: `gpu_col` never beats `gpu_1s`; skin
+    caching stays strong (`skin/1s` 0.402-0.530 on these two, no worse than
+    A100's own 0.487-0.633); `gpu_nlist` stays a robust win on top of skin
+    (`nlist/skin` 0.588-0.703 on H200 — slightly wider margin than A100's
+    own 0.529-0.647 at comparable relative memory pressure; V100 actually
+    crosses 1.0 at its three largest points, 1.035-1.066, the one place a
+    server GPU's `gpu_nlist` measured *slower* than `gpu_1s+skin` anywhere
+    in this document — plausibly V100's older architecture (Volta, sm_70)
+    having less launch-overhead headroom left to recover once skin caching
+    has already removed the sort+grid launches, so the *additional*
+    cell-stencil-walk removal has less left to win back; still a clear win
+    over plain `gpu_1s` throughout, 0.892-1.066 either way). At H200's
+    largest tested point (`n_fluid = 229,340,736`, the largest particle
+    count anywhere in this document), `gpu_nlist` (467,836.4µs ≈ 0.47s) is
+    **20.6x faster than `cpu_col`** (9,633,231.8µs ≈ 9.6s) — edging out
+    A100's own 16.3x at 75.7M as the largest GPU margin recorded in this
+    document.
+
+    **`cpu_nlist` vs `cpu_col` at extended scale: three different pictures
+    across the three server GPUs, all near break-even, none matching the
+    small-size collapse above.** A100 crosses cleanly and stays crossed
+    (`cnl/col` 0.914-0.982 across its whole 3.24M-75.7M range, item 16's own
+    "genuine surprise" above). V100 never crosses — `cnl/col` stays
+    1.045-1.239 across its whole 2.2M-52M range, closest at `n_fluid ≈
+    17,156,164` — consistent with the CPU-side check's original verdict,
+    just far less noisy than the small-size collapse. H200 crosses briefly
+    (`cnl/col` = 0.984 at `n_fluid = 148,474,225`) then drifts back just
+    above break-even at its largest point (1.013 at 229,340,736) — read this
+    as noise hovering around parity, not a genuine reversal, given how close
+    both values sit to 1.0 and how the trend across H200's own six points
+    (1.466 → 1.306 → 1.085 → 1.045 → 0.984 → 1.013) is otherwise monotone
+    decreasing right up to the dip. Taken together: the large-scale
+    `cpu_nlist`-beats-`cpu_col` reversal item 16 found on A100 is real but
+    not universal — it depends on the specific machine, and on two of three
+    server GPUs tested here it doesn't clearly happen at all within the
+    memory-safe range each GPU's own VRAM allowed.
+
+    **A mistake caught mid-run: sizing a job's `mem` request from GPU VRAM
+    headroom alone isn't enough — the CPU-side columns need host RAM too.**
+    The H200 job's first attempt (`mem=64GB`, matching item 13's own
+    precedent) completed the default-size table and the first four extended
+    points cleanly, then was killed (`Exit_status=137`, SIGKILL) attempting
+    the fifth (`nfx=12,185`). `qstat -xf` afterward showed
+    `resources_used.mem` had hit exactly the 64GB job ceiling while
+    `resources_used.gpu_mem` was only ≈46.5GiB — nowhere near this GPU's
+    ≈140GiB, confirming GPU memory was never the actual constraint. The gap:
+    this item's `nfx_max` calculation (above) only ever budgets against
+    `gpu_nlist`'s own ~490 bytes/particle *device*-memory ratio — it has no
+    equivalent host-memory budget for the three CPU-side columns
+    (`cpu_col`, `cpu_1s`, `cpu_nlist`), which stay simultaneously resident in
+    ordinary host `Vector`s with no inter-build free (unlike the four GPU
+    integrators, which this item's own earlier script fix explicitly drops
+    and `GC.gc(); CUDA.reclaim()`s between builds). `cpu_nlist` additionally
+    carries its own host-side candidate-list array at the same ~208
+    bytes/particle the GPU version does. At `n_fluid ≈ 229M` (the largest
+    computed point), three live host integrators plus that candidate list
+    puts peak host usage somewhere around 100-150GB — comfortably past
+    64GB, never close to threatening this GPU's own VRAM. Fixed by
+    resubmitting with `mem=180GB` (same `ncpus=12,ngpus=1`, same
+    `--sizes`) — accepted by the `gpuhopper-exec` queue with no chunk-ratio
+    complaint, and the rerun completed all six points cleanly (the table
+    above is from this second, corrected job). V100's own extended run never
+    triggered this — its computed ceiling (`nfx=7,221`) keeps `n_fluid` low
+    enough (max 52M vs. H200's 229M) that three resident host integrators
+    never approached 64GB. Worth remembering for any future push past this
+    document's own largest tested sizes: budget host RAM (roughly
+    `n_fluid x (3x96 + 208) ~= n_fluid x 496` bytes, generously) alongside
+    GPU VRAM, not instead of it.
+
+    **Reproducing**: submit via `qsub -q gpuhopper` / `qsub -q gpuvolta`
+    with `-P tm70 -l ncpus=12,ngpus=1,mem=180GB,walltime=2:00:00,storage=
+    scratch/tm70` (bump `mem` down to 64GB if only default sizes are
+    wanted — the extended run is what needs the larger allocation), then
+    inside the job: `export JULIA_NUM_THREADS=12; export
+    GRASPH_BENCH_ENV=<shared benchenv path>;
+    bench/run_scaling_benchmark.sh` for the default table, followed by a
+    quick `julia --project=<benchenv> -e 'using CUDA;
+    print(Int(CUDA.total_memory()))'` to get that job's own VRAM figure and
+    derive its own `--sizes` list the way this section's intro describes,
+    then `bench/run_scaling_benchmark.sh --sizes <computed> --budget 5e7`
+    for the extended table.
 
     **Not built** (see "Explicitly deferred" below): 3D; `WritesB`/
     `WritesBoth`/coupled-reverse shapes; a hand-written CPU-Polyester
