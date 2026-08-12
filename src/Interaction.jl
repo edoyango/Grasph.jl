@@ -36,6 +36,8 @@ struct SystemInteraction{T<:AbstractFloat, ND, KT<:AbstractKernel{T,ND}, SA<:Abs
     _grid_cutoff::Base.RefValue{T}      # cell-partitioning pitch actually used by the current cell list (create_grid!'s cutoff+skin); equals _cell_size when skin=0. Used for cell-index derivation (_cell_1idx, coupled cell-index bounds) only.
     _nbr_start::CSA                     # NeighbourListKA only (see docs/gpu-migration-plan.md): CSR offsets into _nbr_idx, same convention as _cell_start; length = system_a.n + 1. Empty/unused for every other mode.
     _nbr_idx::CSA                       # NeighbourListKA only: flat, capacity-preallocated candidate-neighbour-index array built at _grid_cutoff radius (over-inclusive), consumed by the nlist sweep kernels. Empty/unused for every other mode.
+    _nbr_start_a::CSA                   # NeighbourListKA only, coupled interactions only: reverse-pass CSR offsets into _nbr_idx_a, built by system_b's particles scanning _cell_start_a (system_a's grid) — same "_a" suffix convention as _cell_start_a (denotes which grid was scanned, not which system it belongs to). length = system_b.n + 1. Empty/unused for self-interactions and every other mode.
+    _nbr_idx_a::CSA                     # NeighbourListKA only, coupled interactions only: flat candidate-neighbour-index array for the reverse pass (WritesB/WritesBoth), consumed by the reverse nlist sweep. Empty/unused for self-interactions and every other mode.
     function SystemInteraction{T, ND, KT, SA, SB, PFNS, VPFN, CSA, MODE}(args...) where {T, ND, KT, SA, SB, PFNS, VPFN, CSA, MODE}
         ND isa Int || throw(ArgumentError("ND must be an Int, got $(typeof(ND))"))
         new{T, ND, KT, SA, SB, PFNS, VPFN, CSA, MODE}(args...)
@@ -74,12 +76,22 @@ sweep as a `KernelAbstractions.jl` kernel rather than a Polyester `@batch`
 loop — the same kernel source that runs on `system_a`'s array backend,
 `CPU()` or any GPU backend.
 
+Pass `neighbour_list=true` (requires `ka=true`) to additionally cache an
+explicit candidate pair list at each Verlet-skin rebuild and have the
+per-step sweep consume that flat list instead of re-deriving candidates from
+the cell grid every step (see `docs/gpu-migration-plan.md`, items 16-17) —
+only pays off when the owning time integrator uses `verlet_skin > 0`
+(otherwise the list is rebuilt every step for no benefit); measured
+2.0-2.4x faster than plain `ka=true` on the hardware item 16 tested. Supports
+self-interaction and all three coupled write shapes (`WritesA`/`WritesB`/
+`WritesBoth`), 2D and 3D.
+
 `mode` is an internal escape hatch used by benchmarking code (see
 `docs/gpu-migration-plan.md`) to select an `ExecMode` directly, bypassing the
-`onesided`/`ka` derivation above — e.g. `ColouredKA()`, which runs the
-two-sided mutating pfn contract through KernelAbstractions.jl. Not part of
-the public `onesided`/`ka` contract; `nothing` (the default) preserves
-today's behaviour exactly.
+`onesided`/`ka`/`neighbour_list` derivation above — e.g. `ColouredKA()`,
+which runs the two-sided mutating pfn contract through
+KernelAbstractions.jl. Not part of the public contract; `nothing` (the
+default) preserves today's behaviour exactly.
 """
 function SystemInteraction(
     kernel::AbstractKernel,
@@ -89,6 +101,7 @@ function SystemInteraction(
     velocity_adjust_pairwise_fn = nothing,
     onesided::Bool = false,
     ka::Bool = false,
+    neighbour_list::Bool = false,
     mode::Union{Nothing, ExecMode} = nothing,
 ) where {T<:AbstractFloat, ND}
     nd = Int(ND)
@@ -98,13 +111,19 @@ function SystemInteraction(
         "system_b.ndims ($(system_b.ndims)) must match system_a.ndims ($nd)"))
     ka && !onesided && throw(ArgumentError(
         "ka=true requires onesided=true (the KernelAbstractions sweep only implements the one-sided protocol)"))
+    neighbour_list && !ka && throw(ArgumentError(
+        "neighbour_list=true requires ka=true (the cached candidate list only has a KernelAbstractions.jl consumer)"))
     pfns = pairwise_fn isa Tuple ? pairwise_fn : (pairwise_fn,)
     _check_functors_eltype(pfns, T, "pairwise functor")
-    mode = mode !== nothing ? mode : ka ? OnesidedKA() : onesided ? OnesidedCPU() : ColouredCPU()
+    mode = mode !== nothing ? mode :
+           neighbour_list ? NeighbourListKA() :
+           ka ? OnesidedKA() : onesided ? OnesidedCPU() : ColouredCPU()
     cell_start   = similar(system_a.x, Int, 0)
     cell_start_a = similar(system_a.x, Int, 0)
     nbr_start    = similar(system_a.x, Int, 0)
     nbr_idx      = similar(system_a.x, Int, 0)
+    nbr_start_a  = similar(system_a.x, Int, 0)
+    nbr_idx_a    = similar(system_a.x, Int, 0)
     SystemInteraction{
         T, nd, typeof(kernel),
         typeof(system_a), typeof(system_b), typeof(pfns), typeof(velocity_adjust_pairwise_fn),
@@ -125,6 +144,8 @@ function SystemInteraction(
         Ref(T(kernel.interaction_length)),
         nbr_start,
         nbr_idx,
+        nbr_start_a,
+        nbr_idx_a,
     )
 end
 
@@ -407,14 +428,7 @@ _sweep_mode!(::OnesidedKA,  si, system_b, pfn)  = _sweep_coupled_ka_dispatch!(_o
 _sweep_mode!(::ColouredKA,  si, ::Nothing, pfn) = _sweep_self_coloured_ka!(si, pfn)
 _sweep_mode!(::ColouredKA,  si, system_b, pfn)  = _sweep_coupled_coloured_ka!(si, system_b, pfn)
 _sweep_mode!(::NeighbourListKA, si, ::Nothing, pfn) = _sweep_self_nlist!(si, pfn)
-function _sweep_mode!(::NeighbourListKA, si, system_b, pfn)
-    _onesided_shape(pfn, si.system_a, system_b) isa WritesA || error(
-        "NeighbourListKA coupled sweep only supports WritesA-shaped pfns " *
-        "(this is a benchmarking spike — see docs/gpu-migration-plan.md, " *
-        "\"Explicit neighbour list\"); got $(_onesided_shape(pfn, si.system_a, system_b)) " *
-        "for $(typeof(pfn))")
-    _sweep_coupled_nlist!(si, system_b, pfn)
-end
+_sweep_mode!(::NeighbourListKA, si, system_b, pfn)  = _sweep_coupled_nlist_dispatch!(_onesided_shape(pfn, si.system_a, system_b), si, system_b, pfn)
 
 # ---------------------------------------------------------------------------
 # NeighbourListKA rebuild hook — called once per interaction from
@@ -429,7 +443,15 @@ function _maybe_build_neighbour_list!(::NeighbourListKA, si)
     if si.system_b === nothing
         _build_neighbour_list_self!(si)
     else
+        # Both the forward and reverse candidate lists are built
+        # unconditionally, regardless of which pfns are attached to this
+        # interaction — mirrors _cell_start_a's own established tradeoff
+        # (also built unconditionally for every coupled interaction today).
+        # This keeps the rebuild hook pfn-agnostic (it only sees `si`, not
+        # individual pfns' OnesidedShape) at the cost of a bounded extra
+        # build at Verlet-skin rebuild cadence, not the hot per-step path.
         _build_neighbour_list_coupled!(si, si.system_b)
+        _build_neighbour_list_coupled_reverse!(si, si.system_b)
     end
 end
 

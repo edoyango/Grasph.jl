@@ -13,15 +13,19 @@
 # arithmetic (as ColouredCPU does over OnesidedCPU) is still a net win once
 # it costs 6-27x more kernel launches on a GPU. Not wired into any script;
 # reachable only via SystemInteraction's internal `mode` override kwarg.
-# NeighbourListKA is a second internal benchmarking spike (see
-# docs/gpu-migration-plan.md, "Explicit neighbour list"): it caches an
-# explicit, over-inclusive candidate pair list at each Verlet-skin rebuild
-# and has the per-step sweep walk that flat list instead of re-deriving
-# candidates from the cell grid every step — answering whether removing
-# cell-traversal compute (not launches) is worth anything on hardware whose
-# cost is dominated by launch count, not compute. Self + one coupled
-# (WritesA) shape only, 2D only; not wired into any script; reachable only
-# via SystemInteraction's internal `mode` override kwarg.
+# NeighbourListKA (see docs/gpu-migration-plan.md, "Explicit neighbour
+# list") caches an explicit, over-inclusive candidate pair list at each
+# Verlet-skin rebuild and has the per-step sweep walk that flat list instead
+# of re-deriving candidates from the cell grid every step — a measured
+# 2.0-2.4x win over OnesidedKA on the hardware item 16 tested, driven by
+# removing cell-traversal compute (not launches) on hardware whose cost is
+# dominated by launch count. Supports self-interaction and all three coupled
+# write shapes (WritesA/WritesB/WritesBoth, see Interaction.jl's
+# OnesidedShape), 2D and 3D (item 17). Reachable via SystemInteraction's
+# public `neighbour_list=true` kwarg (requires `ka=true`) or the internal
+# `mode` override; not wired into (or defaulted for) any of the 13
+# experiment scripts — that remains a separate, later decision, matching
+# verlet_skin's own still-unwired status.
 # ---------------------------------------------------------------------------
 
 abstract type ExecMode end

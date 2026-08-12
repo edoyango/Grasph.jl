@@ -1,7 +1,7 @@
 using Test
 using Grasph
 using StaticArrays
-using LinearAlgebra: norm
+using LinearAlgebra: norm, dot
 using Random
 using CUDA
 using Adapt
@@ -72,6 +72,22 @@ _gpucuda_sortbufs_gpu(ps) = (CuArray{Int}(undef, ps.n), CuArray{UInt64}(undef, p
 # but we compare via `id` anyway rather than assume exact ordering matches —
 # robust regardless of that stability guarantee holding exactly.
 _byid(ps) = sortperm(getfield(ps, :id))
+
+# Synthetic WritesB-only test pfn for NeighbourListKA's reverse-pass real-CUDA
+# coverage below — distinct name from test_onesided_sweep.jl's
+# _ReverseOnlyTestPfn and test_neighbour_list.jl's _NLReverseOnlyTestPfn
+# (runtests.jl `include`s all three into the same top-level scope, so struct
+# names must be unique across files). Same formula as those files' own
+# precedent.
+@inline _gpucuda_test_pfn_contribution(ps_a, ps_b, i, j, dx, gx, w) =
+    (dvdt = (ps_b.mass * w / ps_a.rho[i]) * gx, drhodt = ps_b.mass * dot(gx, ps_a.v[i]))
+@inline _gpucuda_test_pfn_zero(ps_a, i) = (dvdt = zero(eltype(ps_a.dvdt)), drhodt = zero(eltype(ps_a.drhodt)))
+
+struct _GPUReverseOnlyTestPfn end
+Grasph._onesided_shape(::_GPUReverseOnlyTestPfn, ps_a, ps_b) = Grasph.WritesB()
+@inline Grasph.pfn_contribution(::_GPUReverseOnlyTestPfn, ps_a, ps_b, i::Int, j::Int, dx::SVector, gx::SVector, w) =
+    _gpucuda_test_pfn_contribution(ps_a, ps_b, i, j, dx, gx, w)
+@inline Grasph._onesided_zero_coupled(::_GPUReverseOnlyTestPfn, ps_a, ps_b, i) = _gpucuda_test_pfn_zero(ps_a, i)
 
 if !CUDA_OK
 
@@ -261,15 +277,17 @@ else
         end
 
         @testset "full pipeline (sort+grid+sweep), NeighbourListKA self+coupled: onesided CPU oracle vs CUDA" begin
-            # NeighbourListKA (docs/gpu-migration-plan.md's explicit-neighbour-
-            # list benchmarking spike, Backend.jl) reuses the *same* onesided
-            # candidate-visitation shape as OnesidedCPU/OnesidedKA (both call
+            # NeighbourListKA (docs/gpu-migration-plan.md items 16-17,
+            # Backend.jl) reuses the *same* onesided candidate-visitation
+            # shape as OnesidedCPU/OnesidedKA (both call
             # _pair_self_onesided!/_pair_coupled_onesided! — see KAKernels.jl),
             # just with candidates read from a cached flat list instead of a
             # fresh cell-stencil walk, so the CPU oracle here is plain
             # `onesided=true` (Polyester), same as the "self"/"coupled"
             # testsets above — not ColouredCPU (different pair-visitation
-            # order, different rtol regime).
+            # order, different rtol regime). WritesA/2D coverage; see the
+            # 3D/WritesB/WritesBoth testsets below for the rest of item 17's
+            # matrix.
             CUDA.allowscalar(false)
             rng = MersenneTwister(204)
             h = 0.08
@@ -313,6 +331,146 @@ else
             drhodt_scale = max(maximum(abs.(fluid_cpu.drhodt)), 1.0)
             @test maximum(norm.(fluid_cpu.dvdt[oc] .- fluid_gpu_h.dvdt[og])) < 1e-10 * dvdt_scale
             @test maximum(abs.(fluid_cpu.drhodt[oc] .- fluid_gpu_h.drhodt[og])) < 1e-10 * drhodt_scale
+        end
+
+        @testset "full pipeline (sort+grid+sweep), NeighbourListKA self+coupled 3D: onesided CPU oracle vs CUDA" begin
+            # 3D twin of the testset above (item 17) — same construction,
+            # same oracle, `ndims=3` throughout.
+            CUDA.allowscalar(false)
+            rng = MersenneTwister(220)
+            h = 0.08
+            kernel = CubicSplineKernel(h; ndims=3)
+            cutoff = kernel.interaction_length
+            pfn = FluidPfn(0.03, 0.0, h)
+
+            n_fluid, n_bnd = 1200, 500
+            fluid_cpu = _gpucuda_random_fluid(rng, n_fluid, 3; L=3.0)
+            bnd_cpu   = _gpucuda_random_boundary(rng, n_bnd, 3; L=3.0)
+            static_bnd_cpu = StaticBoundarySystem(bnd_cpu, 0.03)
+
+            fluid_gpu = adapt(CUDABackend(), deepcopy(fluid_cpu))
+            bnd_gpu   = adapt(CUDABackend(), deepcopy(bnd_cpu))
+            static_bnd_gpu = StaticBoundarySystem(bnd_gpu, 0.03)
+
+            pbb, kbb, scb = _gpucuda_sortbufs_cpu(bnd_cpu)
+            sort_particles!(bnd_cpu, cutoff, pbb, kbb, scb)
+            pb2, kb2, sc2 = _gpucuda_sortbufs_cpu(fluid_cpu)
+            sort_particles!(fluid_cpu, cutoff, pb2, kb2, sc2)
+            si_self_cpu = SystemInteraction(kernel, pfn, fluid_cpu; onesided=true)
+            si_cpl_cpu  = SystemInteraction(kernel, pfn, fluid_cpu, static_bnd_cpu; onesided=true)
+            create_grid!(si_self_cpu); create_grid!(si_cpl_cpu)
+            sweep!(si_self_cpu); sweep!(si_cpl_cpu)
+
+            pbbg, kbbg, scbg = _gpucuda_sortbufs_gpu(bnd_gpu)
+            sort_particles!(bnd_gpu, cutoff, pbbg, kbbg, scbg)
+            pb2g, kb2g, sc2g = _gpucuda_sortbufs_gpu(fluid_gpu)
+            sort_particles!(fluid_gpu, cutoff, pb2g, kb2g, sc2g)
+            si_self_gpu = SystemInteraction(kernel, pfn, fluid_gpu; neighbour_list=true, onesided=true, ka=true)
+            si_cpl_gpu  = SystemInteraction(kernel, pfn, fluid_gpu, static_bnd_gpu; neighbour_list=true, onesided=true, ka=true)
+            create_grid!(si_self_gpu); Grasph._maybe_build_neighbour_list!(si_self_gpu)
+            create_grid!(si_cpl_gpu); Grasph._maybe_build_neighbour_list!(si_cpl_gpu)
+            sweep!(si_self_gpu); sweep!(si_cpl_gpu)
+
+            @test Array(si_self_gpu._cell_start) == si_self_cpu._cell_start
+
+            fluid_gpu_h = adapt(Array, fluid_gpu)
+            oc, og = _byid(fluid_cpu), _byid(fluid_gpu_h)
+            dvdt_scale = max(maximum(norm.(fluid_cpu.dvdt)), 1.0)
+            drhodt_scale = max(maximum(abs.(fluid_cpu.drhodt)), 1.0)
+            @test maximum(norm.(fluid_cpu.dvdt[oc] .- fluid_gpu_h.dvdt[og])) < 1e-10 * dvdt_scale
+            @test maximum(abs.(fluid_cpu.drhodt[oc] .- fluid_gpu_h.drhodt[og])) < 1e-10 * drhodt_scale
+        end
+
+        @testset "full pipeline (sort+grid+sweep), NeighbourListKA coupled reverse (WritesB): onesided CPU oracle vs CUDA" begin
+            # Item 17's reverse-pass coverage: _GPUReverseOnlyTestPfn forces
+            # the WritesB() dispatch arm (_sweep_coupled_nlist_reverse!),
+            # exercising _nbr_start_a/_nbr_idx_a end to end on real hardware.
+            CUDA.allowscalar(false)
+            rng = MersenneTwister(221)
+            h = 0.08
+            kernel = CubicSplineKernel(h; ndims=2)
+            cutoff = kernel.interaction_length
+            pfn = _GPUReverseOnlyTestPfn()
+
+            ps_a_cpu = _gpucuda_random_fluid(rng, 1200, 2; L=3.0)
+            ps_b_cpu = _gpucuda_random_fluid(rng, 900, 2; L=3.0)
+            ps_a_gpu = adapt(CUDABackend(), deepcopy(ps_a_cpu))
+            ps_b_gpu = adapt(CUDABackend(), deepcopy(ps_b_cpu))
+
+            pa, kaa, sa = _gpucuda_sortbufs_cpu(ps_a_cpu)
+            sort_particles!(ps_a_cpu, cutoff, pa, kaa, sa)
+            pb, kb, sb = _gpucuda_sortbufs_cpu(ps_b_cpu)
+            sort_particles!(ps_b_cpu, cutoff, pb, kb, sb)
+            si_cpu = SystemInteraction(kernel, pfn, ps_a_cpu, ps_b_cpu; onesided=true)
+            create_grid!(si_cpu)
+            sweep!(si_cpu)
+
+            pag, kag, sag = _gpucuda_sortbufs_gpu(ps_a_gpu)
+            sort_particles!(ps_a_gpu, cutoff, pag, kag, sag)
+            pbg, kbg, sbg = _gpucuda_sortbufs_gpu(ps_b_gpu)
+            sort_particles!(ps_b_gpu, cutoff, pbg, kbg, sbg)
+            si_gpu = SystemInteraction(kernel, pfn, ps_a_gpu, ps_b_gpu; neighbour_list=true, onesided=true, ka=true)
+            create_grid!(si_gpu)
+            Grasph._maybe_build_neighbour_list!(si_gpu)
+            sweep!(si_gpu)
+
+            ps_b_gpu_h = adapt(Array, ps_b_gpu)
+            oc, og = _byid(ps_b_cpu), _byid(ps_b_gpu_h)
+            dvdt_scale = max(maximum(norm.(ps_b_cpu.dvdt)), 1.0)
+            drhodt_scale = max(maximum(abs.(ps_b_cpu.drhodt)), 1.0)
+            @test maximum(norm.(ps_b_cpu.dvdt[oc] .- ps_b_gpu_h.dvdt[og])) < 1e-10 * dvdt_scale
+            @test maximum(abs.(ps_b_cpu.drhodt[oc] .- ps_b_gpu_h.drhodt[og])) < 1e-10 * drhodt_scale
+
+            ps_a_gpu_h = adapt(Array, ps_a_gpu)
+            @test all(==(zero(SVector{2,Float64})), ps_a_gpu_h.dvdt)
+            @test all(==(0.0), ps_a_gpu_h.drhodt)
+        end
+
+        @testset "full pipeline (sort+grid+sweep), NeighbourListKA coupled (WritesBoth, FluidPfn fluid-fluid): onesided CPU oracle vs CUDA" begin
+            # Item 17's WritesBoth coverage: real FluidPfn fluid-fluid
+            # coupling dispatches through both the forward and reverse nlist
+            # passes in one sweep! call.
+            CUDA.allowscalar(false)
+            rng = MersenneTwister(222)
+            h = 0.08
+            kernel = CubicSplineKernel(h; ndims=2)
+            cutoff = kernel.interaction_length
+            pfn = FluidPfn(0.03, 0.0, h)
+
+            ps_a_cpu = _gpucuda_random_fluid(rng, 1000, 2; L=3.0)
+            ps_b_cpu = _gpucuda_random_fluid(rng, 800, 2; L=3.0)
+            ps_a_gpu = adapt(CUDABackend(), deepcopy(ps_a_cpu))
+            ps_b_gpu = adapt(CUDABackend(), deepcopy(ps_b_cpu))
+
+            pa, kaa, sa = _gpucuda_sortbufs_cpu(ps_a_cpu)
+            sort_particles!(ps_a_cpu, cutoff, pa, kaa, sa)
+            pb, kb, sb = _gpucuda_sortbufs_cpu(ps_b_cpu)
+            sort_particles!(ps_b_cpu, cutoff, pb, kb, sb)
+            si_cpu = SystemInteraction(kernel, pfn, ps_a_cpu, ps_b_cpu; onesided=true)
+            create_grid!(si_cpu)
+            sweep!(si_cpu)
+
+            pag, kag, sag = _gpucuda_sortbufs_gpu(ps_a_gpu)
+            sort_particles!(ps_a_gpu, cutoff, pag, kag, sag)
+            pbg, kbg, sbg = _gpucuda_sortbufs_gpu(ps_b_gpu)
+            sort_particles!(ps_b_gpu, cutoff, pbg, kbg, sbg)
+            si_gpu = SystemInteraction(kernel, pfn, ps_a_gpu, ps_b_gpu; neighbour_list=true, onesided=true, ka=true)
+            create_grid!(si_gpu)
+            Grasph._maybe_build_neighbour_list!(si_gpu)
+            sweep!(si_gpu)
+
+            ps_a_gpu_h = adapt(Array, ps_a_gpu)
+            ps_b_gpu_h = adapt(Array, ps_b_gpu)
+            oa, oga = _byid(ps_a_cpu), _byid(ps_a_gpu_h)
+            ob, ogb = _byid(ps_b_cpu), _byid(ps_b_gpu_h)
+            dvdt_scale_a = max(maximum(norm.(ps_a_cpu.dvdt)), 1.0)
+            dvdt_scale_b = max(maximum(norm.(ps_b_cpu.dvdt)), 1.0)
+            drhodt_scale_a = max(maximum(abs.(ps_a_cpu.drhodt)), 1.0)
+            drhodt_scale_b = max(maximum(abs.(ps_b_cpu.drhodt)), 1.0)
+            @test maximum(norm.(ps_a_cpu.dvdt[oa] .- ps_a_gpu_h.dvdt[oga])) < 1e-10 * dvdt_scale_a
+            @test maximum(abs.(ps_a_cpu.drhodt[oa] .- ps_a_gpu_h.drhodt[oga])) < 1e-10 * drhodt_scale_a
+            @test maximum(norm.(ps_b_cpu.dvdt[ob] .- ps_b_gpu_h.dvdt[ogb])) < 1e-10 * dvdt_scale_b
+            @test maximum(abs.(ps_b_cpu.drhodt[ob] .- ps_b_gpu_h.drhodt[ogb])) < 1e-10 * drhodt_scale_b
         end
 
         @testset "full pipeline (sort+grid+sweep), verlet_skin > 0 (padded grid), self+coupled onesided: CPU oracle vs CUDA" begin

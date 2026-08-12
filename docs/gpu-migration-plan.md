@@ -2589,6 +2589,95 @@ to coloured for all 13 scripts, and no script's behavior changed.
     wiring into any of the 13 production scripts; ghosts/virtual
     particles/probes/RK4.
 
+17. **`NeighbourListKA`: 3D, `WritesB`/`WritesBoth`, public API — done.**
+    Item 16 shipped `NeighbourListKA` as a narrow benchmarking spike: self +
+    one coupled shape (`WritesA`) only, 2D only, reachable only via
+    `SystemInteraction`'s internal `mode` escape hatch. The user asked to
+    close those three gaps. Scope was set by an explicit up-front choice
+    (asked via `AskUserQuestion`): promote to a real, testable feature and
+    validate the full shape/dimension matrix, but do **not** wire it into,
+    or change the default of, any of the 13 production scripts — that
+    remains a separate, later, per-script decision. This mirrors
+    `verlet_skin` (item 12)'s own precedent: a bigger, already-proven win
+    that is fully built, tested, and validated on real hardware, yet still
+    isn't wired into any script today.
+
+    **Public API** (`src/Interaction.jl`): a new `neighbour_list::Bool =
+    false` kwarg on `SystemInteraction`, alongside `onesided`/`ka`,
+    requiring `ka=true` — which itself still requires `onesided=true`
+    (unchanged pre-existing rule), so enabling it needs all three:
+    `onesided=true, ka=true, neighbour_list=true`. `mode=` (the internal
+    escape hatch) still takes priority when passed explicitly, so every
+    existing internal test/benchmark call site using
+    `mode=Grasph.NeighbourListKA()` is unaffected.
+
+    **3D** (`src/KAKernels.jl`): `_3d!` twins of every build
+    (`_nbr_count_self/coupled_kernel_3d!`, `_nbr_scatter_self/coupled_kernel_3d!`)
+    and consume (`_sweep_self/coupled_nlist_kernel_3d!`) kernel, transcribing
+    the exact stencil-walk shape the existing 3D onesided sweep kernels
+    already use (`n_cells_z`/`n_cells_y`/`n_cells_yz`, nested `dx_cell`/
+    `dy_cell` loop). `_build_neighbour_list_self!`/`_build_neighbour_list_coupled!`/
+    `_sweep_self_nlist!`/`_sweep_coupled_nlist!` each gained a
+    `SystemInteraction{T,3}` method mirroring their `{T,2}` twin.
+
+    **`WritesB`/`WritesBoth`** (`src/Interaction.jl`, `src/KAKernels.jl`):
+    two new CSR fields, `_nbr_start_a`/`_nbr_idx_a` (reverse-pass candidate
+    list, built by `system_b`'s particles scanning `_cell_start_a` —
+    `system_a`'s own grid, already built unconditionally for every coupled
+    interaction). The reverse build/consume launchers
+    (`_build_neighbour_list_coupled_reverse!`, `_sweep_coupled_nlist_reverse!`)
+    needed **zero new kernels** — they reuse the exact same count/scatter/
+    consume kernels the forward pass uses, with device views and cell-grid
+    arguments swapped, exactly the role-swap trick `_sweep_coupled_ka_reverse!`
+    (item 6) already established for the plain onesided sweep.
+    `_maybe_build_neighbour_list!` now builds both the forward and reverse
+    candidate lists unconditionally for every coupled interaction, mirroring
+    `_cell_start_a`'s own established "build unconditionally regardless of
+    which pfns are attached" tradeoff. The old hard `error(...)` guard for
+    non-`WritesA` shapes is gone, replaced by a three-way
+    `_sweep_coupled_nlist_dispatch!` (`WritesA`/`WritesB`/`WritesBoth`)
+    mirroring the existing `_sweep_coupled_ka_dispatch!`/
+    `_sweep_coupled_onesided_dispatch!` exactly.
+
+    **Validation**: full shape × dimension matrix on both `KA.CPU()`
+    (Tier-1, `test/test_neighbour_list.jl`) and real CUDA hardware
+    (`test/test_gpu_cuda.jl`) — self + coupled `WritesA` (2D+3D), coupled
+    `WritesB` (a synthetic reverse-only test pfn, both tiers), coupled
+    `WritesBoth` (real `FluidPfn` fluid-fluid, both tiers), plus two
+    public-API tests (`neighbour_list=true` reaches `NeighbourListKA`;
+    `neighbour_list=true` without `ka=true` throws `ArgumentError`). This
+    machine happens to have a real GPU (`nvidia-smi`: RTX 4060 Laptop,
+    sm_89 — the same laptop item 16's original GPU numbers were measured
+    on), so the new real-CUDA testsets in `test_gpu_cuda.jl` ran on actual
+    hardware as part of this item's own `Pkg.test()`, not just the
+    `KA.CPU()` oracle. Full suite: **1692/1692** (up from 1645 after item
+    16's A100 extension), every pre-existing test unaffected.
+
+    **Performance was not re-measured for 3D or `WritesB`/`WritesBoth`** —
+    this item validates correctness only. The claim for those cases is
+    mechanism-equivalence with item 16's already-measured 2D/`WritesA`
+    result (same kernels, same no-atomics CSR build/consume shape, just a
+    wider stencil or a role-swapped launch), not an independently confirmed
+    number. Given item 16's A100 extension found `gpu_nlist`'s margin
+    narrows slightly but never disappears from ~40k to ~76M particles, and
+    the reverse pass launches exactly the same kernel shape as the forward
+    pass, there's no structural reason to expect 3D or `WritesB`/
+    `WritesBoth` to behave differently — but this is an inference, not a
+    measurement, and should be treated as such by anyone building on top of
+    it.
+
+    **Not built** (still, by explicit user choice): wiring
+    `neighbour_list=true` into any of the 13 production scripts, or
+    changing any script's default backend selection — matching
+    `verlet_skin`'s own still-unwired status. `ColouredKA` stays
+    internal-only (its own benchmark result was already negative, item 11).
+    A persistent-pairs version of `ColouredCPU` itself remains unbuilt —
+    item 16's A100 extension flagged this as newly worth reconsidering at
+    large scale (`cpu_nlist` started beating `cpu_col` somewhere between
+    202,500 and 3,240,000 particles), but that is a materially different,
+    larger feature (colour-grouped pair caching, not per-particle CSR) and
+    stays out of scope here.
+
 ## Explicitly deferred (not started, not part of the current scope)
 
 - ~~**GPU (`ka=true`) support for any pfn converted in Phase C**~~ — items
@@ -2611,12 +2700,14 @@ to coloured for all 13 scripts, and no script's behavior changed.
 - Morton/Z-order sort keys (packed lexicographic `UInt64` key shipped
   instead).
 - ~~Explicit neighbour list (on-the-fly 27-cell scan is current
-  approach).~~ — **done as a benchmarking spike, item 16** (`NeighbourListKA`)
-  — a real, consistent 2.0-2.4× win over today's production GPU sweep.
-  Self + one coupled (`WritesA`) shape, 2D only, reachable only via the
-  internal `mode` override — extending to a production feature (3D, other
-  coupled shapes, script wiring) is flagged as a good follow-up candidate in
-  item 16, not built there.
+  approach).~~ — **done, items 16-17** (`NeighbourListKA`) — a real,
+  consistent 2.0-2.4× win over today's production GPU sweep (item 16,
+  holding out to 76M particles on A100), now supporting self-interaction and
+  all three coupled write shapes (`WritesA`/`WritesB`/`WritesBoth`), 2D and
+  3D, and reachable via a public `neighbour_list=true` kwarg (item 17). Only
+  remaining gap: not wired into (or defaulted for) any of the 13 production
+  scripts — an explicit, deliberate choice, matching `verlet_skin`'s own
+  still-unwired status; see item 17.
 - Float32/mixed precision (Float64 retained per the GPU-target decision —
   though note the hardware section above: this machine gets zero benefit
   from that decision either way).
@@ -2628,7 +2719,7 @@ to coloured for all 13 scripts, and no script's behavior changed.
   32 commits ahead of it (`12ac526`..`149c238`). Nothing on this branch has
   been pushed to any remote.
 - Run the full suite with `julia --project -e 'using Pkg; Pkg.test()'` —
-  should show `1645/1645` (834 through Phase B1, up to 935 after Phase B2's
+  should show `1692/1692` (834 through Phase B1, up to 935 after Phase B2's
   3D work, up to 1371 after Phase C, up to 1433 after item 5's `device_view`
   extension, up to 1466 after item 6's reverse-sweep KA kernel twin, up to
   1479 after also fixing the `FluidPfn` fluid-fluid `ka=true` dispatch gap
@@ -2648,7 +2739,10 @@ to coloured for all 13 scripts, and no script's behavior changed.
   replacement for the newly-filled `XSPHPfn` `WritesBoth` case; every other
   testset (including all real-CUDA ones) is unchanged. Up to **1645** after
   item 16 (`test/test_neighbour_list.jl`, new, plus one new real-CUDA
-  testset in `test_gpu_cuda.jl`).
+  testset in `test_gpu_cuda.jl`). Up to **1692** after item 17 (3D +
+  `WritesB`/`WritesBoth` + public-API coverage added to both
+  `test_neighbour_list.jl` and `test_gpu_cuda.jl`'s `NeighbourListKA`
+  testsets).
   `Pkg.test()` resolves its own CUDA
   from `test/Project.toml` and picks up real hardware automatically when
   present (confirmed again this item) — no merged-throwaway-environment
